@@ -1,0 +1,17 @@
+node_modules/
+.next/
+.expo/
+dist/
+*.log
+
+# Env / secrets
+.env
+.env.local
+.env*.local
+
+# OS
+.DS_Store
+
+# Local email/password user store (dev only)
+.auth-users.json
+apps/web/.auth-users.json

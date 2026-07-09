@@ -1,0 +1,396 @@
+@import "tailwindcss";
+@import "tw-animate-css";
+@import "shadcn/tailwind.css";
+
+@custom-variant dark (&:is(.dark *));
+
+/* ============================================================
+   Eliora theme
+   ------------------------------------------------------------
+   Brand tokens (--bg, --surface, --accent, --muted, --border,
+   bubbles, --text) are the single source of truth and are read
+   directly by the app's inline styles. shadcn/ui tokens are
+   mapped onto them in @theme so components match automatically.
+   Light is the default (:root); dark overrides under .dark.
+   ============================================================ */
+
+:root {
+  /* ---- App / brand semantic tokens ---- */
+  --bg: #f6f4ee;
+  --surface: #ffffff;
+  --elevated: #fbfaf6;        /* popovers / dropdowns / active drawer */
+  --text: #1b2421;
+  --accent: #2c6b4c;          /* brand green (AA on white) */
+  --accent-hover: #255b40;
+  --accent-soft: #e7efe8;     /* active nav, soft badges, tints */
+  --muted: #566560;           /* secondary text (AA) */
+  --border: #dfe2dc;
+  --border-strong: #c7cdc5;
+  --success: #2c6b4c;
+  --warning: #9a6a16;
+  --warning-soft: #fff5e3;
+  --user-bubble: #2c6b4c;
+  --user-text: #ffffff;
+  --assistant-bubble: #eef1ee;
+  --assistant-text: #1b2421;
+
+  /* ---- shadcn/ui tokens (mapped to the theme) ---- */
+  --background: var(--bg);
+  --foreground: var(--text);
+  --card: var(--surface);
+  --card-foreground: var(--text);
+  --popover: var(--elevated);
+  --popover-foreground: var(--text);
+  --primary: var(--accent);
+  --primary-foreground: #ffffff;
+  --secondary: #eef1ee;
+  --secondary-foreground: var(--text);
+  --muted-foreground: var(--muted);
+  --accent-foreground: var(--text);
+  --destructive: #b3261e;
+  --input: var(--border-strong);
+  --ring: var(--accent);
+  --radius: 0.875rem;
+}
+
+.dark {
+  --bg: #101513;
+  --surface: #19201d;
+  --elevated: #212a26;
+  --text: #e6ece8;
+  --accent: #74cf9b;          /* light green for dark contrast */
+  --accent-hover: #86d8a8;
+  --accent-soft: #1c2c24;
+  --muted: #9eaaa3;
+  --border: #2a332e;
+  --border-strong: #3a463f;
+  --success: #74cf9b;
+  --warning: #e0b25a;
+  --warning-soft: #2a2113;
+  --user-bubble: #2c6b4c;
+  --user-text: #ffffff;
+  --assistant-bubble: #232b2e;
+  --assistant-text: #e6ece8;
+
+  --background: var(--bg);
+  --foreground: var(--text);
+  --card: var(--surface);
+  --card-foreground: var(--text);
+  --popover: var(--elevated);
+  --popover-foreground: var(--text);
+  --primary: var(--accent);
+  --primary-foreground: #0b1410;
+  --secondary: #232b2e;
+  --secondary-foreground: var(--text);
+  --muted-foreground: var(--muted);
+  --accent-foreground: var(--text);
+  --destructive: #ef5350;
+  --input: var(--border-strong);
+  --ring: var(--accent);
+}
+
+/* ---- Extra themes (set via data-theme on <html>) ---- */
+/* Neon: dark base + bright glow accent (also gets the .dark class). */
+[data-theme="neon"] {
+  --bg: #0a0b12;
+  --surface: #12131f;
+  --elevated: #1a1c2e;
+  --text: #e9ecff;
+  --accent: #22f5b0;
+  --accent-hover: #4dffcb;
+  --accent-soft: #10241d;
+  --muted: #9aa0c7;
+  --border: #23263a;
+  --border-strong: #343954;
+  --warning: #ffd166;
+  --warning-soft: #241f10;
+  --user-bubble: #22f5b0;
+  --user-text: #06110d;
+  --assistant-bubble: #191b2b;
+  --assistant-text: #e9ecff;
+  --secondary: #191b2b;
+  --secondary-foreground: var(--text);
+  --primary-foreground: #06110d;
+}
+/* Pastel: soft, airy light theme with a lavender accent. */
+[data-theme="pastel"] {
+  --bg: #fdf4fb;
+  --surface: #ffffff;
+  --elevated: #fdf0f7;
+  --text: #4a3f52;
+  --accent: #b06fd6;
+  --accent-hover: #9c58c7;
+  --accent-soft: #f4e6fa;
+  --muted: #8a7d92;
+  --border: #f0dced;
+  --border-strong: #e3c8de;
+  --warning: #d99a5b;
+  --warning-soft: #fdefe0;
+  --user-bubble: #b06fd6;
+  --user-text: #ffffff;
+  --assistant-bubble: #f6edf9;
+  --assistant-text: #4a3f52;
+  --secondary: #f6edf9;
+}
+/* Minimalist: clean monochrome, near-black accent. */
+[data-theme="minimalist"] {
+  --bg: #ffffff;
+  --surface: #ffffff;
+  --elevated: #fafafa;
+  --text: #171717;
+  --accent: #1a1a1a;
+  --accent-hover: #000000;
+  --accent-soft: #f2f2f2;
+  --muted: #8a8a8a;
+  --border: #eaeaea;
+  --border-strong: #d4d4d4;
+  --warning: #8a6d1a;
+  --warning-soft: #f6f2e6;
+  --user-bubble: #1a1a1a;
+  --user-text: #ffffff;
+  --assistant-bubble: #f4f4f4;
+  --assistant-text: #171717;
+  --secondary: #f4f4f4;
+}
+/* Anime: vibrant, playful purple/pink pop on a soft sky base. */
+[data-theme="anime"] {
+  --bg: #f2f5ff;
+  --surface: #ffffff;
+  --elevated: #f3f0ff;
+  --text: #2d2b42;
+  --accent: #6c5ce7;
+  --accent-hover: #5a49d6;
+  --accent-soft: #ece8ff;
+  --muted: #7a7896;
+  --border: #e4e0f7;
+  --border-strong: #d0c9f0;
+  --warning: #e08a3c;
+  --warning-soft: #fdeede;
+  --user-bubble: #ff5c8a;
+  --user-text: #ffffff;
+  --assistant-bubble: #f0edff;
+  --assistant-text: #2d2b42;
+  --secondary: #f0edff;
+}
+
+/* Expose the theme to Tailwind / shadcn utilities. shadcn's own
+   --accent / --muted are intentionally remapped to soft tints so
+   they don't fight the brand green that inline styles use. */
+@theme inline {
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+  --color-card: var(--card);
+  --color-card-foreground: var(--card-foreground);
+  --color-popover: var(--popover);
+  --color-popover-foreground: var(--popover-foreground);
+  --color-primary: var(--primary);
+  --color-primary-foreground: var(--primary-foreground);
+  --color-secondary: var(--secondary);
+  --color-secondary-foreground: var(--secondary-foreground);
+  --color-muted: var(--secondary);
+  --color-muted-foreground: var(--muted-foreground);
+  --color-accent: var(--secondary);
+  --color-accent-foreground: var(--secondary-foreground);
+  --color-destructive: var(--destructive);
+  --color-border: var(--border);
+  --color-border-strong: var(--border-strong);
+  --color-input: var(--input);
+  --color-ring: var(--ring);
+  --color-elevated: var(--elevated);
+  --color-success: var(--success);
+  --color-warning: var(--warning);
+  --color-accent-soft: var(--accent-soft);
+
+  /* radius scale */
+  --radius-sm: calc(var(--radius) - 6px);
+  --radius-md: calc(var(--radius) - 4px);
+  --radius-lg: var(--radius);
+  --radius-xl: calc(var(--radius) + 4px);
+
+  /* type scale */
+  --text-display: clamp(2rem, 1.4rem + 2.4vw, 2.75rem);
+  --text-h1: clamp(1.6rem, 1.3rem + 1.4vw, 2.1rem);
+  --text-h2: clamp(1.3rem, 1.15rem + 0.7vw, 1.55rem);
+  --text-h3: 1.15rem;
+  --text-body-lg: 1.0625rem;
+
+  /* elevation */
+  --shadow-e1: 0 1px 2px rgba(20, 30, 25, 0.04),
+    0 1px 3px rgba(20, 30, 25, 0.06);
+  --shadow-e2: 0 4px 12px rgba(20, 30, 25, 0.08);
+  --shadow-e3: 0 12px 32px rgba(20, 30, 25, 0.14);
+
+  --font-sans: "Atkinson Hyperlegible", -apple-system, BlinkMacSystemFont,
+    "Segoe UI", Roboto, sans-serif;
+}
+
+/* ---- Base reset & typography ---- */
+* {
+  box-sizing: border-box;
+}
+
+html,
+body {
+  margin: 0;
+  padding: 0;
+  height: 100%;
+}
+
+/* Paint the page background on <html> too — the browser propagates the
+   root element's background across the ENTIRE window canvas, so there's
+   never a black/blank gap below short content regardless of viewport
+   quirks. (The dark class lives on <html>, so this follows the theme.) */
+html {
+  background: var(--bg);
+}
+
+body {
+  min-height: 100vh;
+  background: var(--bg);
+  color: var(--text);
+  font-family: var(--font-sans);
+  font-size: clamp(17px, 0.45vw + 16px, 19px);
+  line-height: 1.6;
+  -webkit-font-smoothing: antialiased;
+  transition: background-color 0.2s ease, color 0.2s ease;
+}
+
+/* Dark mode uses deeper shadows so elevation still reads. */
+.dark {
+  --shadow-e1: 0 1px 2px rgba(0, 0, 0, 0.4);
+  --shadow-e2: 0 4px 14px rgba(0, 0, 0, 0.5);
+  --shadow-e3: 0 14px 40px rgba(0, 0, 0, 0.6);
+}
+
+button {
+  font-family: inherit;
+}
+
+@media (prefers-reduced-motion: no-preference) {
+  .fade-in {
+    animation: fade 160ms ease-out;
+  }
+}
+
+@keyframes fade {
+  from {
+    opacity: 0;
+    transform: translateY(4px);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+
+/* ============================================================
+   Accessibility modes (toggled as classes on <body>)
+   ============================================================ */
+
+/* Dyslexia-friendly typeface + a little letter spacing. */
+body.a11y-dyslexic {
+  font-family: "OpenDyslexic", "Comic Sans MS", "Atkinson Hyperlegible",
+    "Lexend", -apple-system, sans-serif;
+  letter-spacing: 0.02em;
+}
+
+/* Extra spacing helps tracking for dyslexia & visual processing. */
+body.a11y-spacing {
+  line-height: 1.95;
+  letter-spacing: 0.04em;
+  word-spacing: 0.1em;
+}
+
+/* High contrast — overrides the brand tokens the whole app reads. */
+body.a11y-contrast {
+  --bg: #ffffff;
+  --surface: #ffffff;
+  --text: #000000;
+  --accent: #0a5c3b;
+  --muted: #2b2b2b;
+  --border: #000000;
+  --user-bubble: #0a3d2a;
+  --user-text: #ffffff;
+  --assistant-bubble: #e6e6e6;
+  --assistant-text: #000000;
+}
+
+/* Reduced motion — kill animations/transitions. */
+body.a11y-reduce-motion *,
+body.a11y-reduce-motion *::before,
+body.a11y-reduce-motion *::after {
+  animation: none !important;
+  transition: none !important;
+}
+
+/* ============================================================
+   Layout helpers used by the app
+   ============================================================ */
+
+/* Sidebar: slide-out drawer behind the ☰ menu on narrow screens. */
+.eliora-side-toggle {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+.eliora-sidebar {
+  position: fixed;
+  top: 0;
+  left: 0;
+  bottom: 0;
+  transform: translateX(-100%);
+  transition: transform 0.2s ease;
+  z-index: 25;
+  box-shadow: var(--shadow-e3);
+  overflow-y: auto;
+}
+.eliora-sidebar.open {
+  transform: translateX(0);
+}
+
+/* Wide screens: dock the sidebar as a static rail (no drawer / toggle). */
+@media (min-width: 1024px) {
+  .eliora-side-toggle {
+    display: none;
+  }
+  .eliora-sidebar {
+    position: sticky;
+    top: 0;
+    transform: none;
+    box-shadow: none;
+  }
+}
+
+/* Home quick-action cards: 2 columns, stack to 1 on narrow screens. */
+.eliora-home-actions {
+  grid-template-columns: 1fr 1fr;
+}
+@media (max-width: 520px) {
+  .eliora-home-actions {
+    grid-template-columns: 1fr;
+  }
+}
+
+/* Hover-lift for the dashboard quick-action cards. */
+.eliora-action-card:hover {
+  transform: translateY(-2px);
+  box-shadow: var(--shadow-e2);
+  border-color: var(--border-strong);
+}
+.eliora-action-card:focus-visible {
+  outline: 2px solid var(--ring);
+  outline-offset: 2px;
+}
+
+/* Soft hover for list rows (reminders, recent chats). */
+.eliora-row-btn:hover {
+  background: var(--accent-soft);
+}
+
+/* Focus ring for the chat composer. */
+.eliora-input:focus-visible,
+.eliora-input:focus {
+  outline: none;
+  border-color: var(--accent);
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 25%, transparent);
+}

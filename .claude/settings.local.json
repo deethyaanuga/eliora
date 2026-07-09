@@ -1,0 +1,19 @@
+{
+  "permissions": {
+    "allow": [
+      "mcp__Claude_Preview__preview_start",
+      "Bash(command -v npm node npx)",
+      "Read(//usr/local/bin/**)",
+      "Bash(zsh -lic 'echo \"PATH=$PATH\"; echo \"---\"; which -a node npm 2>&1')",
+      "Bash(/opt/homebrew/bin/npm --version)",
+      "Bash(/opt/homebrew/bin/npm install *)",
+      "Bash(curl -s -m 60 http://localhost:3000 -o /tmp/h.html -w \"HTTP %{http_code}\\\\n\")",
+      "Read(//tmp/**)",
+      "Bash(curl -s -m 25 -X POST http://localhost:3000/api/chat -H 'Content-Type: application/json' -d @- -w \"\\\\n[HTTP %{http_code}]\\\\n\")",
+      "Bash(curl -s -m 25 -X POST http://localhost:3000/api/summarize -H 'Content-Type: application/json' -d @- -w \"\\\\n[HTTP %{http_code}]\\\\n\")",
+      "Bash(curl -s -m 60 http://localhost:3000 -o /dev/null -w \"homepage: HTTP %{http_code}\\\\n\")",
+      "Bash(curl -s -m 25 -X POST http://localhost:3000/api/chat -H 'Content-Type: application/json' -d @- -w \"  [chat HTTP %{http_code}]\\\\n\")",
+      "Bash(curl -s -m 25 -X POST http://localhost:3000/api/summarize -H 'Content-Type: application/json' -d @- -w \"  [summarize HTTP %{http_code}]\\\\n\")"
+    ]
+  }
+}

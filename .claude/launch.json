@@ -1,0 +1,18 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "web (Next.js)",
+      "runtimeExecutable": "/bin/zsh",
+      "runtimeArgs": ["-c", "export PATH=\"/opt/homebrew/bin:$PATH\"; exec npm run web"],
+      "port": 3000,
+      "autoPort": true
+    },
+    {
+      "name": "mobile (Expo)",
+      "runtimeExecutable": "/bin/zsh",
+      "runtimeArgs": ["-c", "export PATH=\"/opt/homebrew/bin:$PATH\"; exec npm run mobile"],
+      "port": 8081
+    }
+  ]
+}

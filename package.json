@@ -1,0 +1,14 @@
+{
+  "name": "eliora",
+  "private": true,
+  "version": "0.1.0",
+  "description": "Eliora — an adaptive learning-plan chatbot for learners who struggle with learning.",
+  "workspaces": [
+    "packages/*",
+    "apps/*"
+  ],
+  "scripts": {
+    "web": "npm --workspace @eliora/web run dev",
+    "mobile": "npm --workspace @eliora/mobile run start"
+  }
+}

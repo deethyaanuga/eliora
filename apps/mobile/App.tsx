@@ -14,6 +14,7 @@ import {
   Text,
   TextInput,
   TouchableOpacity,
+  Vibration,
   View,
 } from "react-native";
 import { fetch as expoFetch } from "expo/fetch";
@@ -23,6 +24,15 @@ import AsyncStorage from "@react-native-async-storage/async-storage";
 import * as DocumentPicker from "expo-document-picker";
 import * as FileSystem from "expo-file-system";
 import * as Speech from "expo-speech";
+import {
+  CHECK_IN_CHAT_PROMPT,
+  DEFAULT_CHECKIN_TIME,
+  Notifications,
+  loadCheckInPrefs,
+  saveCheckInPrefs,
+  syncCheckInRegistration,
+  type CheckInPrefs,
+} from "./notifications";
 
 type Video = { videoId: string; title: string; channel: string; url: string };
 type Flashcard = { front: string; back: string };
@@ -69,6 +79,20 @@ type LearnerProfile = {
   learningStyle: string;
   interests: string;
   pastSuccess: string;
+  studyHabits?: string;
+  biggestChallenge?: string;
+  gradeYear?: string;
+  subjectsStudying?: string;
+  planningStyle?: string;
+  sessionLength?: string;
+  focusHelp?: string;
+  usedStudyApp?: string;
+  wantedFeature?: string;
+  planBlocker?: string;
+  mainGoal?: string;
+  hobbies?: string;
+  focusTime?: string;
+  needHelpMost?: string;
 };
 type Milestone = {
   title: string;
@@ -85,6 +109,7 @@ type Assignment = {
   title: string;
   subject?: string;
   due?: string;
+  concern?: string; // what the learner is worried about / stuck on
   done: boolean;
 };
 // A SMART goal the learner sets (Specific, Measurable, Achievable, Relevant,
@@ -120,6 +145,8 @@ const SUBJECTS_KEY = "eliora-subjects";
 const ASSIGNMENTS_KEY = "eliora-assignments";
 const GOALS_KEY = "eliora-goals";
 const REM_DISMISSED_KEY = "eliora-rem-dismissed";
+const SCHEDULE_KEY = "eliora-schedule"; // today's day plan (reset each new day)
+const HOMETIME_KEY = "eliora-hometime"; // hour (24h) the learner gets home
 
 // Multiple-choice answers for the sign-up survey questions.
 const STUDY_HABIT_OPTIONS = [
@@ -242,6 +269,46 @@ function eventId(title: string, date: string): string {
   return `${date}__${title.trim().toLowerCase()}`;
 }
 
+// A daily 9am–9pm time-block schedule. `blocks` maps an hour (9…20) to what the
+// learner plans to do then; stamped with the date so it starts fresh each day.
+type ScheduleKind = "study" | "break" | "class" | "other";
+type ScheduleBlock = { text: string; kind: ScheduleKind };
+type DaySchedule = { date: string; blocks: Record<number, ScheduleBlock> };
+const SCHEDULE_HOURS = [9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20];
+const SCHEDULE_KINDS: {
+  key: ScheduleKind;
+  emoji: string;
+  label: string;
+  color: string;
+}[] = [
+  { key: "study", emoji: "📚", label: "Study", color: "#2f6f4f" },
+  { key: "break", emoji: "☕", label: "Break", color: "#d98a2b" },
+  { key: "class", emoji: "🏫", label: "Class", color: "#3a6ea5" },
+  { key: "other", emoji: "📝", label: "Other", color: "#8a8a8a" },
+];
+const scheduleKind = (k: ScheduleKind) =>
+  SCHEDULE_KINDS.find((x) => x.key === k) ?? SCHEDULE_KINDS[0];
+// Default length for a per-task focus countdown (a Pomodoro sprint).
+const TIMER_DEFAULT_MIN = 25;
+// Local YYYY-MM-DD for today (not UTC — a day plan is a local-day thing).
+function todayISO(): string {
+  const d = new Date();
+  const p = (n: number) => n.toString().padStart(2, "0");
+  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}`;
+}
+// "9:00 AM", "1:00 PM" … for an hour in 24h form.
+function hourLabel(h: number): string {
+  const period = h < 12 ? "AM" : "PM";
+  const h12 = h % 12 === 0 ? 12 : h % 12;
+  return `${h12}:00 ${period}`;
+}
+// "25:00" / "4:09" — seconds → mm:ss for a countdown display.
+function fmtTimer(sec: number): string {
+  const m = Math.floor(sec / 60);
+  const s = sec % 60;
+  return `${m}:${s.toString().padStart(2, "0")}`;
+}
+
 function renderContent(text: string) {
   // Match Markdown links [label](url) OR bare http(s) URLs.
   const re = /\[([^\]]+)\]\((https?:\/\/[^\s)]+)\)|(https?:\/\/[^\s]+)/g;
@@ -349,17 +416,61 @@ function ProfileCard({
   );
 }
 
+// A per-assignment "what are you worried about?" note. Holds its own draft and
+// commits on blur so Eliora sees the concern in her context and coaches around it.
+function ConcernField({
+  value,
+  onCommit,
+}: {
+  value?: string;
+  onCommit: (concern: string) => void;
+}) {
+  const [draft, setDraft] = useState(value ?? "");
+  const [editing, setEditing] = useState(false);
+  useEffect(() => {
+    if (!editing) setDraft(value ?? "");
+  }, [value, editing]);
+
+  if (!editing && !value) {
+    return (
+      <TouchableOpacity onPress={() => setEditing(true)}>
+        <Text style={styles.concernAdd}>💭 Add a concern</Text>
+      </TouchableOpacity>
+    );
+  }
+  return (
+    <View style={styles.concernRow}>
+      <Text style={styles.concernIcon}>💭</Text>
+      <TextInput
+        style={styles.concernInput}
+        value={draft}
+        onChangeText={setDraft}
+        onFocus={() => setEditing(true)}
+        onBlur={() => {
+          setEditing(false);
+          if ((draft.trim() || "") !== (value ?? "")) onCommit(draft);
+        }}
+        placeholder="What's worrying you about this?"
+        placeholderTextColor="#9aa39d"
+        returnKeyType="done"
+      />
+    </View>
+  );
+}
+
 function AssignmentsPanel({
   assignments,
   subjects,
   onAdd,
   onToggle,
+  onSetConcern,
   onRemove,
 }: {
   assignments: Assignment[];
   subjects: string[];
   onAdd: (a: { title: string; subject?: string; due?: string }) => void;
   onToggle: (id: string) => void;
+  onSetConcern: (id: string, concern: string) => void;
   onRemove: (id: string) => void;
 }) {
   const [title, setTitle] = useState("");
@@ -454,6 +565,12 @@ function AssignmentsPanel({
                   {a.subject && a.due ? " · " : ""}
                   {a.due ? `due ${a.due}` : ""}
                 </Text>
+              )}
+              {!a.done && (
+                <ConcernField
+                  value={a.concern}
+                  onCommit={(c) => onSetConcern(a.id, c)}
+                />
               )}
             </View>
             <TouchableOpacity onPress={() => onRemove(a.id)}>
@@ -2035,6 +2152,283 @@ function SignUp({
   );
 }
 
+// Today's 9am–9pm day plan with an editable text block per hour, a block-type
+// tag (study/break/class/other), an AI "build" button, and a per-task focus
+// countdown timer. One timer runs at a time.
+function ScheduleCard({
+  schedule,
+  onSet,
+  onClear,
+  homeHour,
+  onSetHomeHour,
+  onGenerate,
+  generating,
+}: {
+  schedule: DaySchedule | null;
+  onSet: (hour: number, patch: Partial<ScheduleBlock>) => void;
+  onClear: () => void;
+  homeHour: number;
+  onSetHomeHour: (h: number) => void;
+  onGenerate: () => void;
+  generating: boolean;
+}) {
+  const today = todayISO();
+  const fresh = schedule && schedule.date === today ? schedule : null;
+  const blocks = fresh?.blocks ?? {};
+  const currentHour = new Date().getHours();
+  const filled = SCHEDULE_HOURS.filter(
+    (h) => (blocks[h]?.text ?? "").trim(),
+  ).length;
+
+  const [timer, setTimer] = useState<{
+    hour: number;
+    left: number;
+    running: boolean;
+  } | null>(null);
+  useEffect(() => {
+    if (!timer?.running) return;
+    const id = setInterval(() => {
+      setTimer((t) => {
+        if (!t || !t.running) return t;
+        if (t.left <= 1) {
+          Vibration.vibrate([0, 250, 120, 250]);
+          return { ...t, left: 0, running: false };
+        }
+        return { ...t, left: t.left - 1 };
+      });
+    }, 1000);
+    return () => clearInterval(id);
+  }, [timer?.running, timer?.hour]);
+  const startTimer = (h: number) =>
+    setTimer({ hour: h, left: TIMER_DEFAULT_MIN * 60, running: true });
+  const toggleTimer = (h: number) =>
+    setTimer((t) =>
+      t && t.hour === h
+        ? t.left <= 0
+          ? { hour: h, left: TIMER_DEFAULT_MIN * 60, running: true }
+          : { ...t, running: !t.running }
+        : { hour: h, left: TIMER_DEFAULT_MIN * 60, running: true },
+    );
+
+  const cycleKind = (h: number) => {
+    const cur = blocks[h]?.kind ?? "study";
+    const idx = SCHEDULE_KINDS.findIndex((k) => k.key === cur);
+    onSet(h, { kind: SCHEDULE_KINDS[(idx + 1) % SCHEDULE_KINDS.length].key });
+  };
+
+  return (
+    <View style={styles.card}>
+      <View style={styles.cardHead}>
+        <Text style={styles.cardClass}>🕘 Today&apos;s schedule</Text>
+        <Text style={styles.subjectsCount}>
+          {filled ? `${filled} planned` : ""}
+        </Text>
+      </View>
+      <Text style={styles.schedHint}>
+        Plan 9 AM–9 PM, or let me build study time around when you get home. Tap a
+        block&apos;s tag to change study / break / class, and ⏱ to run a{" "}
+        {TIMER_DEFAULT_MIN}-min focus timer.
+      </Text>
+      <View style={styles.schedBuildRow}>
+        <Text style={styles.schedBuildLabel}>I get home at</Text>
+        <View style={styles.schedStepper}>
+          <TouchableOpacity
+            style={styles.schedStepBtn}
+            onPress={() => onSetHomeHour(Math.max(11, homeHour - 1))}
+            accessibilityLabel="Earlier home time"
+          >
+            <Text style={styles.schedStepBtnText}>−</Text>
+          </TouchableOpacity>
+          <Text style={styles.schedStepVal}>{hourLabel(homeHour)}</Text>
+          <TouchableOpacity
+            style={styles.schedStepBtn}
+            onPress={() => onSetHomeHour(Math.min(20, homeHour + 1))}
+            accessibilityLabel="Later home time"
+          >
+            <Text style={styles.schedStepBtnText}>+</Text>
+          </TouchableOpacity>
+        </View>
+      </View>
+      <TouchableOpacity
+        style={styles.schedBuildBtn}
+        disabled={generating}
+        onPress={onGenerate}
+      >
+        {generating ? (
+          <ActivityIndicator color="#2f6f4f" />
+        ) : (
+          <Text style={styles.schedBuildBtnText}>
+            ✨ Build my study schedule
+          </Text>
+        )}
+      </TouchableOpacity>
+      <View style={styles.schedList}>
+        {SCHEDULE_HOURS.map((h) => {
+          const b = blocks[h];
+          const hasText = !!(b?.text ?? "").trim();
+          const kind = scheduleKind(b?.kind ?? "study");
+          const isNow = h === currentHour;
+          return (
+            <View
+              key={h}
+              style={[
+                styles.schedRow,
+                isNow && styles.schedRowNow,
+                { borderLeftColor: hasText ? kind.color : "#d9ddd8" },
+              ]}
+            >
+              <View style={styles.schedTimeWrap}>
+                <Text style={styles.schedTime}>{hourLabel(h)}</Text>
+                {isNow && <Text style={styles.schedNowDot}>NOW</Text>}
+              </View>
+              <TouchableOpacity
+                style={styles.schedKind}
+                onPress={() => cycleKind(h)}
+                accessibilityLabel={`Block type: ${kind.label}. Tap to change.`}
+              >
+                <Text
+                  style={[styles.schedKindEmoji, !hasText && { opacity: 0.4 }]}
+                >
+                  {kind.emoji}
+                </Text>
+              </TouchableOpacity>
+              <TextInput
+                style={styles.schedInput}
+                value={b?.text ?? ""}
+                placeholder={isNow ? "Now — what's the plan?" : "—"}
+                placeholderTextColor="#9aa39d"
+                onChangeText={(text) => onSet(h, { text })}
+              />
+              {hasText &&
+                (timer && timer.hour === h ? (
+                  <View style={styles.schedTimer}>
+                    <TouchableOpacity
+                      style={styles.schedTimerBtn}
+                      onPress={() => toggleTimer(h)}
+                      accessibilityLabel={
+                        timer.left <= 0
+                          ? "Restart timer"
+                          : timer.running
+                            ? "Pause timer"
+                            : "Resume timer"
+                      }
+                    >
+                      <Text style={styles.schedTimerBtnText}>
+                        {timer.left <= 0 ? "↺" : timer.running ? "⏸" : "▶"}
+                      </Text>
+                    </TouchableOpacity>
+                    <Text
+                      style={[
+                        styles.schedTimerTime,
+                        timer.left <= 0 && styles.schedTimerDone,
+                      ]}
+                    >
+                      {timer.left <= 0 ? "done ✓" : fmtTimer(timer.left)}
+                    </Text>
+                    <TouchableOpacity
+                      style={styles.schedTimerClear}
+                      onPress={() => setTimer(null)}
+                      accessibilityLabel="Clear timer"
+                    >
+                      <Text style={styles.schedTimerClearText}>✕</Text>
+                    </TouchableOpacity>
+                  </View>
+                ) : (
+                  <TouchableOpacity
+                    style={styles.schedTimerStart}
+                    onPress={() => startTimer(h)}
+                    accessibilityLabel={`Start a ${TIMER_DEFAULT_MIN}-minute focus timer for this block`}
+                  >
+                    <Text style={styles.schedTimerStartText}>⏱</Text>
+                  </TouchableOpacity>
+                ))}
+            </View>
+          );
+        })}
+      </View>
+      {filled > 0 && (
+        <TouchableOpacity
+          style={styles.schedClearRow}
+          onPress={onClear}
+          accessibilityLabel="Clear today's schedule"
+        >
+          <Text style={styles.linkBtn}>Clear day</Text>
+        </TouchableOpacity>
+      )}
+    </View>
+  );
+}
+
+// Turn "HH:MM" (24h) into a friendly label like "9:00 AM".
+function timeLabel(hhmm: string): string {
+  const [h, m] = hhmm.split(":").map((n) => parseInt(n, 10));
+  const ampm = h < 12 ? "AM" : "PM";
+  const h12 = h % 12 === 0 ? 12 : h % 12;
+  return `${h12}:${String(m).padStart(2, "0")} ${ampm}`;
+}
+
+// Daily check-in reminder: a toggle plus an hour/minute stepper for the local
+// time Eliora pushes a notification and opens a check-in chat.
+function CheckInCard({
+  prefs,
+  onChange,
+}: {
+  prefs: CheckInPrefs;
+  onChange: (p: CheckInPrefs) => void;
+}) {
+  const [h, m] = prefs.time.split(":").map((n) => parseInt(n, 10));
+  const setTime = (hh: number, mm: number) =>
+    onChange({
+      ...prefs,
+      time: `${String((hh + 24) % 24).padStart(2, "0")}:${String(mm).padStart(2, "0")}`,
+    });
+  return (
+    <View style={styles.card}>
+      <View style={styles.cardHead}>
+        <Text style={styles.cardClass}>🔔 Daily check-in</Text>
+        <TouchableOpacity
+          onPress={() => onChange({ ...prefs, enabled: !prefs.enabled })}
+        >
+          <Text style={styles.linkBtn}>{prefs.enabled ? "On" : "Off"}</Text>
+        </TouchableOpacity>
+      </View>
+      <Text style={styles.schedHint}>
+        I&apos;ll send a gentle nudge once a day and open a quick check-in chat
+        when you tap it.
+      </Text>
+      {prefs.enabled ? (
+        <View style={styles.schedBuildRow}>
+          <Text style={styles.schedBuildLabel}>Remind me at</Text>
+          <View style={styles.schedStepper}>
+            <TouchableOpacity
+              style={styles.schedStepBtn}
+              onPress={() => setTime(h - 1, m)}
+              accessibilityLabel="Earlier check-in hour"
+            >
+              <Text style={styles.schedStepBtnText}>−</Text>
+            </TouchableOpacity>
+            <Text style={styles.schedStepVal}>{timeLabel(prefs.time)}</Text>
+            <TouchableOpacity
+              style={styles.schedStepBtn}
+              onPress={() => setTime(h + 1, m)}
+              accessibilityLabel="Later check-in hour"
+            >
+              <Text style={styles.schedStepBtnText}>+</Text>
+            </TouchableOpacity>
+          </View>
+          <TouchableOpacity
+            style={styles.schedStepBtn}
+            onPress={() => setTime(h, (m + 15) % 60)}
+            accessibilityLabel="Adjust minutes"
+          >
+            <Text style={styles.schedStepBtnText}>:{String(m).padStart(2, "0")}</Text>
+          </TouchableOpacity>
+        </View>
+      ) : null}
+    </View>
+  );
+}
+
 export default function App() {
   const [chats, setChats] = useState<Chat[]>([]);
   const [activeChatId, setActiveChatId] = useState<string>("");
@@ -2100,6 +2494,17 @@ export default function App() {
   const [subjects, setSubjects] = useState<string[]>([]);
   const [assignments, setAssignments] = useState<Assignment[]>([]);
   const [goals, setGoals] = useState<SmartGoal[]>([]);
+  const [schedule, setSchedule] = useState<DaySchedule | null>(null);
+  const [homeHour, setHomeHour] = useState(16); // default 4 PM
+  // Daily check-in push notification prefs (enabled + local time "HH:MM").
+  const [checkIn, setCheckIn] = useState<CheckInPrefs>({
+    enabled: true,
+    time: DEFAULT_CHECKIN_TIME,
+  });
+  // Set when a daily check-in notification is tapped; consumed once chat is
+  // ready (may fire on a cold start before storage has loaded).
+  const [pendingCheckIn, setPendingCheckIn] = useState(false);
+  const [generatingSchedule, setGeneratingSchedule] = useState(false);
   const [breakingGoalId, setBreakingGoalId] = useState<string | null>(null);
   const [editing, setEditing] = useState(false);
   const [summarizing, setSummarizing] = useState(false);
@@ -2151,6 +2556,18 @@ export default function App() {
           ? (JSON.parse(rawGoals) as SmartGoal[])
           : null;
         if (Array.isArray(savedGoals)) setGoals(savedGoals);
+
+        const rawSched = await AsyncStorage.getItem(SCHEDULE_KEY);
+        const savedSched = rawSched
+          ? (JSON.parse(rawSched) as DaySchedule)
+          : null;
+        // Only restore if it's for today — a day plan starts fresh each morning.
+        if (savedSched && savedSched.date === todayISO())
+          setSchedule(savedSched);
+
+        const rawHome = await AsyncStorage.getItem(HOMETIME_KEY);
+        const savedHome = rawHome ? parseInt(rawHome, 10) : NaN;
+        if (savedHome >= 11 && savedHome <= 20) setHomeHour(savedHome);
 
         const rawDismissed = await AsyncStorage.getItem(REM_DISMISSED_KEY);
         const savedDismissed = rawDismissed
@@ -2274,6 +2691,13 @@ export default function App() {
       prev.map((a) => (a.id === id ? { ...a, done: !a.done } : a)),
     );
   }
+  function setAssignmentConcern(id: string, concern: string) {
+    setAssignments((prev) =>
+      prev.map((a) =>
+        a.id === id ? { ...a, concern: concern.trim() || undefined } : a,
+      ),
+    );
+  }
   function removeAssignment(id: string) {
     setAssignments((prev) => prev.filter((a) => a.id !== id));
   }
@@ -2283,6 +2707,140 @@ export default function App() {
     if (!loaded) return;
     AsyncStorage.setItem(GOALS_KEY, JSON.stringify(goals)).catch(() => {});
   }, [goals, loaded]);
+
+  // Persist today's schedule and the learner's home time.
+  useEffect(() => {
+    if (!loaded) return;
+    if (schedule) {
+      AsyncStorage.setItem(SCHEDULE_KEY, JSON.stringify(schedule)).catch(
+        () => {},
+      );
+    } else {
+      AsyncStorage.removeItem(SCHEDULE_KEY).catch(() => {});
+    }
+  }, [schedule, loaded]);
+  useEffect(() => {
+    if (!loaded) return;
+    AsyncStorage.setItem(HOMETIME_KEY, String(homeHour)).catch(() => {});
+  }, [homeHour, loaded]);
+
+  // --- Daily check-in push notifications ------------------------------------
+  // Load saved reminder prefs once on mount.
+  useEffect(() => {
+    loadCheckInPrefs()
+      .then(setCheckIn)
+      .catch(() => {});
+  }, []);
+
+  // Persist prefs and (re)register this device with the server whenever the
+  // reminder changes. Debounced so dragging the time doesn't spam the API.
+  useEffect(() => {
+    if (!loaded) return;
+    saveCheckInPrefs(checkIn).catch(() => {});
+    const id = setTimeout(() => {
+      syncCheckInRegistration(checkIn, profile?.name).catch(() => {});
+    }, 500);
+    return () => clearTimeout(id);
+  }, [checkIn, loaded, profile?.name]);
+
+  // A tapped check-in notification (foreground, background, or cold start) opens
+  // the daily check-in chat. Flag it here; the effect below fires it once chat
+  // is ready.
+  useEffect(() => {
+    const isCheckIn = (r: Notifications.NotificationResponse | null) =>
+      r?.notification.request.content.data?.type === "daily-check-in";
+    const sub = Notifications.addNotificationResponseReceivedListener((r) => {
+      if (isCheckIn(r)) setPendingCheckIn(true);
+    });
+    Notifications.getLastNotificationResponseAsync()
+      .then((r) => {
+        if (isCheckIn(r)) setPendingCheckIn(true);
+      })
+      .catch(() => {});
+    return () => sub.remove();
+  }, []);
+
+  useEffect(() => {
+    if (!loaded || !pendingCheckIn || busy) return;
+    setPendingCheckIn(false);
+    startCheckIn();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [loaded, pendingCheckIn, busy]);
+
+  // Take the learner to chat and have Eliora open the daily check-in.
+  function startCheckIn() {
+    setTab("chat");
+    send(CHECK_IN_CHAT_PROMPT, { hidden: true });
+  }
+
+  // Update one hour block of today's schedule (starting a fresh day if needed).
+  const setScheduleBlock = (hour: number, patch: Partial<ScheduleBlock>) => {
+    const today = todayISO();
+    setSchedule((prev) => {
+      const base =
+        prev && prev.date === today ? prev : { date: today, blocks: {} };
+      const existing: ScheduleBlock = base.blocks[hour] ?? {
+        text: "",
+        kind: "study",
+      };
+      return {
+        date: today,
+        blocks: { ...base.blocks, [hour]: { ...existing, ...patch } },
+      };
+    });
+  };
+  const clearSchedule = () => setSchedule({ date: todayISO(), blocks: {} });
+
+  // Ask Eliora to fill the day around the learner's home time, plan, goals and
+  // assignments — mirrors the web "Build my study schedule" button.
+  const generateStudySchedule = async () => {
+    if (generatingSchedule) return;
+    setGeneratingSchedule(true);
+    try {
+      const res = await fetch(`${API_BASE_URL}/api/suggest`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          kind: "schedule",
+          homeHour,
+          profile: profile ?? undefined,
+          plan: plan.filter((m) => !m.done).map((m) => m.title),
+          assignments: assignments
+            .filter((a) => !a.done)
+            .map((a) => ({ title: a.title, subject: a.subject, due: a.due })),
+          goals: goals.length ? goals : undefined,
+        }),
+      });
+      const data = (await res.json()) as {
+        blocks?: { hour?: number; kind?: string; text?: string }[];
+      };
+      const list = Array.isArray(data.blocks) ? data.blocks : [];
+      if (list.length) {
+        const map: Record<number, ScheduleBlock> = {};
+        for (const b of list) {
+          if (
+            typeof b.hour === "number" &&
+            b.hour >= 9 &&
+            b.hour <= 20 &&
+            (b.text ?? "").trim()
+          ) {
+            const kind = (
+              ["study", "break", "class", "other"] as ScheduleKind[]
+            ).includes(b.kind as ScheduleKind)
+              ? (b.kind as ScheduleKind)
+              : "study";
+            map[b.hour] = { text: String(b.text).trim(), kind };
+          }
+        }
+        if (Object.keys(map).length)
+          setSchedule({ date: todayISO(), blocks: map });
+      }
+    } catch {
+      /* ignore — the button can be tapped again */
+    } finally {
+      setGeneratingSchedule(false);
+    }
+  };
 
   // The learner (or Eliora) adds a SMART goal.
   function addGoal(g: Omit<SmartGoal, "id" | "done">) {
@@ -2555,7 +3113,7 @@ export default function App() {
         }`,
         kind: "calendar",
       });
-    else if (n < 0 && n >= -4)
+    else if (n < 0 && n >= -3)
       reminders.push({
         id: `fu-${e.id}`,
         icon: "🔁",
@@ -2563,13 +3121,28 @@ export default function App() {
         kind: "chat",
         chatMsg: `My ${e.kind ?? "exam"} "${e.title}" just happened. Help me reflect on how it went and plan what to do next.`,
       });
-    else if (n <= -5 && n >= -10)
+    else if (n <= -4 && n >= -6)
       reminders.push({
         id: `fix-${e.id}`,
         icon: "🔁",
         text: `Correct mistakes from ${e.title}`,
         kind: "chat",
         chatMsg: `It's about a week since my ${e.kind ?? "test"} "${e.title}". Let's go over the questions I got wrong and fix those mistakes — re-teach me and quiz me on just those.`,
+      });
+    // A week after every exam and test, follow up on the results — by now the
+    // grade is usually back, so nudge a review of how it went and what to focus
+    // on next. Only for exams/tests (not plain assignments or misc events).
+    else if (
+      n <= -7 &&
+      n >= -11 &&
+      (!e.kind || e.kind === "exam" || e.kind === "final" || e.kind === "quiz")
+    )
+      reminders.push({
+        id: `res-${e.id}`,
+        icon: "📊",
+        text: `Results back for ${e.title}? Let's review them`,
+        kind: "chat",
+        chatMsg: `It's been about a week since my ${e.kind ?? "exam"} "${e.title}", so the results should be back. Help me review how I did — talk through my grade, what went well, and the topics to focus on next.`,
       });
   }
   // Goal target dates: the day a goal is meant to finish by (and shortly after),
@@ -2891,8 +3464,19 @@ export default function App() {
             subjects={subjects}
             onAdd={addAssignment}
             onToggle={toggleAssignment}
+            onSetConcern={setAssignmentConcern}
             onRemove={removeAssignment}
           />
+          <ScheduleCard
+            schedule={schedule}
+            onSet={setScheduleBlock}
+            onClear={clearSchedule}
+            homeHour={homeHour}
+            onSetHomeHour={setHomeHour}
+            onGenerate={generateStudySchedule}
+            generating={generatingSchedule}
+          />
+          <CheckInCard prefs={checkIn} onChange={setCheckIn} />
           <View style={styles.card}>
             <View style={styles.cardHead}>
               <Text style={styles.cardClass}>📅 Calendar</Text>
@@ -4051,6 +4635,105 @@ const styles = StyleSheet.create({
   assignSubjChipTextActive: { color: "#fff" },
   assignEmpty: { color: "#5b6660", fontSize: 14, marginTop: 10 },
   subjectsCount: { fontSize: 13, color: "#5b6660", fontWeight: "600" },
+  schedHint: { color: "#5b6660", fontSize: 13, marginTop: 4, marginBottom: 10 },
+  schedBuildRow: {
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "space-between",
+    gap: 10,
+    marginBottom: 8,
+  },
+  schedBuildLabel: { fontSize: 14, color: "#1c2421", fontWeight: "600" },
+  schedStepper: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 4,
+    borderWidth: 1,
+    borderColor: "#d9ddd8",
+    borderRadius: 10,
+    padding: 2,
+  },
+  schedStepBtn: { paddingHorizontal: 12, paddingVertical: 4 },
+  schedStepBtnText: { fontSize: 18, color: "#2f6f4f", fontWeight: "700" },
+  schedStepVal: {
+    fontSize: 14,
+    fontWeight: "700",
+    color: "#1c2421",
+    minWidth: 74,
+    textAlign: "center",
+  },
+  schedBuildBtn: {
+    backgroundColor: "#eaf3ec",
+    borderWidth: 1,
+    borderColor: "#bcd9c4",
+    borderRadius: 12,
+    paddingVertical: 10,
+    alignItems: "center",
+    marginBottom: 12,
+  },
+  schedBuildBtnText: { color: "#2f6f4f", fontWeight: "700", fontSize: 14 },
+  schedList: { gap: 6 },
+  schedRow: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 8,
+    backgroundColor: "#f7f8f6",
+    borderRadius: 10,
+    paddingVertical: 4,
+    paddingRight: 6,
+    paddingLeft: 8,
+    borderLeftWidth: 4,
+    borderLeftColor: "#d9ddd8",
+  },
+  schedRowNow: {
+    backgroundColor: "#eaf3ec",
+    borderWidth: 1,
+    borderColor: "#2f6f4f",
+    borderLeftWidth: 4,
+  },
+  schedTimeWrap: { width: 66, flexShrink: 0 },
+  schedTime: { fontSize: 12, fontWeight: "700", color: "#5b6660" },
+  schedNowDot: {
+    fontSize: 9,
+    fontWeight: "800",
+    color: "#2f6f4f",
+    letterSpacing: 0.4,
+  },
+  schedKind: { flexShrink: 0, padding: 2 },
+  schedKindEmoji: { fontSize: 18 },
+  schedInput: {
+    flex: 1,
+    minWidth: 0,
+    fontSize: 14,
+    color: "#1c2421",
+    paddingVertical: 6,
+    paddingHorizontal: 4,
+  },
+  schedTimer: {
+    flexShrink: 0,
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 2,
+    backgroundColor: "#eaf3ec",
+    borderRadius: 999,
+    paddingHorizontal: 4,
+    paddingVertical: 2,
+  },
+  schedTimerBtn: { paddingHorizontal: 4, paddingVertical: 2 },
+  schedTimerBtnText: { fontSize: 13, color: "#2f6f4f", fontWeight: "700" },
+  schedTimerTime: {
+    fontSize: 13,
+    fontWeight: "700",
+    color: "#2f6f4f",
+    minWidth: 40,
+    textAlign: "center",
+  },
+  schedTimerDone: { color: "#2f6f4f" },
+  schedTimerClear: { paddingHorizontal: 4, paddingVertical: 2 },
+  schedTimerClearText: { fontSize: 12, color: "#5b6660" },
+  schedTimerStart: { flexShrink: 0, paddingHorizontal: 6, paddingVertical: 4 },
+  schedTimerStartText: { fontSize: 16, opacity: 0.6 },
+  schedClearRow: { marginTop: 10, alignSelf: "flex-end" },
   assignItem: {
     flexDirection: "row",
     alignItems: "center",
@@ -4079,6 +4762,25 @@ const styles = StyleSheet.create({
   },
   assignMeta: { fontSize: 12.5, color: "#5b6660", marginTop: 2 },
   assignRemove: { color: "#9aa39d", fontSize: 22, paddingHorizontal: 4 },
+  concernAdd: { fontSize: 12.5, color: "#9aa39d", marginTop: 5 },
+  concernRow: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 6,
+    marginTop: 5,
+  },
+  concernIcon: { fontSize: 13 },
+  concernInput: {
+    flex: 1,
+    borderWidth: 1,
+    borderColor: "#d9ddd8",
+    borderRadius: 8,
+    paddingHorizontal: 8,
+    paddingVertical: 4,
+    fontSize: 12.5,
+    color: "#1c2421",
+    backgroundColor: "#fff",
+  },
   // SMART goals
   goalField: { marginTop: 10 },
   goalFieldLabel: {

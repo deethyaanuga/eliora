@@ -283,11 +283,16 @@ export async function POST(req: Request) {
           { role: "user", content },
         ],
         tools: [tool],
-        tool_choice: { type: "function", function: { name: tool.function.name } },
+        tool_choice: {
+          type: "function",
+          function: {
+            name: tool.type === "function" ? tool.function.name : "",
+          },
+        },
       });
+      const call = completion.choices[0]?.message?.tool_calls?.[0];
       const args = JSON.parse(
-        completion.choices[0]?.message?.tool_calls?.[0]?.function?.arguments ||
-          "{}",
+        (call && "function" in call ? call.function.arguments : "") || "{}",
       );
       if (output === "flashcards") {
         const cards = (args.cards ?? [])
@@ -337,7 +342,8 @@ export async function POST(req: Request) {
         const client = new OpenAI(); // reads OPENAI_API_KEY; throws if missing
         const completion = await client.chat.completions.create({
           model: ELIORA_SUMMARY_MODEL,
-          max_completion_tokens: 1300,
+          // In-depth notes / study guides run longer, so give room to finish.
+          max_completion_tokens: 2800,
           messages: [
             { role: "system", content: outputSystemPrompt(output, body.profile) },
             { role: "user", content },

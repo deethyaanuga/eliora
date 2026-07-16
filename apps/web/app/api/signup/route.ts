@@ -25,10 +25,16 @@ export async function POST(req: Request) {
   try {
     await createUser(email, password, body.name);
     return Response.json({ ok: true });
-  } catch {
+  } catch (err) {
+    if (err instanceof Error && err.message === "exists") {
+      return Response.json(
+        { error: "An account with that email already exists." },
+        { status: 409 },
+      );
+    }
     return Response.json(
-      { error: "An account with that email already exists." },
-      { status: 409 },
+      { error: "Something went wrong creating your account — try again." },
+      { status: 500 },
     );
   }
 }

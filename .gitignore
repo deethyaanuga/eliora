@@ -15,3 +15,7 @@ dist/
 # Local email/password user store (dev only)
 .auth-users.json
 apps/web/.auth-users.json
+
+# Local push-notification subscription store (dev only)
+.notif-subs.json
+apps/web/.notif-subs.json

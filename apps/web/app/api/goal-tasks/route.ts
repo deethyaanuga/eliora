@@ -77,7 +77,10 @@ export async function POST(req: Request) {
       },
     });
     const call = completion.choices[0]?.message?.tool_calls?.[0];
-    const args = call ? JSON.parse(call.function.arguments || "{}") : {};
+    const args =
+      call && "function" in call
+        ? JSON.parse(call.function.arguments || "{}")
+        : {};
     const tasks: string[] = (args.tasks ?? [])
       .map((t: unknown) => String(t).trim())
       .filter((t: string) => t.length > 0)

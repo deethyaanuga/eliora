@@ -6,6 +6,7 @@
     "orientation": "portrait",
     "userInterfaceStyle": "light",
     "newArchEnabled": true,
+    "icon": "./assets/icon.png",
     "splash": {
       "backgroundColor": "#f7f5f0"
     },
@@ -14,11 +15,21 @@
     },
     "android": {
       "adaptiveIcon": {
-        "backgroundColor": "#f7f5f0"
+        "foregroundImage": "./assets/adaptive-icon.png",
+        "backgroundColor": "#2c6b4c"
       }
     },
+    "plugins": [
+      [
+        "expo-notifications",
+        {
+          "color": "#2c6b4c"
+        }
+      ]
+    ],
     "extra": {
-      "apiBaseUrl": "http://localhost:3000"
+      "apiBaseUrl": "http://localhost:3000",
+      "//eas": "Push notifications need an EAS project id. Run `eas init` (or set it here as extra.eas.projectId) so getExpoPushTokenAsync can issue a token on a device build."
     }
   }
 }

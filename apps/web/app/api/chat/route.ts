@@ -6,6 +6,7 @@ import {
   eventsContext,
   fourYearPlanContext,
   goalsContext,
+  mistakesContext,
   planContext,
   profileContext,
   revisionContext,
@@ -17,15 +18,37 @@ import {
 
 // Streams newline-delimited JSON events to the client:
 //   {"type":"text","value":"..."}      incremental reply text
+//   {"type":"status","value":"..."}     what Eliora is doing right now (tool runs)
 //   {"type":"videos","items":[...]}    real YouTube videos to render as cards
 //   {"type":"plan","items":[...]}      learning-plan milestones
 //   {"type":"event","item":{...}}      a calendar date
 //   {"type":"flashcards","items":[...]}
 //   {"type":"quiz","items":[...]}
 //   {"type":"goal","item":{...}}        a SMART goal to add
+//   {"type":"mistake","item":{...}}     a concept for the mistake tracker
 //   {"type":"fourYearPlan","item":{...}} the long-term academic roadmap
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
+
+// Only this many of the most recent messages go to the model — the profile,
+// plan, calendar, and goals all travel in the system prompt, so old chat turns
+// add cost without adding much context.
+const MAX_HISTORY = 40;
+
+// Friendly one-liners shown in the chat bubble while a tool runs.
+const TOOL_STATUS: Record<string, string> = {
+  search_youtube: "Searching YouTube for real videos…",
+  fetch_link: "Reading that link…",
+  save_plan: "Updating your plan…",
+  add_event: "Adding it to your calendar…",
+  make_flashcards: "Making your flashcards…",
+  make_quiz: "Building your quiz…",
+  create_subject_folder: "Creating a subject folder…",
+  add_assignment: "Adding your assignment…",
+  add_goal: "Saving your goal…",
+  log_mistake: "Noting that for your review list…",
+  save_four_year_plan: "Updating your roadmap…",
+};
 
 const EVENT_KINDS = ["exam", "final", "quiz", "assignment", "other"] as const;
 
@@ -48,6 +71,28 @@ const TOOLS: OpenAI.Chat.Completions.ChatCompletionTool[] = [
           },
         },
         required: ["query"],
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "fetch_link",
+      description:
+        "Fetch a web page and return its readable text. Call this whenever the " +
+        "learner shares a URL (an article, study guide, assignment page, etc.) " +
+        "or asks about a specific link, so you can read it before answering. " +
+        "Works for public http(s) pages only; if it returns an error, say you " +
+        "couldn't open the page and ask them to paste the relevant part.",
+      parameters: {
+        type: "object",
+        properties: {
+          url: {
+            type: "string",
+            description: "Full URL to fetch, e.g. 'https://example.com/article'",
+          },
+        },
+        required: ["url"],
       },
     },
   },
@@ -254,6 +299,42 @@ const TOOLS: OpenAI.Chat.Completions.ChatCompletionTool[] = [
   {
     type: "function",
     function: {
+      name: "log_mistake",
+      description:
+        "Record a specific concept or skill the learner just got wrong, or " +
+        "revealed a real misconception about, onto their mistake tracker for " +
+        "targeted review later. Call this when you catch a GENUINE, specific " +
+        "misunderstanding in their answer or reasoning — not for tiny slips, " +
+        "typos, or things they self-correct. One call per distinct concept.",
+      parameters: {
+        type: "object",
+        properties: {
+          concept: {
+            type: "string",
+            description:
+              "The specific concept/skill they're missing, e.g. 'Balancing redox equations' or 'Subject–verb agreement'.",
+          },
+          subject: {
+            type: "string",
+            description: "The class/subject it belongs to, e.g. 'Chemistry'.",
+          },
+          why: {
+            type: "string",
+            description:
+              "The misconception — what they got wrong or believe incorrectly, in a short phrase.",
+          },
+          fix: {
+            type: "string",
+            description: "The correct idea, in one plain sentence.",
+          },
+        },
+        required: ["concept"],
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
       name: "save_four_year_plan",
       description:
         "Save or update the learner's long-term 4-year ACADEMIC ROADMAP — the " +
@@ -389,6 +470,103 @@ async function searchYouTube(
   }
 }
 
+// How much page text the model gets — enough for an article, small enough to
+// not blow up the context window.
+const FETCH_MAX_CHARS = 8000;
+
+// Hosts a server-side fetch must never reach (the request runs from our
+// server, so a learner-supplied URL could otherwise probe the local network).
+function isBlockedHost(hostname: string): boolean {
+  const h = hostname.toLowerCase();
+  return (
+    h === "localhost" ||
+    h.endsWith(".localhost") ||
+    h.endsWith(".local") ||
+    h.endsWith(".internal") ||
+    h === "0.0.0.0" ||
+    h === "[::1]" ||
+    h === "::1" ||
+    /^127\./.test(h) ||
+    /^10\./.test(h) ||
+    /^192\.168\./.test(h) ||
+    /^172\.(1[6-9]|2\d|3[01])\./.test(h) ||
+    /^169\.254\./.test(h) // link-local / cloud metadata
+  );
+}
+
+// Crude but dependency-free HTML → readable text.
+function htmlToText(html: string): string {
+  return html
+    .replace(/<script[\s\S]*?<\/script>/gi, " ")
+    .replace(/<style[\s\S]*?<\/style>/gi, " ")
+    .replace(/<!--[\s\S]*?-->/g, " ")
+    .replace(/<(br|\/p|\/div|\/li|\/h[1-6]|\/tr)\b[^>]*>/gi, "\n")
+    .replace(/<[^>]+>/g, " ")
+    .replace(/&nbsp;/gi, " ")
+    .replace(/&amp;/gi, "&")
+    .replace(/&lt;/gi, "<")
+    .replace(/&gt;/gi, ">")
+    .replace(/&#39;|&apos;/gi, "'")
+    .replace(/&quot;/gi, '"')
+    .replace(/[ \t]{2,}/g, " ")
+    .replace(/\n\s*\n\s*/g, "\n\n")
+    .trim();
+}
+
+async function fetchLink(
+  rawUrl: string,
+): Promise<{ url: string; title?: string; text: string } | { error: string }> {
+  let url: URL;
+  try {
+    url = new URL(rawUrl);
+  } catch {
+    return { error: "invalid_url" };
+  }
+  if (url.protocol !== "http:" && url.protocol !== "https:") {
+    return { error: "only_http_and_https_urls_are_supported" };
+  }
+  if (isBlockedHost(url.hostname)) {
+    return { error: "host_not_allowed" };
+  }
+  try {
+    const res = await fetch(url, {
+      redirect: "follow",
+      signal: AbortSignal.timeout(10_000),
+      headers: {
+        "User-Agent": "Mozilla/5.0 (compatible; ElioraBot/1.0)",
+        Accept: "text/html,application/xhtml+xml,text/plain;q=0.9,*/*;q=0.5",
+      },
+    });
+    if (!res.ok) return { error: `request_failed_${res.status}` };
+    const type = res.headers.get("content-type") ?? "";
+    if (!/text\/|html|xml|json/i.test(type)) {
+      return { error: "not_a_text_page" };
+    }
+    const raw = await res.text();
+    const title = /<title[^>]*>([\s\S]*?)<\/title>/i
+      .exec(raw)?.[1]
+      ?.trim()
+      .slice(0, 200);
+    const text = /html|xml/i.test(type) ? htmlToText(raw) : raw.trim();
+    if (!text) return { error: "page_had_no_readable_text" };
+    return {
+      url: url.toString(),
+      title: title || undefined,
+      text:
+        text.length > FETCH_MAX_CHARS
+          ? text.slice(0, FETCH_MAX_CHARS) + "\n\n[…truncated]"
+          : text,
+    };
+  } catch (err) {
+    return {
+      error:
+        err instanceof Error && err.name === "TimeoutError"
+          ? "request_timed_out"
+          : "request_error",
+    };
+  }
+}
+
 function isValid(messages: unknown): messages is ChatMessage[] {
   return (
     Array.isArray(messages) &&
@@ -396,7 +574,10 @@ function isValid(messages: unknown): messages is ChatMessage[] {
       (m) =>
         m &&
         typeof m === "object" &&
-        (m as ChatMessage).role !== undefined &&
+        // Only chat roles — a client must not be able to smuggle in a
+        // "system" (or other privileged) message.
+        ((m as ChatMessage).role === "user" ||
+          (m as ChatMessage).role === "assistant") &&
         typeof (m as ChatMessage).content === "string",
     )
   );
@@ -409,8 +590,32 @@ async function runTool(
   send: (obj: unknown) => void,
 ): Promise<string> {
   if (name === "search_youtube") {
-    const result = await searchYouTube(String(input.query ?? ""));
-    if (Array.isArray(result)) send({ type: "videos", items: result });
+    const query = String(input.query ?? "").trim();
+    const result = await searchYouTube(query);
+    if (Array.isArray(result)) {
+      send({ type: "videos", items: result });
+      return JSON.stringify(result);
+    }
+    // No API key / API failure — hand the model a ready-made search link so it
+    // can share that instead of apologizing about an error.
+    const link = `https://www.youtube.com/results?search_query=${encodeURIComponent(query)}`;
+    return JSON.stringify({
+      ...result,
+      fallback:
+        "Video lookup is unavailable, but do NOT tell the learner there was " +
+        `an error — just share this YouTube search link instead: ${link}`,
+    });
+  }
+  if (name === "fetch_link") {
+    const result = await fetchLink(String(input.url ?? "").trim());
+    if ("error" in result) {
+      return JSON.stringify({
+        ...result,
+        note:
+          "Could not read the page. Tell the learner you couldn't open the " +
+          "link and ask them to paste the part they want help with.",
+      });
+    }
     return JSON.stringify(result);
   }
   if (name === "save_plan") {
@@ -503,6 +708,23 @@ async function runTool(
     const due = /^\d{4}-\d{2}-\d{2}$/.test(dueRaw) ? dueRaw : undefined;
     send({ type: "assignment", item: { title, subject, due } });
     return `Added assignment "${title}"${due ? ` (due ${due})` : ""}.`;
+  }
+  if (name === "log_mistake") {
+    const concept = String(input.concept ?? "").trim();
+    if (!concept) return "No concept was given.";
+    const str = (v: unknown) =>
+      typeof v === "string" && v.trim() ? v.trim() : undefined;
+    send({
+      type: "mistake",
+      item: {
+        concept,
+        subject: str(input.subject),
+        why: str(input.why),
+        fix: str(input.fix),
+        source: "chat",
+      },
+    });
+    return `Logged "${concept}" to the mistake tracker.`;
   }
   if (name === "add_goal") {
     const specific = String(input.specific ?? "").trim();
@@ -643,30 +865,72 @@ export async function POST(req: Request) {
     goalsContext(body.goals, today) +
     fourYearPlanContext(body.fourYearPlan) +
     revisionContext(body.missed) +
+    mistakesContext(body.mistakes) +
     subjectsContext(body.subjects);
 
   const messages: OpenAI.Chat.Completions.ChatCompletionMessageParam[] = [
     { role: "system", content: system },
-    ...body.messages.map((m) => ({ role: m.role, content: m.content })),
+    ...body.messages
+      .slice(-MAX_HISTORY)
+      .map((m) => ({ role: m.role, content: m.content })),
   ];
+
+  // Create a (streaming) completion, retrying once on transient failures
+  // (rate limits, 5xx, dropped connections) so a blip doesn't kill the reply.
+  async function createCompletion(
+    client: OpenAI,
+    params: OpenAI.Chat.Completions.ChatCompletionCreateParamsStreaming,
+    signal: AbortSignal,
+  ) {
+    for (let attempt = 1; ; attempt++) {
+      try {
+        return await client.chat.completions.create(params, { signal });
+      } catch (err) {
+        const status = err instanceof OpenAI.APIError ? err.status : undefined;
+        const transient =
+          status === undefined || status === 429 || status >= 500;
+        if (signal.aborted || !transient || attempt >= 2) throw err;
+        await new Promise((r) => setTimeout(r, 800));
+      }
+    }
+  }
+
+  // Aborts the upstream OpenAI request when the client disconnects.
+  const upstream = new AbortController();
 
   const stream = new ReadableStream<Uint8Array>({
     async start(controller) {
-      const send = (obj: unknown) =>
-        controller.enqueue(encoder.encode(JSON.stringify(obj) + "\n"));
+      const send = (obj: unknown) => {
+        try {
+          controller.enqueue(encoder.encode(JSON.stringify(obj) + "\n"));
+        } catch {
+          /* client already disconnected — nothing to do */
+        }
+      };
 
       try {
         const client = new OpenAI(); // reads OPENAI_API_KEY; throws if missing
         // Tool-use loop: stream text each turn; if Eliora calls tools, run them,
         // feed results back, and continue. Capped to avoid loops.
+        let answered = false;
+        let streamedAny = false; // any visible text sent to the learner yet?
         for (let i = 0; i < 5; i++) {
-          const completion = await client.chat.completions.create({
-            model: ELIORA_CHAT_MODEL,
-            max_completion_tokens: 2000,
-            messages,
-            tools: TOOLS,
-            stream: true,
-          });
+          const completion = await createCompletion(
+            client,
+            {
+              model: ELIORA_CHAT_MODEL,
+              // gpt-5 reasoning shares this budget with the visible reply, so
+              // keep effort low (it's a chat coach, not a proof) and the cap
+              // roomy — otherwise reasoning can eat it all and the learner
+              // gets an empty reply.
+              max_completion_tokens: 4000,
+              reasoning_effort: "low",
+              messages,
+              tools: TOOLS,
+              stream: true,
+            },
+            upstream.signal,
+          );
 
           let assistantText = "";
           const calls: { id: string; name: string; args: string }[] = [];
@@ -675,6 +939,7 @@ export async function POST(req: Request) {
             const delta = chunk.choices[0]?.delta;
             if (delta?.content) {
               assistantText += delta.content;
+              streamedAny = true;
               send({ type: "text", value: delta.content });
             }
             for (const tc of delta?.tool_calls ?? []) {
@@ -686,7 +951,18 @@ export async function POST(req: Request) {
             }
           }
 
-          if (calls.length === 0) break; // no tools requested — done
+          if (calls.length === 0) {
+            answered = true;
+            break; // no tools requested — done
+          }
+
+          // Tell the learner what's happening while the tools run.
+          const labels = [
+            ...new Set(
+              calls.map((c) => TOOL_STATUS[c.name] ?? "Working on it…"),
+            ),
+          ];
+          send({ type: "status", value: labels.join(" ") });
 
           messages.push({
             role: "assistant",
@@ -698,23 +974,62 @@ export async function POST(req: Request) {
             })),
           });
 
-          for (const c of calls) {
-            let input: Record<string, unknown> = {};
-            try {
-              input = JSON.parse(c.args || "{}");
-            } catch {
-              /* leave empty */
-            }
-            const result = await runTool(c.name, input, send);
+          // Independent tools (e.g. two YouTube searches) run concurrently.
+          const results = await Promise.all(
+            calls.map((c) => {
+              let input: Record<string, unknown> = {};
+              try {
+                input = JSON.parse(c.args || "{}");
+              } catch {
+                /* leave empty */
+              }
+              return runTool(c.name, input, send);
+            }),
+          );
+          calls.forEach((c, j) =>
             messages.push({
               role: "tool",
               tool_call_id: c.id,
-              content: result,
-            });
+              content: results[j],
+            }),
+          );
+          send({ type: "status", value: "Thinking…" });
+        }
+
+        // If the loop cap was hit while the model still wanted tools, or the
+        // model never produced any visible text (e.g. reasoning ate the token
+        // budget), force a plain-text wrap-up so the learner never gets a
+        // silent ending.
+        if (!answered || !streamedAny) {
+          const wrapUp = await createCompletion(
+            client,
+            {
+              model: ELIORA_CHAT_MODEL,
+              max_completion_tokens: 2000,
+              reasoning_effort: "low",
+              messages,
+              tools: TOOLS,
+              tool_choice: "none",
+              stream: true,
+            },
+            upstream.signal,
+          );
+          for await (const chunk of wrapUp) {
+            const text = chunk.choices[0]?.delta?.content;
+            if (text) send({ type: "text", value: text });
           }
         }
         controller.close();
       } catch (err) {
+        if (upstream.signal.aborted) {
+          // Client hung up (or hit Stop) — nothing left to tell them.
+          try {
+            controller.close();
+          } catch {
+            /* already closed */
+          }
+          return;
+        }
         const status =
           err instanceof OpenAI.APIError ? ` (${err.status})` : "";
         send({
@@ -723,6 +1038,9 @@ export async function POST(req: Request) {
         });
         controller.close();
       }
+    },
+    cancel() {
+      upstream.abort();
     },
   });
 

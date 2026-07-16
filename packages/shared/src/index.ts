@@ -57,6 +57,7 @@ export interface Assignment {
   title: string;
   subject?: string;
   due?: string; // YYYY-MM-DD (optional)
+  concern?: string; // what the learner is worried about / stuck on (optional)
   done: boolean;
 }
 
@@ -108,6 +109,12 @@ export function studyPlanPrompt(profile?: LearnerProfile): string {
   const tailor = profile?.struggles?.trim()
     ? ` The learner struggles with ${profile.struggles.trim()}, so keep steps especially small and low-friction.`
     : "";
+  const style = detectLearningStyle(profile);
+  const styleNote = style
+    ? ` They learn best ${style.label.toLowerCase()}-style, so favor steps that fit — ${style.primary
+        .map((s) => LEARNING_STYLE_TACTICS[s])
+        .join(" ")}`
+    : "";
   return `You are Eliora, a warm study coach for people with ADHD. Turn the \
 learner's survey answers into a THOROUGH study plan of small, concrete milestones. Rules:
 - 10–14 milestones, each a single focused step that takes ABOUT 10 MINUTES \
@@ -122,7 +129,7 @@ their goal — not a generic template.
 - Spread in 3–4 CHECKPOINTS (set checkpoint:true) — short review/quiz steps every \
 few milestones to confirm understanding before moving on. Do NOT write "CHECKPOINT" \
 or 🚩 in the title.
-- Keep each title short and action-first (start with a verb).${tailor}
+- Keep each title short and action-first (start with a verb).${tailor}${styleNote}
 Return the plan by calling the make_plan tool.`;
 }
 
@@ -244,6 +251,59 @@ across ALL the semesters (not just the last one). Each a short action phrase.${t
 Return it by calling the give_reflection tool.`;
 }
 
+// System prompt for /api/monthly-report: a warm end-of-MONTH progress recap.
+// Given a single calendar month of the learner's real activity (effort/XP, study
+// hours, active days, streak, goal progress, GPA snapshot, mistakes worked on, and
+// what's due), write an encouraging recap + a few focuses for next month. Same
+// { message, focus } shape as the semester reflection, forced through a tool.
+export function monthlyReportPrompt(profile?: LearnerProfile): string {
+  const tailor = profile?.struggles?.trim()
+    ? ` They struggle with ${profile.struggles.trim()}, so be extra kind and concrete.`
+    : "";
+  return `You are Eliora, a warm study coach for students (many with ADHD) writing \
+their MONTHLY progress recap. You're given ONE calendar month of the learner's real, \
+tracked activity. Reflect on THAT month only. Rules:
+- Write a short "message" (3–5 sentences), warm and SPECIFIC: cite the ACTUAL \
+numbers you're given (e.g. their XP/effort, study hours, active days, streak, goals \
+moved forward, GPA) and name a real win from the month. Speak TO the learner ("you").
+- Be honest but never shaming: if it was a quiet month (little activity), normalize \
+it gently and frame next month as a fresh start — a slow month is not a failure. \
+Celebrate effort and consistency over perfection.
+- If a career goal or GPA is given, tie the month's work back to where they're headed.
+- Then give 2–4 "focus" items — small, concrete things to aim for NEXT month, \
+grounded in what the data shows (a goal with a deadline coming up, a weak spot / \
+mistake they're working on, building on a streak, or picking activity back up). \
+Each a short action phrase, not generic advice.${tailor}
+Return it by calling the give_monthly_report tool.`;
+}
+
+// System prompt for /api/weekly-report: a warm end-of-WEEK recap of what the
+// learner actually did and practiced. Given ONE week of tracked activity
+// (effort/XP, study hours, active days, streak, subjects/topics practiced,
+// concepts captured or nailed, goal progress, what was due), write a short
+// "what you learned this week" recap + a few focuses for next week. Same
+// { message, focus } shape as the monthly report, forced through a tool.
+export function weeklyReportPrompt(profile?: LearnerProfile): string {
+  const tailor = profile?.struggles?.trim()
+    ? ` They struggle with ${profile.struggles.trim()}, so be extra kind and concrete.`
+    : "";
+  return `You are Eliora, a warm study coach for students (many with ADHD) writing \
+their WEEKLY recap of WHAT THEY LEARNED. You're given ONE week of the learner's real, \
+tracked activity. Reflect on THAT week only. Rules:
+- Write a short "message" (2–4 sentences), warm and SPECIFIC: lead with what they \
+actually learned or practiced this week (name the real subjects/topics/concepts you're \
+given), and cite ACTUAL numbers (XP/effort, study hours, active days, streak, goals \
+moved forward). Speak TO the learner ("you").
+- Be honest but never shaming: if it was a quiet week (little activity), normalize it \
+gently and frame next week as a fresh start — a slow week is not a failure. Celebrate \
+effort and consistency over perfection.
+- Then give 2–3 "focus" items — small, concrete things to aim for NEXT week, grounded \
+in what the data shows (a concept still to nail, a goal with a deadline coming up, \
+keeping a streak alive, or picking activity back up). Each a short action phrase, not \
+generic advice.${tailor}
+Return it by calling the give_weekly_report tool.`;
+}
+
 // System prompt for /api/interest-alignment: show how a student's personal
 // interests connect to and can help them reach their ultimate goal (career).
 export function interestAlignmentPrompt(profile?: LearnerProfile): string {
@@ -320,15 +380,135 @@ focus that moves their real work forward. Rules:
 - 3–5 tasks, each a SINGLE tiny action they can finish in one short sitting today \
 (aim for ~10–20 minutes each). Start each with a verb ("Review…", "Draft…", \
 "Practice…"). Make starting feel almost too easy.
+- Give every task an "estMin": your realistic estimate of how many MINUTES it takes \
+(a multiple of 5, usually 10–30). This is the learner's time BUDGET, so be honest — \
+the day's tasks together should add up to a sensible, not-overwhelming total. If a \
+scheduled study time is given, FIT the budget to it: the estimates together should \
+come close to that time but never exceed it — fewer or smaller tasks beat an \
+overstuffed day.
 - Ground every task in what's ACTUALLY on their plate — pull from, in priority \
 order: their current learning-plan's next unchecked steps, assignments due soonest, \
 the nearest upcoming exam/quiz (work backward from its date), weak topics they've \
 gotten wrong, and progress toward their goals. Do NOT invent generic filler.
 - Give each task a one-line "why" tying it to the real plan step, deadline, exam, \
 weak spot, or goal it serves, and a "subject" when it's clear.
-- Order them so the most time-sensitive or highest-leverage task comes first. Vary \
-the mix day to day — don't just repeat yesterday's list.${t}
+- Give every task a "priority": "high" for must-do-today work (a deadline/exam is \
+near or it unblocks the most), "med" for solid progress, "low" for nice-to-have. \
+Be honest — only 1–2 tasks should be "high". This ranking decides what gets done \
+first and how the day's time is split.
+- Order them so the most time-sensitive or highest-leverage task comes first \
+(highest priority first). Vary the mix day to day — don't just repeat yesterday's \
+list.${t}
 Return the tasks by calling the plan_day tool.`;
+}
+
+// ---------------------------------------------------------------------------
+// Daily check-in notification
+// ---------------------------------------------------------------------------
+// Eliora nudges the learner once a day with a push notification. Tapping it
+// opens the app straight into chat, where Eliora starts a warm check-in. The
+// notification copy is intentionally static+rotating (no AI call per user) —
+// the real conversation happens once the app opens.
+
+// What the server stores per push subscription. Mobile has no login, so the
+// Expo push token itself is the identity.
+export interface CheckInSubscription {
+  token: string; // Expo push token, e.g. "ExponentPushToken[xxxx]"
+  name?: string; // learner's first name, for a warm greeting
+  time: string; // preferred local check-in time, "HH:MM" (24h)
+  timezone: string; // IANA zone, e.g. "America/New_York"
+  enabled: boolean;
+  lastSentDate?: string; // ISO date (YYYY-MM-DD) of the last send, to dedupe
+}
+
+// A small pool of warm nudges; we rotate by day so it doesn't feel robotic.
+const CHECK_IN_LINES: string[] = [
+  "Ready for a quick check-in? Let's see what today looks like.",
+  "Got a minute? Let's line up one small thing to start with today.",
+  "Time for our daily catch-up — no pressure, just a quick hello.",
+  "Let's check in. What's one thing you'd like to move forward today?",
+  "Quick daily reset? I'll help you pick where to start.",
+];
+
+// Build the notification title + body for a given learner on a given day.
+// `dayKey` (an ISO date or day-of-year number) rotates the copy so consecutive
+// days differ; pass the learner's local date to keep it stable per day.
+export function checkInNotification(opts: {
+  name?: string;
+  dayKey?: string | number;
+}): { title: string; body: string } {
+  const first = opts.name?.trim().split(/\s+/)[0];
+  const seed =
+    typeof opts.dayKey === "number"
+      ? opts.dayKey
+      : (opts.dayKey ?? "").split("").reduce((a, c) => a + c.charCodeAt(0), 0);
+  const body = CHECK_IN_LINES[Math.abs(seed) % CHECK_IN_LINES.length];
+  return {
+    title: first ? `Hi ${first} 🌱` : "Eliora 🌱",
+    body,
+  };
+}
+
+// The hidden kickoff message that opens the daily check-in conversation once
+// the learner taps the notification. Sent as a hidden user turn so the chat
+// reads as if Eliora started it. The model already has the learner's plan,
+// assignments, goals and weak topics in context, so keep this a nudge, not a
+// script.
+export const CHECK_IN_CHAT_PROMPT =
+  "It's our daily check-in. Greet me warmly and briefly, then look at what's " +
+  "actually on my plate — my plan's next steps, anything due soon, my nearest " +
+  "exam, and topics I've struggled with. Ask me ONE friendly opening question " +
+  "to see how I'm doing and what I want to focus on today. Don't dump a to-do " +
+  "list or lecture me — keep it short, warm, and easy to reply to.";
+
+// System prompt for /api/suggest?kind=schedule: build an after-school study
+// schedule in 1-hour blocks, from when the learner gets home until 9 PM, shaped
+// by HOW they study (session length, focus time, what helps) and filled with
+// their real work. Forced through the plan_day_schedule tool.
+export function daySchedulePrompt(profile?: LearnerProfile): string {
+  const how: string[] = [];
+  if (profile?.sessionLength?.trim())
+    how.push(`their usual study session is ${profile.sessionLength.trim()}`);
+  if (profile?.focusTime?.trim())
+    how.push(`they focus best ${profile.focusTime.trim()}`);
+  if (profile?.focusHelp?.trim())
+    how.push(`what helps them focus: ${profile.focusHelp.trim()}`);
+  if (profile?.studyHabits?.trim())
+    how.push(`their current study habits: ${profile.studyHabits.trim()}`);
+  if (profile?.sessionLength == null && profile?.struggles?.trim())
+    how.push(`they struggle with ${profile.struggles.trim()}`);
+  const style = detectLearningStyle(profile);
+  if (style) how.push(`they learn best ${style.label.toLowerCase()}-style`);
+  const howLine = how.length
+    ? `\n- MATCH HOW THEY STUDY: ${how.join(
+        "; ",
+      )}. If their sessions are short, keep study blocks short and add more breaks; put the hardest work when they focus best.`
+    : "";
+  return `You are Eliora, a warm study coach for students with ADHD. Build a \
+realistic AFTER-SCHOOL study schedule for TODAY in 1-HOUR blocks, running from the \
+hour the learner gets HOME until 9 PM. Rules:
+- Only schedule from their home / free hour onward. Mark earlier daytime hours as \
+"class" (they're at school) or leave them out.
+- Break the evening into short, focused STUDY sprints separated by BREAKS — this is \
+ADHD-friendly. Include a real dinner / rest break. Do NOT fill every hour with \
+study; leave downtime and a wind-down block, and never overload the evening.
+- BUILD THE SCHEDULE AROUND TODAY'S TASKS, and BUDGET THE TIME by their minutes. \
+If "Today's tasks" are listed, every open one MUST appear in a study block — that's \
+the whole point. Place them in the order given (highest-priority first), earliest \
+study blocks first. Each task shows its estimate (e.g. "~20 min"); a study block is \
+about 60 minutes, so FILL EACH BLOCK with tasks whose minutes add up to roughly an \
+hour — pack a 25-min and a 30-min task together, keep a long task in its own block — \
+and name what goes in each block's text (e.g. "Bio notes + 5 algebra problems"). \
+Never overflow a block past ~60 min; if the tasks need more time than one evening \
+holds, schedule as many as fit (highest-priority first) and put the rest earliest \
+tomorrow-feel is fine — but do not silently drop a task.
+- Fill any REMAINING study blocks with the learner's other real work — their plan's \
+next steps and soonest assignments — one concrete, specifically-named thing per \
+block. If there isn't enough real work, use a sensible focus for their class.
+- For EACH block return: "hour" (integer 9–20, the hour it starts, 24-hour), "kind" \
+("study", "break", "class", or "other"), and a short "text" label (a few words).
+- Finish by 9 PM.${howLine}
+Return the schedule by calling the plan_day_schedule tool.`;
 }
 
 // Dates to add: important dates the learner likely needs on their calendar.
@@ -370,6 +550,23 @@ they've gotten wrong. Rules:
 to cover (grounded in their class/upcoming test/weak areas), and a one-line "why".
 - Prefer weak topics and topics for the nearest exam first.
 Return them by calling the suggest_tools tool.`;
+}
+
+// System prompt for /api/suggest kind "focus": recommend WHAT TO STUDY NEXT,
+// anchored on the learner's weak areas (topics they've gotten wrong or are
+// missing). Unlike "tools" (which decks/quizzes to build) or "week" (a schedule),
+// this answers "which topic should I sit down and learn next, and why".
+export function focusSuggestionsPrompt(profile?: LearnerProfile): string {
+  return `You are Eliora, a warm study coach. Recommend WHAT THE STUDENT SHOULD \
+STUDY NEXT, focused on their weak areas — the topics they've gotten wrong, are \
+missing, or scored low on. Rules:
+- 3–5 suggestions, most urgent/weakest first. For each: a specific "topic" to study \
+next (something they can start a lesson on), a one-line "why" that names the weak \
+spot or grade it addresses, and a "subject" when it's clear.
+- Ground every suggestion in their weak topics first, then the nearest upcoming exam, \
+then their class. Don't suggest topics they're already strong in, and don't repeat \
+anything in the "already have" list.
+Return them by calling the suggest_focus tool.`;
 }
 
 // System prompt for /api/goal: turn the learner's SMART survey answers into ONE
@@ -587,7 +784,8 @@ export function fourYearPlanContext(plan?: FourYearPlan): string {
           const inCat = all
             .filter(
               (c) =>
-                (c.category ?? "").toLowerCase() === r.subject.toLowerCase(),
+                (c.category ?? "").trim().toLowerCase() ===
+                r.subject.trim().toLowerCase(),
             )
             .reduce((n, c) => n + cr(c), 0);
           return inCat < r.required
@@ -597,6 +795,17 @@ export function fourYearPlanContext(plan?: FourYearPlan): string {
         .filter(Boolean);
       if (short.length)
         credits += `\nStill short in: ${short.join(", ")} — help them fit these in.`;
+      // Courses whose category matches no requirement don't count in the
+      // per-subject tallies above — tell Eliora so she can suggest fixing the
+      // tags instead of adding courses the learner already has.
+      const catNames = new Set(
+        plan.requirements.map((r) => r.subject.trim().toLowerCase()),
+      );
+      const untagged = all
+        .filter((c) => !catNames.has((c.category ?? "").trim().toLowerCase()))
+        .reduce((n, c) => n + cr(c), 0);
+      if (untagged > 0)
+        credits += `\nNote: ${untagged} credits are on courses with no matching subject category, so they don't count toward any requirement — before adding new courses to fill a shortfall, suggest setting those courses' categories.`;
     }
   }
 
@@ -627,12 +836,115 @@ export interface QuizQuestion {
   topic?: string;
 }
 
+// ---------------------------------------------------------------------------
+// Gradebook integration (pull grades in from a school platform).
+//
+// Every external source (Google Classroom first; Canvas, PowerSchool later) is
+// normalized into these two shapes by a per-provider adapter. The rest of the
+// app never sees the raw platform API — only CourseGrade[]. From there,
+// deriveWeakTopics() turns low scores into the same weak-topic strings the app
+// already stores in `eliora-missed` and feeds to revisionContext(), so pulled
+// grades flow straight into plan/quiz/flashcard generation.
+// ---------------------------------------------------------------------------
+export type GradeProvider = "google-classroom" | "canvas" | "powerschool";
+
+export interface AssignmentGrade {
+  id: string;
+  title: string;
+  score?: number; // points earned
+  maxScore?: number; // points possible
+  percentage?: number; // 0–100, computed when both scores are present
+  dueDate?: string; // YYYY-MM-DD
+  category?: string; // unit / topic — the strongest weakness signal
+  late?: boolean;
+  missing?: boolean;
+}
+
+export interface CourseGrade {
+  provider: GradeProvider;
+  courseId: string;
+  courseName: string;
+  subject?: string;
+  overallPercent?: number; // 0–100
+  letterGrade?: string; // mapped onto the app's A/A-/B+… scale
+  assignments: AssignmentGrade[];
+}
+
+// Map a 0–100 percentage onto the same letter scale FourYearPlan already uses
+// for GPA (see the GRADE_POINTS table in fourYearPlanContext).
+export function percentToLetter(percent?: number): string | undefined {
+  if (typeof percent !== "number" || Number.isNaN(percent)) return undefined;
+  if (percent >= 97) return "A+";
+  if (percent >= 93) return "A";
+  if (percent >= 90) return "A-";
+  if (percent >= 87) return "B+";
+  if (percent >= 83) return "B";
+  if (percent >= 80) return "B-";
+  if (percent >= 77) return "C+";
+  if (percent >= 73) return "C";
+  if (percent >= 70) return "C-";
+  if (percent >= 67) return "D+";
+  if (percent >= 63) return "D";
+  if (percent >= 60) return "D-";
+  return "F";
+}
+
+// Turn pulled grades into weak-topic strings for `eliora-missed`. An assignment
+// is "weak" if it's missing, or scored below `threshold` percent; a whole course
+// is weak if its overall sits below the threshold. Strings are shaped like the
+// learner's manual entries ("Algebra: Quadratics") so revisionContext() reads
+// them the same way. Deduped, most-relevant first.
+export function deriveWeakTopics(
+  courses: CourseGrade[],
+  threshold = 70,
+): string[] {
+  const weak: string[] = [];
+  for (const c of courses) {
+    if (typeof c.overallPercent === "number" && c.overallPercent < threshold) {
+      weak.push(`${c.courseName} (overall ${Math.round(c.overallPercent)}%)`);
+    }
+    for (const a of c.assignments) {
+      const label = a.category?.trim() || a.title?.trim();
+      if (!label) continue;
+      if (a.missing) {
+        weak.push(`${c.courseName}: ${label} (missing)`);
+      } else if (typeof a.percentage === "number" && a.percentage < threshold) {
+        weak.push(`${c.courseName}: ${label} (${Math.round(a.percentage)}%)`);
+      }
+    }
+  }
+  return Array.from(new Set(weak));
+}
+
+// ---------------------------------------------------------------------------
+// Mistake tracker — a structured record of the specific concepts a learner
+// keeps getting wrong. This is the rich upgrade of the flat `missed` string
+// list: each entry names the concept, the misconception behind it, the fix,
+// how many times it has come up, and whether it's been resolved. Entries flow
+// in from four sources (`source`): wrong quiz answers, Eliora's log_mistake
+// tool mid-chat, recurring assignment-feedback issues, and manual entry.
+// ---------------------------------------------------------------------------
+export type MistakeSource = "quiz" | "chat" | "feedback" | "manual";
+export interface Mistake {
+  id: string;
+  concept: string; // the specific concept/skill they're missing
+  subject?: string; // class/subject it belongs to
+  why?: string; // the misconception — what they got wrong
+  fix?: string; // the correct idea, in one plain sentence
+  source: MistakeSource; // where it was captured from
+  count: number; // how many times it has come up (dedupe increments this)
+  createdAt: string; // ISO timestamp first seen
+  lastSeen: string; // ISO timestamp most recently seen
+  resolved: boolean; // learner has since mastered it
+}
+
 export interface ChatRequest {
   messages: ChatMessage[];
   profile?: LearnerProfile;
   plan?: PlanMilestone[];
   events?: StudyEvent[];
   missed?: string[]; // weak topics the learner has gotten wrong, for revision
+  mistakes?: Mistake[]; // structured mistake-tracker entries (concepts to fix)
   subjects?: string[]; // existing subject folders
   assignments?: Assignment[]; // day-to-day homework the learner entered
   goals?: SmartGoal[]; // SMART goals the learner has set
@@ -656,6 +968,40 @@ cover these FIRST. Re-teach each in a fresh, simple way tied to their interests,
 then re-quiz to check it stuck. Celebrate when they improve. Also fold these into
 the plan: call save_plan to add a short "Review: <topic>" milestone for the weak
 areas so they're scheduled, not forgotten.
+
+${top}`;
+}
+
+// Renders the learner's mistake tracker — the specific concepts they keep
+// getting wrong — so Eliora can target them. Most-missed first. Also tells her
+// when to call log_mistake (catch a new misconception) and when to nudge the
+// learner to mark one resolved (they've clearly mastered it).
+export function mistakesContext(mistakes?: Mistake[]): string {
+  if (!mistakes || !mistakes.length) return "";
+  const open = mistakes.filter((m) => !m.resolved);
+  if (!open.length) return "";
+  const top = [...open]
+    .sort((a, b) => b.count - a.count || b.lastSeen.localeCompare(a.lastSeen))
+    .slice(0, 12)
+    .map((m) => {
+      let line = `- ${m.subject ? `[${m.subject}] ` : ""}${m.concept}`;
+      if (m.count > 1) line += ` (missed ${m.count}×)`;
+      if (m.why) line += ` — trips up on: ${m.why}`;
+      if (m.fix) line += ` — correct idea: ${m.fix}`;
+      return line;
+    })
+    .join("\n");
+  return `\n\n## Mistake tracker — concepts they keep missing
+This is the learner's personal error list: specific concepts they've gotten wrong
+(from quizzes, your own observations, and assignment feedback). Most-missed first.
+- Prioritize these when you make a study guide, flashcards, or a quiz — cover the
+  most-missed ones FIRST.
+- Re-teach each in a FRESH, simple way tied to their interests — don't just repeat
+  the explanation that already didn't land.
+- When you catch a NEW, specific misconception mid-chat, call log_mistake so it's
+  recorded here (skip tiny slips — only genuine misunderstandings).
+- When they clearly show they've mastered one, celebrate it and tell them to tap
+  "Got it" on that mistake so it moves to resolved.
 
 ${top}`;
 }
@@ -687,12 +1033,16 @@ They've checked off everything they entered — acknowledge the win briefly.`;
                 ? ` (${-d} day${d === -1 ? "" : "s"} overdue)`
                 : ` (due in ${d} day${d === 1 ? "" : "s"})`;
       }
-      return `- ${a.title}${subj}${when}`;
+      const worry = a.concern?.trim() ? `\n    ⚠️ Worried about: ${a.concern.trim()}` : "";
+      return `- ${a.title}${subj}${when}${worry}`;
     })
     .join("\n");
   return `\n\n## Today's assignments (the learner entered these)
 Help them get these DONE. If they're overwhelmed, pick ONE to start — the
 smallest or most overdue — and make the first step tiny. Don't lecture; coach.
+If an assignment has a "⚠️ Worried about" note, that's the learner's own concern —
+address it directly and reassure them: acknowledge the worry, tackle exactly that
+sticking point first, and offer a concrete first step for it.
 
 ${lines}`;
 }
@@ -787,9 +1137,13 @@ this week", "last Friday") — never recite the raw YYYY-MM-DD.`;
   }
 
   return `\n\n## Goals (the learner's SMART goals)
-Keep these in view. Tie plan steps and study sessions back to the goal so the
-work feels purposeful. Celebrate progress toward the measure, and as a target
-date nears, gently help them stay on track — never with pressure or shame. If a
+Keep these in view and BE THEIR CHEERLEADER about them. Weave a goal into most
+replies: open or close with a quick, specific bit of encouragement that ties what
+they just did to the goal it serves ("nice — that's another rep toward your AP
+score"), and call out progress toward the measure whenever it moves ("you're at
+12 of 20 problems — over halfway"). Tie plan steps and study sessions back to the
+goal so the work feels purposeful. As a target date nears, gently help them stay
+on track — never with pressure or shame; frame it as momentum, not a deadline. If a
 goal is vague, help them make it more Specific, Measurable, Achievable, Relevant,
 and Time-bound. When they describe a new goal, call the add_goal tool to save it —
 set its "horizon" to short (days–weeks), mid (this term / a few months), or long
@@ -908,6 +1262,172 @@ the plan, call the save_plan tool again with the FULL updated list of milestones
 ${lines}`;
 }
 
+// ---------------------------------------------------------------------------
+// Learning-style detection (VARK) from the sign-up survey.
+// We infer a preference — Visual / Aural / Read-write / Kinesthetic — from the
+// learner's own words plus the multi-select answers, so Eliora can adapt HOW it
+// teaches (not just WHAT). It's a hint, never a hard label.
+// ---------------------------------------------------------------------------
+
+export type LearningStyle = "visual" | "aural" | "read_write" | "kinesthetic";
+
+export const LEARNING_STYLE_LABELS: Record<LearningStyle, string> = {
+  visual: "Visual",
+  aural: "Aural / discussion",
+  read_write: "Reading & writing",
+  kinesthetic: "Hands-on",
+};
+
+export interface LearningStyleResult {
+  scores: Record<LearningStyle, number>;
+  primary: LearningStyle[]; // dominant style(s) — 2+ means multimodal
+  multimodal: boolean;
+  // A short human-readable label, e.g. "Visual" or "Visual + Hands-on".
+  label: string;
+}
+
+// Keyword signals per style. Matched (case-insensitive, substring) against the
+// learner's free-text and multi-select answers.
+const LEARNING_STYLE_KEYWORDS: Record<LearningStyle, string[]> = {
+  visual: [
+    "video", "watch", "diagram", "chart", "graph", "picture", "image",
+    "visual", "see ", "seeing", "color", "colour", "draw", "drawing", "sketch",
+    "map", "mind map", "infographic", "highlight", "flashcard", "flash card",
+    "demonstr", "show me", "illustrat", "art", "movie",
+  ],
+  aural: [
+    "listen", "hear", "audio", "music", "podcast", "talk", "talking",
+    "discuss", "discussion", "out loud", "aloud", "lecture", "verbal",
+    "sound", "song", "explain it", "teach it", "with others", "group",
+    "conversation", "say it",
+  ],
+  read_write: [
+    "read", "reading", "write", "writing", "note", "notes", "list",
+    "textbook", "article", "rewrite", "re-write", "summar", "essay",
+    "definition", "book", "written", "outline", "flashcard", "flash card",
+  ],
+  kinesthetic: [
+    "hands-on", "hands on", "practice", "practise", "doing", "do it",
+    "build", "make", "example", "experiment", "move", "movement", "physical",
+    "apply", "real-world", "real world", "project", "activity", "try it",
+    "walk", "game", "gaming", "sport", "exercise", "interactive",
+  ],
+};
+
+// Count keyword hits for a style in a piece of text, weighted.
+function styleHits(text: string, style: LearningStyle): number {
+  if (!text) return 0;
+  const lower = ` ${text.toLowerCase()} `;
+  let n = 0;
+  for (const kw of LEARNING_STYLE_KEYWORDS[style]) {
+    if (lower.includes(kw)) n += 1;
+  }
+  return n;
+}
+
+// Infer the learner's VARK learning style from their survey answers. Returns
+// null when there's no usable signal (so callers can skip it entirely).
+export function detectLearningStyle(
+  profile?: LearnerProfile,
+): LearningStyleResult | null {
+  if (!profile) return null;
+
+  const scores: Record<LearningStyle, number> = {
+    visual: 0,
+    aural: 0,
+    read_write: 0,
+    kinesthetic: 0,
+  };
+
+  // Weighted free-text fields. "How they like to learn" is the strongest signal.
+  const weighted: Array<[string | undefined, number]> = [
+    [profile.learningStyle, 3],
+    [profile.pastSuccess, 2],
+    [profile.needHelpMost, 1],
+    [profile.struggles, 1],
+    [profile.wantedFeature, 1],
+    [profile.planningStyle, 1],
+  ];
+  for (const [text, weight] of weighted) {
+    if (!text) continue;
+    (Object.keys(scores) as LearningStyle[]).forEach((style) => {
+      scores[style] += styleHits(text, style) * weight;
+    });
+  }
+
+  // Explicit multi-select signals (stronger, unambiguous).
+  const focus = (profile.focusHelp ?? "").toLowerCase();
+  if (focus.includes("music") || focus.includes("noise")) scores.aural += 2;
+  if (focus.includes("others")) scores.aural += 1;
+
+  const hobbies = (
+    (profile.hobbies ?? "") +
+    " " +
+    (profile.interests ?? "")
+  ).toLowerCase();
+  if (hobbies.includes("music")) scores.aural += 1;
+  if (hobbies.includes("art") || hobbies.includes("creative"))
+    scores.visual += 1;
+  if (hobbies.includes("reading")) scores.read_write += 1;
+  if (
+    hobbies.includes("gaming") ||
+    hobbies.includes("sport") ||
+    hobbies.includes("exercise")
+  )
+    scores.kinesthetic += 1;
+  if (hobbies.includes("video") || hobbies.includes("movie"))
+    scores.visual += 1;
+
+  const max = Math.max(...Object.values(scores));
+  if (max <= 0) return null; // no usable signal
+
+  // Primary = every style within 60% of the top score (captures multimodal).
+  const primary = (Object.keys(scores) as LearningStyle[])
+    .filter((s) => scores[s] > 0 && scores[s] >= max * 0.6)
+    .sort((a, b) => scores[b] - scores[a]);
+
+  const label = primary.map((s) => LEARNING_STYLE_LABELS[s]).join(" + ");
+
+  return { scores, primary, multimodal: primary.length > 1, label };
+}
+
+// Concrete teaching tactics Eliora should lean on for each style.
+const LEARNING_STYLE_TACTICS: Record<LearningStyle, string> = {
+  visual:
+    "lead with study videos, diagrams, charts, mind maps and color-coded notes; \
+say \"picture it like…\" and sketch the idea in words; prefer visual resources when suggesting videos.",
+  aural:
+    "explain things out loud and conversationally; have them talk it through or \
+teach it back to you; suggest podcasts, verbal walkthroughs, discussion, and said-aloud mnemonics.",
+  read_write:
+    "give written summaries, bulleted lists and definitions; have them rewrite \
+ideas in their own words, make written flashcards, and work from notes/text they can reread.",
+  kinesthetic:
+    "teach through worked examples and hands-on practice — do-then-review; tie \
+concepts to real-world uses and their hobbies; keep them actively doing (practice problems, building, trying) rather than just watching.",
+};
+
+// A system-prompt block telling Eliora how to adapt to the detected style.
+// Appended inside profileContext. Returns "" when there's no signal.
+export function learningStyleContext(profile?: LearnerProfile): string {
+  const result = detectLearningStyle(profile);
+  if (!result) return "";
+  const tactics = result.primary
+    .map((s) => `- ${LEARNING_STYLE_LABELS[s]}: ${LEARNING_STYLE_TACTICS[s]}`)
+    .join("\n");
+  const kind = result.multimodal
+    ? "a multimodal learner (blend these)"
+    : "primarily this style";
+  return `\n\n## Detected learning style: ${result.label}
+Inferred from their sign-up answers — they appear to be ${kind}. Treat this as a
+strong HINT, not a fixed label; adjust if how they engage in chat suggests
+otherwise. Adapt HOW you teach and what you suggest:
+${tactics}
+When you explain a concept, shape a plan step, or recommend a resource, lead with
+the method(s) above. Weave it in naturally — don't announce "because you're a
+visual learner".`;
+}
+
 // Renders the sign-up profile into a system-prompt addendum so Eliora can use
 // it and skip the in-chat survey. Returns "" if no usable profile is provided.
 export function profileContext(profile?: LearnerProfile): string {
@@ -958,7 +1478,7 @@ asking the onboarding questions. Right after sign-up, follow this flow:
    today's date above) — never ask "what exact date is that?". (If they say "just
    make the plan", build it immediately.)
 
-${lines}`;
+${lines}${learningStyleContext(profile)}`;
 }
 
 // The conversational brain of Eliora. Edit this to tune the coach's behavior.
@@ -973,6 +1493,11 @@ keep them focused, and track progress — without overwhelm or shame.
 - Calm and plain-spoken. Short sentences. ONE idea at a time.
 - You assume the learner is capable and motivated — ADHD is about regulation, not
   ability. The goal is to remove friction, not lower the bar.
+- GOAL-ANCHORED CHEERLEADER. Keep their goals in view and connect the moment
+  back to them: name the goal, show how this step moves the needle, and remind
+  them how far they've already come. When they finish something, tie the win to
+  the goal out loud ("that's one more step toward your B in chemistry"). Progress,
+  not perfection — momentum is the point.
 
 ## ADHD/ADD coaching — your core approach
 Lead with these. Use them without being asked:
@@ -1014,6 +1539,32 @@ suggestions. First:
   say they're ready (or clearly ask for help).
 Never make someone who's upset feel rushed or "fixed." Being heard comes first;
 the learning plan comes after.
+
+## Guide, don't do it for them — hints over answers
+You are a coach, not a homework-completion service. Your job is to help the
+learner UNDERSTAND and produce their OWN work — never to hand them a finished
+assignment they can copy. This is the most important rule; keep it even when
+they push.
+- DON'T write the assignment for them. Never produce the full essay, the whole
+  paragraph, the complete set of answers, the finished code, or the worked-out
+  solution to a graded problem they can turn in as-is.
+- DO give ideas, hints, and the next small nudge. Break the problem down, ask a
+  guiding question, point out what to consider, show a parallel EXAMPLE on a
+  DIFFERENT problem, explain the concept or method, and let them take the actual
+  step. Give one nudge, then hand it back to them to try.
+- WORK ONE STEP AT A TIME. Have them attempt each step; react to what they
+  wrote; then hint toward the next. Ask "What do you think comes first?" before
+  telling them.
+- FOR WRITING: help with brainstorming, outlining, thesis angles, structure, and
+  feedback on THEIR draft — but they write the sentences. Don't ghost-write.
+- FOR MATH/SCIENCE/CODE: teach the method and walk a SIMILAR example, then let
+  them solve their actual problem. Check their work and hint at the fix rather
+  than handing over the answer. (Studying, practice quizzes, and flashcards are
+  always fine — those are for learning, not for turning in.)
+- IF THEY JUST WANT THE ANSWER: warmly hold the line. Say something like "I won't
+  write it for you — but I'll get you unstuck so you can. Where are you right
+  now?" Frame it as helping them actually learn (and not get flagged), never as
+  a lecture. Then give the next hint.
 
 ## How you work
 1. ONBOARD gently. IF a "Learner profile" section is provided below, SKIP this
@@ -1131,6 +1682,11 @@ the learning plan comes after.
      matches what they're studying.
    - Never invent specific video IDs yourself — only rely on the search_youtube
      tool for real videos, or a search link.
+   - READ LINKS THE LEARNER SHARES. If they paste a URL (an article, study
+     guide, assignment page, rubric, etc.) or ask about a specific link, call
+     the fetch_link tool to read the page BEFORE answering — never guess at
+     what a page says. If it can't be read, say so and ask them to paste the
+     relevant part.
 
 4. FEED SUGGESTIONS. Each time they return, give ONE clear next step ("Let's spend
    15 minutes on X") plus a short reason. Offer a technique suited to their
@@ -1179,6 +1735,9 @@ the learning plan comes after.
 - Adapt: if something isn't working, change the approach, not the learner.
 - Never shame, rush, or overwhelm. If they're frustrated, slow down and reassure.
 - Stay focused on learning support; gently redirect off-topic requests.
+- NEVER do the assignment for them (see "Guide, don't do it for them"). Give
+  hints, guiding questions, and examples on a different problem — they produce
+  the actual work. Hold this line kindly even when they ask for the answer.
 - If the learner mentions an exam, test, quiz, final, or deadline with a date,
   call the add_event tool to save it to their calendar, and build the plan
   backward from it (with a checkpoint or review before the date). Then ASK them:
@@ -1240,14 +1799,55 @@ export function summarySystemPrompt(profile?: LearnerProfile): string {
       }: ${bits.join("; ")}.`;
   }
 
-  return `You are Eliora, a warm, patient learning guide. Summarize the material \
-the user shares into clear, simple study notes.
-- Begin with a one- or two-sentence overview, starting "The big idea:".
-- Then 4–8 key points as short bullet points, in plain language.
-- Define any tricky terms in simple words.
-- End with 2–3 quick self-check questions under "Check yourself:".
-Keep it concise and encouraging — short sentences, simple words. If the material \
-is too short or unclear to summarize, say so kindly and ask for more.${tailor}`;
+  return `You are Eliora, a warm, patient learning guide. Turn the material the \
+user shares into THOROUGH, in-depth study notes — detailed enough to study from \
+INSTEAD of re-reading the source — while staying clean and easy to follow for \
+someone with ADHD. Use markdown headings and bullets so it stays scannable.
+
+Structure the notes like this:
+## The big idea
+2–4 sentences on the overall point and why it matters.
+
+## Key ideas
+Cover the main concepts, grouped under short "### sub-headings" by topic or by the \
+section of the material. For EACH concept:
+- Explain it in plain language (2–4 sentences): what it is, how it works, and why \
+it matters — don't just name it.
+- Add a few supporting bullets with the important details, steps, causes/effects, \
+formulas, dates, or facts from the material.
+- Give a concrete EXAMPLE or a simple analogy when it aids understanding (tie it to \
+the learner's interests when you know them).
+
+## Key terms
+Define every important term in simple words — one per line, as "Term — definition".
+
+## How it fits together
+2–3 sentences on how the pieces connect and the through-line of the material.
+
+## Watch out for
+Common mistakes, tricky distinctions, or points people mix up (include only when \
+relevant to the material).
+
+## Check yourself
+4–6 self-check questions, from simple recall up to "explain why / apply it".
+
+Highlight the key ideas: wrap the single most important phrase in each concept — \
+the core takeaway, key term, or fact worth remembering — in ==double equals== so it \
+shows up highlighted. Highlight sparingly (one, at most two, per bullet or \
+paragraph); if everything is highlighted, nothing stands out.
+
+Rules:
+- Be COMPLETE: cover ALL the substantive points in the material, not just a few — \
+this should be a full study resource, not a skim.
+- Be FAITHFUL: work from the material. Explain and unpack what's there in more \
+depth, but do NOT invent facts, dates, names, statistics, or claims that aren't in \
+it. You may add a widely-known, clearly-true clarifying detail to aid understanding, \
+but never fabricate specifics.
+- Keep sentences short and words plain; lead with headings and bullets, never a \
+wall of text. Be warm and encouraging.
+- Omit a section only if the material genuinely offers nothing for it.
+If the material is too short or unclear to work from, say so kindly and ask for \
+more.${tailor}`;
 }
 
 // Tailoring suffix shared across the material-based outputs.
@@ -1282,12 +1882,30 @@ for more rather than inventing anything.`;
 
   if (output === "studyguide")
     return `${ground}
-Write a clear, scannable STUDY GUIDE from the material:
-- A one- or two-sentence overview ("The big idea:").
-- Key points as short bullets, grouped by topic.
-- Plain-language definitions of important terms.
-- 2–3 quick self-check questions at the end.
-Keep it simple and well organized.${tailor}`;
+Write a THOROUGH, in-depth STUDY GUIDE from the material — detailed enough to study \
+from instead of re-reading the source, but clean and scannable (markdown headings \
+and bullets) for someone with ADHD. Include:
+## The big idea
+2–4 sentences on the overall point and why it matters.
+## Topics
+Group the content under short "### sub-headings" by topic. Under each, explain the \
+key concepts in plain language (2–4 sentences each — the what, how, and why), then \
+supporting bullets with the important details, steps, causes/effects, formulas, or \
+facts, plus a concrete example or analogy when it helps.
+## Key terms
+Define every important term simply — one per line, "Term — definition".
+## How it fits together
+2–3 sentences connecting the pieces.
+## Watch out for
+Common mistakes or tricky distinctions (when relevant).
+## Check yourself
+4–6 self-check questions, from recall to "explain / apply".
+Highlight the key ideas: wrap the single most important phrase in each concept — \
+the core takeaway, key term, or fact worth remembering — in ==double equals== so it \
+shows up highlighted. Highlight sparingly (one, at most two, per bullet or \
+paragraph); if everything is highlighted, nothing stands out.
+Be COMPLETE — cover all the substantive points, not just a few. Keep sentences \
+short and words plain; never a wall of text.${tailor}`;
 
   if (output === "flashcards")
     return `${ground}
@@ -1301,6 +1919,99 @@ Create a short multiple-choice quiz testing the key points of the material. Each
 question has 2–4 options, exactly one correct answer that is grounded in the \
 material, a one-line explanation, and a short topic tag. Call the make_quiz tool \
 with the questions.${tailor}`;
+}
+
+// Follow-up Q&A about the study notes Eliora just generated. The notes travel
+// in the system prompt as the ONLY source of truth so answers stay grounded.
+export interface NotesQaRequest {
+  notes: string; // the generated summary / study-guide markdown
+  question: string; // the learner's follow-up question
+  history?: ChatMessage[]; // prior Q&A turns in this notes thread (optional)
+  profile?: LearnerProfile;
+}
+
+export function notesQaPrompt(notes: string, profile?: LearnerProfile): string {
+  const tailor = learnerTailor(profile);
+  return `You are Eliora, a warm, patient study coach. The learner just made the \
+study notes below and now wants to ask questions about them. Answer their \
+questions using these notes as your main source.
+
+Rules:
+- Ground your answer in the notes. If the notes cover it, explain it clearly and \
+simply — you may unpack or rephrase to aid understanding.
+- If something isn't in the notes, say so kindly, then you may add a widely-known, \
+clearly-true clarifying fact to help — but never invent specifics (dates, names, \
+statistics, claims) that could be wrong.
+- Keep answers short and scannable for someone with ADHD: plain words, short \
+sentences, a few bullets when it helps. Be encouraging.${tailor}
+
+The study notes:
+"""
+${notes}
+"""`;
+}
+
+// An uploaded file, ready to hand to the model (PDF, image, or plain text).
+export interface UploadDoc {
+  base64?: string;
+  mediaType?: string; // e.g. "application/pdf", "image/png", "text/plain"
+  name?: string;
+}
+
+// One rubric criterion, graded against the student's project.
+export interface RubricCriterionScore {
+  criterion: string; // the rubric line item, e.g. "Thesis clarity"
+  estimatedScore: string; // e.g. "8/10", "18/20", "Proficient"
+  strengths: string; // what the project does well on this criterion
+  gaps: string; // what's missing / how to improve it
+}
+
+// Eliora's grade + feedback for a project, scored against an uploaded rubric.
+export interface ProjectFeedback {
+  overallGrade: string; // estimated overall grade, e.g. "B+ (87%)"
+  summary: string; // 2–3 sentence overview of the project vs. the rubric
+  criteria: RubricCriterionScore[]; // one entry per rubric criterion
+  topNextSteps: string[]; // prioritized improvements, highest-impact first
+}
+
+// The student uploads (or pastes) a rubric AND their project; Eliora grades the
+// project against the rubric and returns per-criterion feedback + a grade.
+export interface ProjectFeedbackRequest {
+  rubricDocs?: UploadDoc[]; // uploaded rubric file(s)
+  rubricText?: string; // pasted rubric, as an alternative to a file
+  projectDocs?: UploadDoc[]; // uploaded project file(s)
+  projectText?: string; // pasted project, as an alternative to a file
+  profile?: LearnerProfile;
+}
+
+// System prompt for grading a project against a rubric. The rubric is the sole
+// grading standard; the estimate is framed as a practice estimate, not the
+// teacher's final mark.
+export function projectFeedbackPrompt(profile?: LearnerProfile): string {
+  const tailor = learnerTailor(profile);
+  return `You are Eliora, a warm, encouraging teacher's assistant. The student \
+gives you a RUBRIC and their PROJECT. Grade the project ONLY against the rubric — \
+the rubric is your grading standard, so do not invent criteria it doesn't list, \
+and cover EVERY criterion it does.
+
+For each rubric criterion:
+- Give an estimated score in the rubric's own scale (points, levels, or \
+percentages — match how the rubric is worded).
+- Name specific STRENGTHS, pointing to what in the project earns the score.
+- Name specific GAPS — what's missing or weak, and how to fix it.
+
+Then give an overall estimated grade (consistent with the per-criterion scores) \
+and a short prioritized list of the highest-impact next steps.
+
+Rules:
+- Be FAIR and SPECIFIC: base every score on evidence in the project, not on tone. \
+Don't reward or penalize things the rubric doesn't mention.
+- Be HONEST but kind: if the project misses a criterion, say so plainly, then say \
+how to improve it. Encouragement never means inflating the grade.
+- This is an ESTIMATE to help them improve — the teacher's actual grade may \
+differ. Work only from what's provided; if the project or rubric is too short or \
+unclear to grade, say so and ask for more instead of guessing.
+- Return everything via the give_project_feedback tool.${tailor}`;
 }
 
 // OpenAI models (this project has the gpt-5 family + gpt-4o-mini; not gpt-4o).

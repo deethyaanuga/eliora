@@ -2,7 +2,9 @@ import OpenAI from "openai";
 import {
   ELIORA_SUMMARY_MODEL,
   dailyTasksPrompt,
+  daySchedulePrompt,
   dateSuggestionsPrompt,
+  focusSuggestionsPrompt,
   todoSuggestionsPrompt,
   toolSuggestionsPrompt,
   weekPlanPrompt,
@@ -10,15 +12,17 @@ import {
 } from "@eliora/shared";
 
 // A family of AI "suggestion" helpers behind one route, chosen by `kind`:
-//   "daily" → { items: [{title, why, subject}] }           (today's fresh tasks)
-//   "week"  → { items: [{title, why, when}] }              (this-week focus plan)
-//   "dates" → { suggestions: [{title, date, kind, why}] }  (dates to add)
-//   "todos" → { suggestions: [{title, subject, due}] }     (prep to-dos)
-//   "tools" → { suggestions: [{type, topic, why}] }        (flashcards/quizzes)
+//   "daily"    → { items: [{title, why, subject}] }        (today's fresh tasks)
+//   "schedule" → { blocks: [{hour, kind, text}] }          (after-school day plan)
+//   "week"     → { items: [{title, why, when}] }           (this-week focus plan)
+//   "dates"    → { suggestions: [{title, date, kind, why}] } (dates to add)
+//   "todos"    → { suggestions: [{title, subject, due}] }   (prep to-dos)
+//   "tools"    → { suggestions: [{type, topic, why}] }      (flashcards/quizzes)
+//   "focus"    → { suggestions: [{topic, why, subject}] }   (what to study next)
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 
-type Kind = "daily" | "week" | "dates" | "todos" | "tools";
+type Kind = "daily" | "schedule" | "week" | "dates" | "todos" | "tools" | "focus";
 type EventLike = { title?: string; date?: string; kind?: string };
 type GoalLike = { specific?: string; statement?: string; timeBound?: string };
 type AsgLike = { title?: string; subject?: string; due?: string };
@@ -32,12 +36,47 @@ type SuggestRequest = {
   events?: EventLike[];
   assignments?: AsgLike[];
   plan?: string[]; // the learner's current plan milestones (unchecked next steps)
+  tasks?: string[]; // today's open daily tasks (~10–20 min each), in priority order
+  homeHour?: number; // hour (24h) the learner gets home / is free to study
+  budgetMin?: number; // scheduled study minutes today — cap for the tasks' estMin total
   missed?: string[];
   existing?: string[];
   profile?: LearnerProfile;
 };
 
 const TOOLS: Record<Kind, OpenAI.Chat.Completions.ChatCompletionTool> = {
+  schedule: {
+    type: "function",
+    function: {
+      name: "plan_day_schedule",
+      description:
+        "Return an after-school study schedule as 1-hour blocks (9–20).",
+      parameters: {
+        type: "object",
+        properties: {
+          blocks: {
+            type: "array",
+            items: {
+              type: "object",
+              properties: {
+                hour: {
+                  type: "integer",
+                  description: "Start hour, 9–20 (24-hour).",
+                },
+                kind: {
+                  type: "string",
+                  enum: ["study", "break", "class", "other"],
+                },
+                text: { type: "string" },
+              },
+              required: ["hour", "text"],
+            },
+          },
+        },
+        required: ["blocks"],
+      },
+    },
+  },
   daily: {
     type: "function",
     function: {
@@ -54,8 +93,19 @@ const TOOLS: Record<Kind, OpenAI.Chat.Completions.ChatCompletionTool> = {
                 title: { type: "string" },
                 why: { type: "string" },
                 subject: { type: "string", description: "Subject, optional." },
+                priority: {
+                  type: "string",
+                  enum: ["high", "med", "low"],
+                  description:
+                    "How important/urgent this task is. high = must-do (soonest deadline, biggest leverage), low = nice-to-have.",
+                },
+                estMin: {
+                  type: "integer",
+                  description:
+                    "Estimated minutes to finish (multiple of 5, usually 10–30).",
+                },
               },
-              required: ["title"],
+              required: ["title", "priority"],
             },
           },
         },
@@ -167,22 +217,58 @@ const TOOLS: Record<Kind, OpenAI.Chat.Completions.ChatCompletionTool> = {
       },
     },
   },
+  focus: {
+    type: "function",
+    function: {
+      name: "suggest_focus",
+      description:
+        "Return the topics the student should study next, weakest/most-urgent first.",
+      parameters: {
+        type: "object",
+        properties: {
+          suggestions: {
+            type: "array",
+            items: {
+              type: "object",
+              properties: {
+                topic: {
+                  type: "string",
+                  description: "Specific topic to study next (lesson-sized).",
+                },
+                why: {
+                  type: "string",
+                  description: "One line naming the weak spot or grade it addresses.",
+                },
+                subject: { type: "string", description: "Subject, optional." },
+              },
+              required: ["topic"],
+            },
+          },
+        },
+        required: ["suggestions"],
+      },
+    },
+  },
 };
 
 const TOOL_NAMES: Record<Kind, string> = {
+  schedule: "plan_day_schedule",
   daily: "plan_day",
   week: "plan_week",
   dates: "suggest_dates",
   todos: "suggest_todos",
   tools: "suggest_tools",
+  focus: "suggest_focus",
 };
 
 const PROMPTS: Record<Kind, (p?: LearnerProfile) => string> = {
+  schedule: daySchedulePrompt,
   daily: dailyTasksPrompt,
   week: weekPlanPrompt,
   dates: dateSuggestionsPrompt,
   todos: todoSuggestionsPrompt,
   tools: toolSuggestionsPrompt,
+  focus: focusSuggestionsPrompt,
 };
 
 const str = (v: unknown) =>
@@ -224,15 +310,42 @@ export async function POST(req: Request) {
     .filter((s) => typeof s === "string" && s.trim())
     .map((s) => s.trim())
     .slice(0, 20);
+  const tasks = (body.tasks ?? [])
+    .filter((s) => typeof s === "string" && s.trim())
+    .map((s) => s.trim())
+    .slice(0, 8);
+
+  const homeHour =
+    typeof body.homeHour === "number" &&
+    body.homeHour >= 6 &&
+    body.homeHour <= 21
+      ? Math.round(body.homeHour)
+      : undefined;
+
+  const budgetMin =
+    typeof body.budgetMin === "number" && body.budgetMin >= 15
+      ? Math.min(720, Math.round(body.budgetMin))
+      : undefined;
 
   const detail = [
     `Today is ${today}.`,
+    homeHour != null
+      ? `Gets home / free to study at ${homeHour}:00 (24-hour). Schedule from then until 9 PM.`
+      : "",
+    budgetMin != null
+      ? `Scheduled study time today: ${budgetMin} minutes (from their schedule). Size the tasks so their estMin together come close to this but never exceed it.`
+      : "",
     str(body.career) ? `Career goal: ${body.career!.trim()}` : "",
     str(body.classes) || str(body.profile?.klass)
       ? `Classes: ${str(body.classes) ?? body.profile!.klass!.trim()}`
       : "",
     str(body.grade) || str(body.profile?.gradeYear)
       ? `Grade/year: ${str(body.grade) ?? body.profile!.gradeYear!.trim()}`
+      : "",
+    tasks.length
+      ? `Today's tasks — the learner's chosen focus for today (in priority order, ~10–20 min each). SCHEDULE THESE FIRST, in order:\n${tasks
+          .map((t) => `- ${t}`)
+          .join("\n")}`
       : "",
     plan.length
       ? `Current plan — next unchecked steps:\n${plan.map((p) => `- ${p}`).join("\n")}`
@@ -269,15 +382,79 @@ export async function POST(req: Request) {
         ? JSON.parse(call.function.arguments || "{}")
         : {};
 
+    if (kind === "schedule") {
+      const seen = new Set<number>();
+      const blocks = (Array.isArray(args.blocks) ? args.blocks : [])
+        .map((b: { hour?: unknown; kind?: unknown; text?: unknown }) => ({
+          hour:
+            typeof b?.hour === "number" ? Math.round(b.hour) : Number(b?.hour),
+          kind: ["study", "break", "class", "other"].includes(b?.kind as string)
+            ? (b!.kind as string)
+            : "study",
+          text: str(b?.text) ?? "",
+        }))
+        .filter(
+          (b: { hour: number; text: string }) =>
+            Number.isInteger(b.hour) &&
+            b.hour >= 9 &&
+            b.hour <= 20 &&
+            b.text &&
+            !seen.has(b.hour) &&
+            (seen.add(b.hour), true),
+        )
+        .sort((a: { hour: number }, b: { hour: number }) => a.hour - b.hour);
+      return blocks.length
+        ? Response.json({ blocks })
+        : Response.json({ error: "none" }, { status: 200 });
+    }
+
     if (kind === "daily") {
       const items = (Array.isArray(args.items) ? args.items : [])
         .filter((it: { title?: unknown }) => str(it?.title))
         .slice(0, 5)
-        .map((it: { title?: unknown; why?: unknown; subject?: unknown }) => ({
-          title: String(it.title).trim(),
-          why: str(it.why),
-          subject: str(it.subject),
-        }));
+        .map(
+          (it: {
+            title?: unknown;
+            why?: unknown;
+            subject?: unknown;
+            priority?: unknown;
+            estMin?: unknown;
+          }) => {
+            const m =
+              typeof it.estMin === "number" ? it.estMin : Number(it.estMin);
+            const p = it.priority;
+            return {
+              title: String(it.title).trim(),
+              why: str(it.why),
+              subject: str(it.subject),
+              priority:
+                p === "high" || p === "med" || p === "low" ? p : "med",
+              estMin:
+                Number.isFinite(m) && m > 0
+                  ? Math.min(120, Math.round(m))
+                  : undefined,
+            };
+          },
+        );
+      // Fit the estimates to the scheduled study budget: shave 5-minute chunks
+      // off the biggest tasks until the total fits (floor of 5 min per task).
+      if (budgetMin) {
+        type Item = { estMin?: number };
+        let total = (items as Item[]).reduce(
+          (n: number, it: Item) => n + (it.estMin ?? 0),
+          0,
+        );
+        while (total > budgetMin) {
+          const biggest = (items as Item[]).reduce(
+            (best: Item | null, it: Item) =>
+              (it.estMin ?? 0) > (best?.estMin ?? 0) ? it : best,
+            null,
+          );
+          if (!biggest?.estMin || biggest.estMin <= 5) break;
+          biggest.estMin -= 5;
+          total -= 5;
+        }
+      }
       return items.length
         ? Response.json({ items })
         : Response.json({ error: "none" }, { status: 200 });
@@ -322,6 +499,15 @@ export async function POST(req: Request) {
           title: String(s.title).trim(),
           subject: str(s.subject),
           due: isDate(s.due) ? s.due : undefined,
+        }));
+    } else if (kind === "focus") {
+      suggestions = raw
+        .filter((s: { topic?: unknown }) => str(s?.topic))
+        .slice(0, 5)
+        .map((s: { topic?: unknown; why?: unknown; subject?: unknown }) => ({
+          topic: String(s.topic).trim(),
+          why: str(s.why),
+          subject: str(s.subject),
         }));
     } else {
       // tools

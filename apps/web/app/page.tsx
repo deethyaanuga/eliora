@@ -38,6 +38,87 @@ type Chat = {
 };
 type ChatFolder = { id: string; name: string };
 
+// --- Sharing flashcards & notes with friends -------------------------------
+// Eliora is local-first (everything lives in the browser, no shared backend),
+// so "sharing" packs the deck or note into a link. The friend opens the link
+// on any device and the app imports it — no accounts or server needed.
+type SharePayload =
+  | { v: 1; kind: "flashcards"; title?: string; cards: Flashcard[] }
+  | { v: 1; kind: "note"; title?: string; text: string };
+
+// URL-safe base64 that survives unicode (emoji, accents) round-trips.
+function b64urlEncode(s: string): string {
+  return btoa(unescape(encodeURIComponent(s)))
+    .replace(/\+/g, "-")
+    .replace(/\//g, "_")
+    .replace(/=+$/, "");
+}
+function b64urlDecode(s: string): string {
+  const p = s.replace(/-/g, "+").replace(/_/g, "/");
+  return decodeURIComponent(escape(atob(p + "=".repeat((4 - (p.length % 4)) % 4))));
+}
+
+function makeShareUrl(payload: SharePayload): string {
+  const enc = b64urlEncode(JSON.stringify(payload));
+  const { origin, pathname } = window.location;
+  return `${origin}${pathname}?share=${enc}`;
+}
+
+// Read an incoming share from the URL (?share=…). Returns null if absent/bad.
+function readShareFromUrl(): SharePayload | null {
+  try {
+    const enc = new URLSearchParams(window.location.search).get("share");
+    if (!enc) return null;
+    const data = JSON.parse(b64urlDecode(enc)) as SharePayload;
+    if (data?.v !== 1) return null;
+    if (data.kind === "flashcards" && Array.isArray(data.cards)) return data;
+    if (data.kind === "note" && typeof data.text === "string") return data;
+    return null;
+  } catch {
+    return null;
+  }
+}
+
+// Try the native share sheet (lets them send to a friend via Messages, email,
+// WhatsApp, AirDrop…). Falls back to copying the link. Returns what happened.
+async function shareContent(
+  payload: SharePayload,
+): Promise<"shared" | "copied" | "error"> {
+  const url = makeShareUrl(payload);
+  const title =
+    payload.title ||
+    (payload.kind === "flashcards" ? "Flashcards from Eliora" : "Notes from Eliora");
+  const text =
+    payload.kind === "flashcards"
+      ? `${title} — ${payload.cards.length} flashcards to study. Open in Eliora:`
+      : `${title} — study notes. Open in Eliora:`;
+  try {
+    if (typeof navigator !== "undefined" && navigator.share) {
+      await navigator.share({ title, text, url });
+      return "shared";
+    }
+  } catch (e) {
+    // AbortError = user dismissed the sheet; treat as no-op, not an error.
+    if ((e as Error)?.name === "AbortError") return "error";
+  }
+  try {
+    await navigator.clipboard.writeText(url);
+    return "copied";
+  } catch {
+    return "error";
+  }
+}
+
+// Best-effort short title for a note: its first heading/line, markdown stripped.
+function noteTitle(text: string): string {
+  const line = (text || "")
+    .split("\n")
+    .map((l) => l.replace(/^#+\s*/, "").replace(/[*_`]/g, "").trim())
+    .find((l) => l.length > 0);
+  if (!line) return "Study notes";
+  return line.length > 60 ? line.slice(0, 60) + "…" : line;
+}
+
 let chatCounter = 0;
 function newChatId(): string {
   chatCounter += 1;
@@ -81,6 +162,71 @@ type Milestone = {
   added?: boolean; // true when the learner added this step themselves
 };
 type IncomingMilestone = { title: string; detail?: string; checkpoint?: boolean };
+
+// A daily 9am–9pm time-block schedule. `blocks` maps an hour (9…20, i.e. the
+// slot that starts at that hour) to what the learner plans to do then. Stamped
+// with the date it's for so it starts fresh each new day.
+type ScheduleKind = "study" | "break" | "class" | "other";
+type ScheduleBlock = { text: string; kind: ScheduleKind };
+type DaySchedule = { date: string; blocks: Record<number, ScheduleBlock> };
+// The hours the schedule covers: 9:00 (9am) through the 20:00 (8–9pm) block.
+const SCHEDULE_HOURS = [9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20];
+const SCHEDULE_KINDS: {
+  key: ScheduleKind;
+  emoji: string;
+  label: string;
+  color: string;
+}[] = [
+  { key: "study", emoji: "📚", label: "Study", color: "#2f6f4f" },
+  { key: "break", emoji: "☕", label: "Break", color: "#d98a2b" },
+  { key: "class", emoji: "🏫", label: "Class", color: "#3a6ea5" },
+  { key: "other", emoji: "📝", label: "Other", color: "#8a8a8a" },
+];
+const scheduleKind = (k: ScheduleKind) =>
+  SCHEDULE_KINDS.find((x) => x.key === k) ?? SCHEDULE_KINDS[0];
+// "9:00 AM", "12:00 PM", "1:00 PM" … for an hour in 24h form.
+function hourLabel(h: number): string {
+  const period = h < 12 ? "AM" : "PM";
+  const h12 = h % 12 === 0 ? 12 : h % 12;
+  return `${h12}:00 ${period}`;
+}
+// Default length for a per-task focus countdown (a Pomodoro sprint).
+const TIMER_DEFAULT_MIN = 25;
+// "25:00" / "4:09" — seconds → mm:ss for a countdown display.
+function fmtTimer(sec: number): string {
+  const m = Math.floor(sec / 60);
+  const s = sec % 60;
+  return `${m}:${s.toString().padStart(2, "0")}`;
+}
+// A soft two-note chime when a countdown finishes. Best-effort: the AudioContext
+// is unlocked by the click that started the timer, and any failure is ignored.
+function playTimerChime(): void {
+  try {
+    const Ctx =
+      window.AudioContext ||
+      (window as unknown as { webkitAudioContext?: typeof AudioContext })
+        .webkitAudioContext;
+    if (!Ctx) return;
+    const ctx = new Ctx();
+    const now = ctx.currentTime;
+    [880, 1174.66].forEach((freq, i) => {
+      const osc = ctx.createOscillator();
+      const gain = ctx.createGain();
+      osc.type = "sine";
+      osc.frequency.value = freq;
+      const t0 = now + i * 0.18;
+      gain.gain.setValueAtTime(0.0001, t0);
+      gain.gain.exponentialRampToValueAtTime(0.25, t0 + 0.02);
+      gain.gain.exponentialRampToValueAtTime(0.0001, t0 + 0.35);
+      osc.connect(gain).connect(ctx.destination);
+      osc.start(t0);
+      osc.stop(t0 + 0.36);
+    });
+    setTimeout(() => ctx.close().catch(() => {}), 1000);
+  } catch {
+    /* audio not available — silent */
+  }
+}
 type EventKind = "exam" | "final" | "quiz" | "assignment" | "other";
 type StudyEvent = {
   id: string;
@@ -96,8 +242,46 @@ type Assignment = {
   due?: string;
   estMin?: number; // estimated minutes (time management)
   planDate?: string; // day the learner plans to work on it (YYYY-MM-DD)
+  concern?: string; // what the learner is worried about / stuck on
   done: boolean;
 };
+// Turn an ISO due date (YYYY-MM-DD) into a friendly deadline for display:
+// the calendar date plus a relative countdown ("in 3 days", "tomorrow",
+// "overdue"). `urgent` flags anything due today/tomorrow or already past so
+// the UI can highlight it. Returns null when there's no due date.
+function formatDeadline(
+  due: string | undefined,
+  todayISO: string,
+): { label: string; urgent: boolean; overdue: boolean } | null {
+  if (!due) return null;
+  const date = new Date(`${due}T00:00:00`);
+  const dateLabel = date.toLocaleDateString("en-US", {
+    month: "short",
+    day: "numeric",
+    year:
+      date.getFullYear() === new Date(`${todayISO}T00:00:00`).getFullYear()
+        ? undefined
+        : "numeric",
+  });
+  const days = Math.round(
+    (date.getTime() - new Date(`${todayISO}T00:00:00`).getTime()) / 86_400_000,
+  );
+  const rel =
+    days < -1
+      ? `${Math.abs(days)} days overdue`
+      : days === -1
+        ? "overdue since yesterday"
+        : days === 0
+          ? "due today"
+          : days === 1
+            ? "due tomorrow"
+            : `in ${days} days`;
+  return {
+    label: `📅 ${dateLabel} · ${rel}`,
+    urgent: days <= 1,
+    overdue: days < 0,
+  };
+}
 // A SMART goal the learner sets (Specific, Measurable, Achievable, Relevant,
 // Time-bound). Only `specific` is required; `target`/`current` drive a progress bar.
 type GoalTask = { title: string; done: boolean };
@@ -147,6 +331,24 @@ type SmartGoal = {
   done: boolean;
 };
 
+// One entry in the mistake tracker — a specific concept the learner keeps
+// getting wrong. Captured from wrong quiz answers, Eliora's log_mistake tool,
+// recurring assignment-feedback issues, or manual entry. Deduped by concept
+// (case-insensitive); a repeat bumps `count` + `lastSeen` instead of adding a row.
+type MistakeSource = "quiz" | "chat" | "feedback" | "manual";
+type Mistake = {
+  id: string;
+  concept: string;
+  subject?: string;
+  why?: string; // the misconception
+  fix?: string; // the correct idea
+  source: MistakeSource;
+  count: number;
+  createdAt: string; // ISO
+  lastSeen: string; // ISO
+  resolved: boolean;
+};
+
 // The long-term 4-year academic roadmap: classes + milestones per year leading
 // to a destination (a college, major, or career). `done` is tracked on the
 // client. AI-generated (via /api/four-year-plan or the save_four_year_plan tool)
@@ -178,6 +380,8 @@ type FourYearPlan = {
   years: FourYearYear[];
   requirements?: CreditRequirement[];
   totalRequired?: number;
+  gpaGoal?: number; // target weighted GPA the learner is aiming for
+  projectedGrade?: string; // assumed grade for planned (ungraded) courses
 };
 // Answers from the 4-year-plan survey, passed to the generator. `blank` starts an
 // empty skeleton instead of drafting; `advise` asks Eliora what to do next after.
@@ -421,6 +625,8 @@ function normalizeFourYearPlan(raw: unknown, fallbackDest = ""): FourYearPlan {
     years,
     requirements: requirements.length ? requirements : undefined,
     totalRequired: fypNum(r.totalRequired),
+    gpaGoal: fypNum((r as { gpaGoal?: unknown }).gpaGoal),
+    projectedGrade: fypGrade((r as { projectedGrade?: unknown }).projectedGrade),
   };
 }
 
@@ -475,7 +681,9 @@ function fypCredits(plan: FourYearPlan) {
     (reqs.length ? reqs.reduce((n, r) => n + r.required, 0) : undefined);
   const byCategory = reqs.map((r) => {
     const inCat = all.filter(
-      (c) => (c.category ?? "").toLowerCase() === r.subject.toLowerCase(),
+      (c) =>
+        (c.category ?? "").trim().toLowerCase() ===
+        r.subject.trim().toLowerCase(),
     );
     return {
       subject: r.subject,
@@ -484,6 +692,15 @@ function fypCredits(plan: FourYearPlan) {
       earned: inCat.filter((c) => c.done).reduce((n, c) => n + cr(c), 0),
     };
   });
+  // Credits on courses whose category matches no requirement (or is blank) are
+  // invisible to the per-subject bars — surface them so a "short in Math"
+  // warning isn't really just a mistagged course.
+  const catNames = new Set(reqs.map((r) => r.subject.trim().toLowerCase()));
+  const uncategorized = reqs.length
+    ? all
+        .filter((c) => !catNames.has((c.category ?? "").trim().toLowerCase()))
+        .reduce((n, c) => n + cr(c), 0)
+    : 0;
 
   // GPA: credit-weighted average over completed courses that carry a letter grade.
   let gp = 0;
@@ -526,7 +743,82 @@ function fypCredits(plan: FourYearPlan) {
     shortOverall,
     shortCats,
     onTrack,
+    uncategorized,
   };
+}
+
+// Projected GPA: blend actual grades (completed, graded courses) with an ASSUMED
+// grade for every remaining/ungraded course, so the learner sees where the plan is
+// heading — not just what's already banked. Also works out the average grade they'd
+// need on the remaining courses to reach their weighted-GPA goal.
+const DEFAULT_PROJECTED_GRADE = "A-";
+function fypProjection(plan: FourYearPlan) {
+  const all = plan.years.flatMap((y) => y.courses);
+  const cr = (c: FourYearCourse) =>
+    typeof c.credits === "number" ? c.credits : 1;
+  const assumed = fypGrade(plan.projectedGrade) ?? DEFAULT_PROJECTED_GRADE;
+  const assumedPts = fypGradePoints(assumed) ?? 3.7;
+
+  let gp = 0; // projected unweighted points
+  let wgp = 0; // projected weighted points
+  let credits = 0; // all GPA-bearing credits in the projection
+  let gradedWeighted = 0; // weighted points already banked (real grades)
+  let gradedCredits = 0;
+  let remBonusW = 0; // level bonus on the remaining (ungraded) courses
+  for (const c of all) {
+    const w = cr(c);
+    const real = fypGradePoints(c.grade);
+    const bonus = c.level ? LEVEL_WEIGHT[c.level] : 0;
+    const base = real ?? assumedPts;
+    gp += base * w;
+    wgp += (base + bonus) * w;
+    credits += w;
+    if (real != null) {
+      gradedWeighted += (real + bonus) * w;
+      gradedCredits += w;
+    } else {
+      remBonusW += bonus * w;
+    }
+  }
+  const projectedGpa = credits > 0 ? gp / credits : undefined;
+  const projectedWeightedGpa = credits > 0 ? wgp / credits : undefined;
+
+  const goal = typeof plan.gpaGoal === "number" ? plan.gpaGoal : undefined;
+  const remainingCredits = credits - gradedCredits;
+  const meetsGoal =
+    goal != null && projectedWeightedGpa != null
+      ? projectedWeightedGpa >= goal - 0.001
+      : undefined;
+  // Base grade needed, on average, across the remaining courses (their level
+  // bonuses are already factored out) to hit the weighted goal.
+  let neededBase: number | undefined;
+  if (goal != null && remainingCredits > 0) {
+    neededBase =
+      (goal * credits - gradedWeighted - remBonusW) / remainingCredits;
+  }
+  return {
+    assumed,
+    projectedGpa,
+    projectedWeightedGpa,
+    goal,
+    meetsGoal,
+    neededBase,
+    remainingCredits,
+    hasCourses: credits > 0,
+  };
+}
+// Nearest letter grade to a grade-point value (to show a target as a letter).
+function fypLetterFor(points: number): string {
+  let best = GRADE_OPTIONS[0];
+  let bestDiff = Infinity;
+  for (const g of GRADE_OPTIONS) {
+    const d = Math.abs((GRADE_POINTS[g] ?? 0) - points);
+    if (d < bestDiff) {
+      bestDiff = d;
+      best = g;
+    }
+  }
+  return best;
 }
 
 // Unweighted GPA for a single year, from its graded, completed courses. Undefined
@@ -604,7 +896,7 @@ function AccessibilityPanel({
   onClose: () => void;
 }) {
   const items: {
-    key: Exclude<keyof A11y, "fontScale">;
+    key: Exclude<keyof A11y, "fontScale" | "theme">;
     label: string;
     desc: string;
   }[] = [
@@ -731,7 +1023,109 @@ function AccessibilityPanel({
             </span>
           </button>
         ))}
+        <ChangePasswordSection />
       </div>
+    </div>
+  );
+}
+
+// "Reset password" for signed-in users: verify the current password, set a new
+// one (typed twice). Google-only accounts get a friendly explanation from the
+// API instead, since they have no password in the local store.
+function ChangePasswordSection() {
+  const [open, setOpen] = useState(false);
+  const [current, setCurrent] = useState("");
+  const [next, setNext] = useState("");
+  const [confirm, setConfirm] = useState("");
+  const [error, setError] = useState("");
+  const [done, setDone] = useState(false);
+  const [busy, setBusy] = useState(false);
+
+  async function submit() {
+    setError("");
+    setDone(false);
+    if (!current || !next) {
+      setError("Fill in your current and new password.");
+      return;
+    }
+    if (next.length < 6) {
+      setError("New password must be at least 6 characters.");
+      return;
+    }
+    if (next !== confirm) {
+      setError("New passwords don't match — please retype them.");
+      return;
+    }
+    setBusy(true);
+    try {
+      const res = await fetch("/api/change-password", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ currentPassword: current, newPassword: next }),
+      });
+      const d = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        setError(d.error || "Could not change your password.");
+        return;
+      }
+      setDone(true);
+      setCurrent("");
+      setNext("");
+      setConfirm("");
+    } catch {
+      setError("Something went wrong. Please try again.");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <div style={{ marginTop: 12, borderTop: "1px solid var(--border)", paddingTop: 12 }}>
+      <div style={styles.toggleLabel}>Account</div>
+      {!open ? (
+        <button style={styles.linkBtn} onClick={() => setOpen(true)}>
+          🔑 Reset password
+        </button>
+      ) : (
+        <div style={{ display: "flex", flexDirection: "column", gap: 8, marginTop: 8 }}>
+          <input
+            style={styles.loginInput}
+            type="password"
+            placeholder="Current password"
+            value={current}
+            autoComplete="current-password"
+            onChange={(e) => setCurrent(e.target.value)}
+          />
+          <input
+            style={styles.loginInput}
+            type="password"
+            placeholder="New password (6+ characters)"
+            value={next}
+            autoComplete="new-password"
+            onChange={(e) => setNext(e.target.value)}
+          />
+          <input
+            style={styles.loginInput}
+            type="password"
+            placeholder="Confirm new password"
+            value={confirm}
+            autoComplete="new-password"
+            onChange={(e) => setConfirm(e.target.value)}
+            onKeyDown={(e) => {
+              if (e.key === "Enter") submit();
+            }}
+          />
+          {error && <p style={styles.loginError}>{error}</p>}
+          {done && (
+            <p style={{ color: "var(--accent)", margin: 0, fontSize: 14 }}>
+              ✅ Password changed.
+            </p>
+          )}
+          <button style={styles.loginSubmit} disabled={busy} onClick={submit}>
+            {busy ? "…" : "Change password"}
+          </button>
+        </div>
+      )}
     </div>
   );
 }
@@ -797,6 +1191,73 @@ function renderContent(text: string, linkColor: string) {
   return nodes;
 }
 
+// Inline formatting for one line: ==highlighted key ideas==, **bold**, plus
+// links/URLs (via renderContent). The AI wraps its most important takeaways in
+// == == so they show up as marker-pen highlights in the study notes.
+function renderInline(text: string, linkColor: string): React.ReactNode[] {
+  const out: React.ReactNode[] = [];
+  text.split(/(\*\*[^*]+\*\*|==[^=]+==)/g).forEach((part, i) => {
+    if (!part) return;
+    let m: RegExpMatchArray | null;
+    if ((m = part.match(/^\*\*([^*]+)\*\*$/)))
+      out.push(<strong key={`b${i}`}>{renderContent(m[1], linkColor)}</strong>);
+    else if ((m = part.match(/^==([^=]+)==$/)))
+      out.push(
+        <mark key={`h${i}`} style={styles.mdMark}>
+          {renderContent(m[1], linkColor)}
+        </mark>,
+      );
+    else out.push(<span key={`s${i}`}>{renderContent(part, linkColor)}</span>);
+  });
+  return out;
+}
+
+// Lightweight markdown renderer for AI study notes: #/##/### headings, - / *
+// bullets, 1. numbered items, **bold**, and links — kept plain and scannable.
+// (The AI's notes use this structure; chat stays on the simpler renderContent.)
+function renderMarkdown(text: string, linkColor: string): React.ReactNode {
+  const blocks: React.ReactNode[] = [];
+  text.split("\n").forEach((raw, i) => {
+    const line = raw.replace(/\s+$/, "");
+    if (!line.trim()) {
+      blocks.push(<div key={i} style={{ height: 6 }} />);
+      return;
+    }
+    let m: RegExpMatchArray | null;
+    if ((m = line.match(/^(#{1,6})\s+(.*)$/))) {
+      const style = m[1].length <= 2 ? styles.mdH2 : styles.mdH3;
+      blocks.push(
+        <div key={i} style={style}>
+          {renderInline(m[2], linkColor)}
+        </div>,
+      );
+    } else if ((m = line.match(/^(\s*)[-*]\s+(.*)$/))) {
+      const indent = Math.min(m[1].length, 6) * 4;
+      blocks.push(
+        <div key={i} style={{ ...styles.mdBullet, marginLeft: indent }}>
+          <span style={styles.mdBulletMark}>•</span>
+          <span>{renderInline(m[2], linkColor)}</span>
+        </div>,
+      );
+    } else if ((m = line.match(/^(\s*)(\d+)\.\s+(.*)$/))) {
+      const indent = Math.min(m[1].length, 6) * 4;
+      blocks.push(
+        <div key={i} style={{ ...styles.mdBullet, marginLeft: indent }}>
+          <span style={styles.mdBulletMark}>{m[2]}.</span>
+          <span>{renderInline(m[3], linkColor)}</span>
+        </div>,
+      );
+    } else {
+      blocks.push(
+        <div key={i} style={styles.mdP}>
+          {renderInline(line, linkColor)}
+        </div>,
+      );
+    }
+  });
+  return <div>{blocks}</div>;
+}
+
 function VideoCards({ videos }: { videos: Video[] }) {
   return (
     <div style={styles.videoGrid}>
@@ -820,6 +1281,198 @@ function VideoCards({ videos }: { videos: Video[] }) {
           </div>
         </a>
       ))}
+    </div>
+  );
+}
+
+type FeedVideo = Video & { topic: string };
+
+// A browsable feed of real study videos for the learner's classes. Videos play
+// inline (click a card → embedded player) so they can watch without leaving
+// the app. A search box lets them pull up a feed for any topic.
+function VideoFeed({ topics }: { topics: string[] }) {
+  const [items, setItems] = useState<FeedVideo[]>([]);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState(false);
+  const [playing, setPlaying] = useState<string | null>(null);
+  const [filter, setFilter] = useState<string | null>(null);
+  const [query, setQuery] = useState("");
+  // What the feed is currently built from: the learner's classes, or a search.
+  const [searched, setSearched] = useState<string | null>(null);
+
+  const topicsKey = topics.join("|");
+
+  async function load(forTopics: string[]) {
+    if (!forTopics.length) return;
+    setLoading(true);
+    setError(false);
+    setPlaying(null);
+    try {
+      const res = await fetch("/api/videos", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ topics: forTopics }),
+      });
+      const data = (await res.json()) as { items?: FeedVideo[]; error?: string };
+      if (data.items?.length) setItems(data.items);
+      else {
+        setItems([]);
+        setError(true);
+      }
+    } catch {
+      setItems([]);
+      setError(true);
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  useEffect(() => {
+    setSearched(null);
+    setFilter(null);
+    load(topics);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [topicsKey]);
+
+  function search() {
+    const q = query.trim();
+    if (!q || loading) return;
+    setSearched(q);
+    setFilter(null);
+    load([q]);
+  }
+
+  const feedTopics = searched ? [searched] : topics;
+  const shown = filter ? items.filter((v) => v.topic === filter) : items;
+
+  return (
+    <div style={styles.card}>
+      <div style={styles.cardHead}>
+        <span style={styles.cardClass}>🎬 Video feed</span>
+        <button
+          style={styles.feedRefresh}
+          disabled={loading || !feedTopics.length}
+          onClick={() => load(feedTopics)}
+        >
+          ↻ Refresh
+        </button>
+      </div>
+      <div style={styles.feedSearchRow}>
+        <input
+          style={styles.feedSearchInput}
+          placeholder="Search study videos on any topic…"
+          value={query}
+          onChange={(e) => setQuery(e.target.value)}
+          onKeyDown={(e) => {
+            if (e.key === "Enter") search();
+          }}
+        />
+        <button style={styles.feedSearchBtn} disabled={loading} onClick={search}>
+          Search
+        </button>
+        {searched && (
+          <button
+            style={styles.feedRefresh}
+            disabled={loading}
+            onClick={() => {
+              setSearched(null);
+              setQuery("");
+              load(topics);
+            }}
+          >
+            ← My classes
+          </button>
+        )}
+      </div>
+      {feedTopics.length > 1 && (
+        <div style={styles.feedChips}>
+          {[null, ...feedTopics].map((t) => (
+            <button
+              key={t ?? "__all"}
+              style={{
+                ...styles.feedChip,
+                ...(filter === t ? styles.feedChipActive : {}),
+              }}
+              onClick={() => setFilter(t)}
+            >
+              {t ?? "All"}
+            </button>
+          ))}
+        </div>
+      )}
+
+      {!feedTopics.length && (
+        <p style={styles.feedEmpty}>
+          Add a class in the Study tab (or search a topic above) and your
+          video feed will fill up with study videos.
+        </p>
+      )}
+      {loading && <p style={styles.feedEmpty}>Loading your feed…</p>}
+      {!loading && error && feedTopics.length > 0 && (
+        <p style={styles.feedEmpty}>
+          Couldn&apos;t load videos right now. Try{" "}
+          {feedTopics.map((t, i) => (
+            <span key={t}>
+              {i > 0 && ", "}
+              <a
+                href={`https://www.youtube.com/results?search_query=${encodeURIComponent(t)}`}
+                target="_blank"
+                rel="noopener noreferrer"
+              >
+                {t} on YouTube
+              </a>
+            </span>
+          ))}
+          .
+        </p>
+      )}
+
+      {!loading && shown.length > 0 && (
+        <div style={styles.feedGrid}>
+          {shown.map((v) => (
+            <div key={v.videoId} style={styles.feedCard}>
+              {playing === v.videoId ? (
+                <iframe
+                  style={styles.feedPlayer}
+                  src={`https://www.youtube.com/embed/${v.videoId}?autoplay=1`}
+                  title={v.title}
+                  allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture"
+                  allowFullScreen
+                />
+              ) : (
+                <button
+                  style={styles.feedThumbBtn}
+                  onClick={() => setPlaying(v.videoId)}
+                  aria-label={`Play ${v.title}`}
+                >
+                  {/* eslint-disable-next-line @next/next/no-img-element */}
+                  <img
+                    src={`https://i.ytimg.com/vi/${v.videoId}/mqdefault.jpg`}
+                    alt=""
+                    style={styles.videoThumb}
+                  />
+                  <span style={styles.feedPlayBadge}>▶</span>
+                </button>
+              )}
+              <div style={styles.videoMeta}>
+                <span style={styles.videoTitle}>{v.title}</span>
+                <span style={styles.videoChannel}>{v.channel}</span>
+                <span style={styles.feedCardFoot}>
+                  <span style={styles.feedTopicTag}>{v.topic}</span>
+                  <a
+                    href={v.url}
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    style={styles.feedYtLink}
+                  >
+                    YouTube ↗
+                  </a>
+                </span>
+              </div>
+            </div>
+          ))}
+        </div>
+      )}
     </div>
   );
 }
@@ -872,6 +1525,58 @@ function ProfileCard({
   );
 }
 
+// A per-assignment "what are you worried about?" note. Keeps its own draft state
+// and commits on blur so we don't rewrite global state (and localStorage) on every
+// keystroke. Eliora sees the concern in her context and coaches around it.
+function ConcernField({
+  value,
+  onCommit,
+}: {
+  value?: string;
+  onCommit: (concern: string) => void;
+}) {
+  const [draft, setDraft] = useState(value ?? "");
+  const [editing, setEditing] = useState(false);
+  // Keep the draft in sync if the underlying value changes while not editing.
+  useEffect(() => {
+    if (!editing) setDraft(value ?? "");
+  }, [value, editing]);
+
+  if (!editing && !value) {
+    return (
+      <button
+        style={styles.concernAdd}
+        onClick={() => setEditing(true)}
+        aria-label="Add a concern"
+      >
+        💭 Add a concern
+      </button>
+    );
+  }
+  return (
+    <div style={styles.concernRow}>
+      <span style={styles.concernIcon} aria-hidden>
+        💭
+      </span>
+      <input
+        style={styles.concernInput}
+        value={draft}
+        autoFocus={editing && !value}
+        placeholder="What's worrying you about this?"
+        onChange={(e) => setDraft(e.target.value)}
+        onFocus={() => setEditing(true)}
+        onBlur={() => {
+          setEditing(false);
+          if ((draft.trim() || "") !== (value ?? "")) onCommit(draft);
+        }}
+        onKeyDown={(e) => {
+          if (e.key === "Enter") (e.target as HTMLInputElement).blur();
+        }}
+      />
+    </div>
+  );
+}
+
 // The learner types in their day-to-day assignments / homework here.
 function AssignmentsPanel({
   assignments,
@@ -882,6 +1587,7 @@ function AssignmentsPanel({
   timeMgmt,
   onToggleTimeMgmt,
   onSetTime,
+  onSetConcern,
   onAdd,
   onToggle,
   onRemove,
@@ -894,6 +1600,7 @@ function AssignmentsPanel({
   timeMgmt: boolean;
   onToggleTimeMgmt: () => void;
   onSetTime: (id: string, f: { estMin?: number; planDate?: string }) => void;
+  onSetConcern: (id: string, concern: string) => void;
   onAdd: (a: {
     title: string;
     subject?: string;
@@ -1044,13 +1751,25 @@ function AssignmentsPanel({
               <div style={a.done ? styles.assignTitleDone : styles.assignTitle}>
                 {a.title}
               </div>
-              {(a.subject || a.due) && (
-                <div style={styles.assignMeta}>
-                  {a.subject}
-                  {a.subject && a.due ? " · " : ""}
-                  {a.due ? `due ${a.due}` : ""}
-                </div>
-              )}
+              {a.subject && <div style={styles.assignMeta}>{a.subject}</div>}
+              {(() => {
+                const dl = formatDeadline(a.due, todayISO);
+                if (!dl) return null;
+                return (
+                  <div
+                    style={{
+                      ...styles.assignDeadline,
+                      ...(!a.done && dl.overdue
+                        ? styles.assignDeadlineOverdue
+                        : !a.done && dl.urgent
+                          ? styles.assignDeadlineUrgent
+                          : {}),
+                    }}
+                  >
+                    {dl.label}
+                  </div>
+                );
+              })()}
               {timeMgmt && (
                 <div style={styles.timeRow}>
                   <input
@@ -1077,6 +1796,12 @@ function AssignmentsPanel({
                     }
                   />
                 </div>
+              )}
+              {!a.done && (
+                <ConcernField
+                  value={a.concern}
+                  onCommit={(c) => onSetConcern(a.id, c)}
+                />
               )}
             </div>
             <button
@@ -1400,6 +2125,18 @@ function GoalsPanel({
     setSuggestions((prev) => (prev ? prev.filter((_, x) => x !== i) : prev));
   const activeGoals = goals.filter((g) => !g.done);
   const achieved = goals.filter((g) => g.done);
+  // Goal achievements: the badges you unlock by achieving goals, shown right
+  // here so progress toward them is visible where goals live. They only depend
+  // on goal counts, so build a minimal stats object (XP fields unused here).
+  const goalBadges = BADGE_DEFS.filter((b) => b.id.startsWith("goal-"));
+  const goalStats: BadgeStats = {
+    total: 0,
+    activeDays: 0,
+    streak: 0,
+    goalsAchieved: achieved.length,
+    goalHorizons: new Set(achieved.map((g) => g.horizon).filter(Boolean)).size,
+  };
+  const earnedGoalBadges = goalBadges.filter((b) => b.met(goalStats)).length;
   // Within a group, soonest deadline first (undated goals last).
   const byDeadline = (a: SmartGoal, b: SmartGoal) => {
     if (a.timeBound && b.timeBound) return a.timeBound.localeCompare(b.timeBound);
@@ -1580,6 +2317,46 @@ function GoalsPanel({
           Specific, Measurable, Achievable, Relevant, Time-bound.
         </p>
       )}
+      {goals.length > 0 && (
+        <div style={styles.goalAchStrip}>
+          <div style={styles.goalAchHead}>
+            <span style={styles.goalAchTitle}>🏆 Achievements</span>
+            <span style={styles.subjectsCount}>
+              {earnedGoalBadges}/{goalBadges.length} unlocked
+            </span>
+          </div>
+          <div style={styles.goalAchRow}>
+            {goalBadges.map((bd) => {
+              const earned = bd.met(goalStats);
+              return (
+                <div
+                  key={bd.id}
+                  style={styles.goalAchItem}
+                  title={earned ? `${bd.label} — ${bd.blurb}` : `🔒 ${bd.hint}`}
+                >
+                  <span
+                    style={{
+                      ...styles.goalAchMedal,
+                      background: bd.bg,
+                      ...(earned ? {} : styles.badgeMedalLocked),
+                    }}
+                  >
+                    {bd.emoji}
+                  </span>
+                  <span
+                    style={{
+                      ...styles.goalAchLabel,
+                      ...(earned ? {} : { color: "var(--muted)" }),
+                    }}
+                  >
+                    {bd.label}
+                  </span>
+                </div>
+              );
+            })}
+          </div>
+        </div>
+      )}
       {goalGroups.map((grp) => {
         const inGroup = activeGoals
           .filter((g) => (grp.horizon ? g.horizon === grp.horizon : !g.horizon))
@@ -1593,13 +2370,24 @@ function GoalsPanel({
               ...(grp.highlight ? styles.goalGroupHighlight : {}),
             }}
           >
-            <div
-              style={{
-                ...styles.goalGroupHead,
-                ...(grp.highlight ? styles.goalGroupHeadHighlight : {}),
-              }}
-            >
-              {grp.title} · {inGroup.length}
+            <div style={styles.goalGroupHeadRow}>
+              <span
+                style={
+                  grp.highlight
+                    ? styles.goalGroupHeadHighlight
+                    : styles.goalGroupHead
+                }
+              >
+                {grp.title}
+              </span>
+              <span
+                style={{
+                  ...styles.goalGroupCount,
+                  ...(grp.highlight ? styles.goalGroupCountOn : {}),
+                }}
+              >
+                {inGroup.length}
+              </span>
             </div>
             {inGroup.map(goalCard)}
           </div>
@@ -1720,13 +2508,73 @@ type SugItem = Record<string, string | undefined>;
 
 // A single auto-generated task for today, and the day's set (stamped with the
 // date it was generated for so it regenerates when a new day begins).
+// How important a task is. Drives ordering and how the day's time is split:
+// higher-priority tasks are worked first and get a bigger slice of the budget.
+type Priority = "high" | "med" | "low";
 type DailyTask = {
   title: string;
   why?: string;
   subject?: string;
+  priority?: Priority; // importance ranking (defaults to "med" when unset)
+  estMin?: number; // estimated minutes — the time budget for this task
   done: boolean;
 };
 type DailyTasksState = { date: string; tasks: DailyTask[] };
+
+// Weight each priority carries when splitting a fixed time block across tasks:
+// a "high" task gets 3× the minutes of a "low" one.
+const PRIORITY_WEIGHT: Record<Priority, number> = { high: 3, med: 2, low: 1 };
+const PRIORITY_RANK: Record<Priority, number> = { high: 0, med: 1, low: 2 };
+const PRIORITY_LABEL: Record<Priority, string> = {
+  high: "High",
+  med: "Med",
+  low: "Low",
+};
+const PRIORITY_ORDER: Priority[] = ["high", "med", "low"];
+const taskPriority = (t: DailyTask): Priority => t.priority ?? "med";
+
+// Split a fixed block of minutes across tasks weighted by priority. Only unfinished
+// tasks get time; each slice is rounded to 5 min (min 5), then rounding drift is
+// absorbed by the highest-priority task so the slices sum back to the block.
+function budgetByPriority(
+  tasks: DailyTask[],
+  blockMin: number,
+): (number | undefined)[] {
+  const idx = tasks
+    .map((t, i) => ({ t, i }))
+    .filter(({ t }) => !t.done && t.title.trim());
+  const out: (number | undefined)[] = tasks.map(() => undefined);
+  if (!idx.length || blockMin < 5) return out;
+  const totalWeight = idx.reduce(
+    (n, { t }) => n + PRIORITY_WEIGHT[taskPriority(t)],
+    0,
+  );
+  let assigned = 0;
+  for (const { t, i } of idx) {
+    const share = (blockMin * PRIORITY_WEIGHT[taskPriority(t)]) / totalWeight;
+    const rounded = Math.max(5, Math.round(share / 5) * 5);
+    out[i] = rounded;
+    assigned += rounded;
+  }
+  // Absorb rounding drift on the highest-priority open task (never below 5 min).
+  let drift = blockMin - assigned;
+  if (drift !== 0) {
+    const top = idx
+      .slice()
+      .sort(
+        (a, b) =>
+          PRIORITY_RANK[taskPriority(a.t)] - PRIORITY_RANK[taskPriority(b.t)],
+      )[0];
+    if (top) {
+      const step = drift > 0 ? 5 : -5;
+      while (drift !== 0 && (out[top.i] ?? 0) + step >= 5) {
+        out[top.i] = (out[top.i] ?? 0) + step;
+        drift -= step;
+      }
+    }
+  }
+  return out;
+}
 // Reusable AI-suggestions box: a button that fetches from /api/suggest, then a
 // list with Regenerate/Hide. Each item is drawn by the caller's renderItem,
 // which supplies the per-item action (Add / Make it / …) + can drop it.
@@ -1833,7 +2681,8 @@ function TopicStarter({
         <span style={styles.cardClass}>💬 Start a lesson</span>
       </div>
       <p style={{ color: "var(--muted)", margin: "2px 0 10px", fontSize: 13 }}>
-        Pick a topic and I&apos;ll open a new chat and walk you through it.
+        Pick a topic and I&apos;ll open a new chat, walk you through it, then
+        have you teach it back to lock it in.
       </p>
       <div style={styles.topicRow}>
         <input
@@ -1873,24 +2722,228 @@ function TopicStarter({
   );
 }
 
+// Home-dashboard card: teach a concept back to Eliora (the Feynman technique).
+// Picking one opens a new chat where Eliora runs the whole exercise
+// conversationally — frames a challenge, hears you out, then finds the gaps.
+function TeachBackStarter({
+  profile,
+  subjects,
+  missed,
+  busy,
+  onStart,
+}: {
+  profile: LearnerProfile | null;
+  subjects: string[];
+  missed: string[];
+  busy: boolean;
+  onStart: (concept: string) => void;
+}) {
+  const [concept, setConcept] = useState("");
+  // Weak spots first — teaching what you got wrong is where it pays off most.
+  const suggestions = Array.from(
+    new Set(
+      [...missed.slice(0, 3), ...(profile?.klass ? [profile.klass] : []), ...subjects]
+        .map((s) => s.trim())
+        .filter(Boolean),
+    ),
+  ).slice(0, 5);
+  const start = (c: string) => {
+    const v = c.trim();
+    if (!v || busy) return;
+    onStart(v);
+    setConcept("");
+  };
+  return (
+    <div style={styles.card}>
+      <div style={styles.cardHead}>
+        <span style={styles.cardClass}>🧑‍🏫 Teach it back</span>
+      </div>
+      <p style={{ color: "var(--muted)", margin: "2px 0 10px", fontSize: 13 }}>
+        The fastest way to find the holes in what you know is to teach it. Pick a
+        concept and I&apos;ll have you explain it, then show you what&apos;s missing.
+      </p>
+      <div style={styles.topicRow}>
+        <input
+          style={styles.topicInput}
+          value={concept}
+          placeholder="e.g. photosynthesis, the causes of WWI…"
+          onChange={(e) => setConcept(e.target.value)}
+          onKeyDown={(e) => {
+            if (e.key === "Enter") start(concept);
+          }}
+          disabled={busy}
+        />
+        <button
+          style={styles.topicBtn}
+          disabled={busy || !concept.trim()}
+          onClick={() => start(concept)}
+        >
+          Teach →
+        </button>
+      </div>
+      {suggestions.length > 0 && (
+        <div style={styles.topicChips}>
+          {suggestions.map((s) => (
+            <button
+              key={s}
+              style={styles.topicChip}
+              disabled={busy}
+              onClick={() => start(s)}
+              title={`Teach back ${s}`}
+            >
+              {s}
+            </button>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+// Home-dashboard card: "what to study next", ranked from the learner's weak
+// areas (topics they've gotten wrong / low grades in `missed`). Each suggestion
+// opens a lesson via the same startTopicChat path the TopicStarter chips use.
+// Only shown once we actually know some weak areas, so it stays honest to its name.
+function StudyNextCard({
+  profile,
+  missed,
+  events,
+  career,
+  busy,
+  onStart,
+}: {
+  profile: LearnerProfile | null;
+  missed: string[];
+  events: StudyEvent[];
+  career?: string;
+  busy: boolean;
+  onStart: (topic: string) => void;
+}) {
+  if (!missed.length) return null;
+  return (
+    <div style={styles.card}>
+      <div style={styles.cardHead}>
+        <span style={styles.cardClass}>🎯 Study next</span>
+      </div>
+      <p style={{ color: "var(--muted)", margin: "2px 0 10px", fontSize: 13 }}>
+        What to focus on, based on the topics you&apos;ve gotten wrong.
+      </p>
+      <Suggestions
+        kind="focus"
+        label="Suggest what to study next"
+        resultKey="suggestions"
+        body={{
+          missed,
+          events: events.length ? events : undefined,
+          career,
+          profile: profile ?? undefined,
+        }}
+        renderItem={(s, i, drop) => (
+          <div key={i} style={styles.sugItem}>
+            <div style={{ flex: 1 }}>
+              <div style={styles.sugText}>
+                {s.subject ? <b>{s.subject}: </b> : null}
+                {s.topic}
+              </div>
+              {s.why && <div style={styles.sugMeta}>{s.why}</div>}
+            </div>
+            <button
+              style={styles.topicBtn}
+              disabled={busy || !s.topic}
+              title={`Start a lesson on ${s.topic ?? "this topic"}`}
+              onClick={() => {
+                if (s.topic) {
+                  onStart(s.topic);
+                  drop();
+                }
+              }}
+            >
+              Start →
+            </button>
+          </div>
+        )}
+      />
+    </div>
+  );
+}
+
+// A progress-aware nudge for the day's task list. Picks an encouraging line from
+// how far the learner has gotten so momentum itself becomes the reward: an empty
+// list invites a first small win, a partial list names the streak, a full list
+// celebrates. `seed` (the done count) rotates the copy so it doesn't feel canned.
+function taskCheer(done: number, total: number, seed: number): string {
+  const pick = (msgs: string[]) => msgs[seed % msgs.length];
+  if (total === 0) return "";
+  if (done === 0)
+    return pick([
+      "🚀 One small task to start — momentum beats motivation. Pick the top one.",
+      "🌱 Every plan begins with a single check. You've got this.",
+      "🎯 Just start with one. Future-you is already grateful.",
+    ]);
+  if (done === total)
+    return pick([
+      "🏆 Every task done — that's a full day earned. Proud of you.",
+      "🎉 Clean sweep! You showed up and finished. Rest well.",
+      "🌟 100% today. This is exactly how big goals get built.",
+    ]);
+  const left = total - done;
+  if (done / total >= 0.5)
+    return pick([
+      `🔥 Over halfway — just ${left} to go. Don't stop now.`,
+      `💪 ${done} down, ${left} left. You're closer than you think.`,
+      `⚡ Momentum's on your side — ${left} more and it's a wrap.`,
+    ]);
+  return pick([
+    `✅ ${done} done — that first win is the hardest. Keep rolling.`,
+    `👏 On the board! ${left} left, one at a time.`,
+    `📈 Progress logged. Small steps stack up fast.`,
+  ]);
+}
+
 // Home-dashboard card: a fresh, tiny to-do list Eliora generates for TODAY from
 // the learner's plan, goals, calendar, assignments, and weak spots. It refreshes
 // on its own each new day; the learner can check tasks off or ask for a new set.
 function DailyTasksCard({
   state,
   loading,
+  budgetMin,
   onGenerate,
   onToggle,
+  onSetMin,
+  onSetPriority,
+  onBudget,
 }: {
   state: DailyTasksState | null;
   loading: boolean;
+  budgetMin: number; // study minutes in today's schedule (0 = no schedule yet)
   onGenerate: () => void;
   onToggle: (i: number) => void;
+  onSetMin: (i: number, min: number) => void;
+  onSetPriority: (i: number, p: Priority) => void;
+  onBudget: (blockMin: number) => void;
 }) {
   const today = localISO();
   const fresh = state?.date === today;
   const tasks = fresh ? state!.tasks : [];
   const doneCount = tasks.filter((t) => t.done).length;
+  // How many minutes to split across tasks by priority. Seeds from today's
+  // scheduled study time; the learner can override it before splitting.
+  const [blockMin, setBlockMin] = useState<number>(budgetMin || 60);
+  useEffect(() => {
+    if (budgetMin > 0) setBlockMin(budgetMin);
+  }, [budgetMin]);
+  // Show tasks highest-priority first (stable within a priority, so generation
+  // order is preserved for ties). Keep each task's real index for the handlers.
+  const ordered = tasks
+    .map((t, i) => ({ t, i }))
+    .sort((a, b) => PRIORITY_RANK[taskPriority(a.t)] - PRIORITY_RANK[taskPriority(b.t)]);
+  const fmtMin = (m: number) =>
+    m >= 60 ? `${Math.round((m / 60) * 10) / 10} hr` : `${m} min`;
+  // Time budget: total estimated minutes and how much is still left to do.
+  const totalMin = tasks.reduce((n, t) => n + (t.estMin ?? 0), 0);
+  const leftMin = tasks
+    .filter((t) => !t.done)
+    .reduce((n, t) => n + (t.estMin ?? 0), 0);
   const allDone = tasks.length > 0 && doneCount === tasks.length;
   // A friendly "Mon, Jul 7" for the header.
   const prettyDate = new Date(`${today}T00:00:00`).toLocaleDateString(undefined, {
@@ -1930,32 +2983,113 @@ function DailyTasksCard({
         )
       ) : (
         <>
-          {tasks.map((t, i) => (
-            <div key={i} style={styles.assignItem}>
-              <button
-                style={{
-                  ...styles.assignCheck,
-                  ...(t.done ? styles.assignCheckDone : {}),
-                }}
-                onClick={() => onToggle(i)}
-                aria-label={t.done ? "Mark not done" : "Mark done"}
-              >
-                {t.done ? "✓" : ""}
-              </button>
-              <div style={{ flex: 1 }}>
-                <div style={t.done ? styles.assignTitleDone : styles.assignTitle}>
-                  {t.title}
-                </div>
-                {(t.subject || t.why) && (
-                  <div style={styles.assignMeta}>
-                    {t.subject}
-                    {t.subject && t.why ? " · " : ""}
-                    {t.why}
-                  </div>
-                )}
-              </div>
+          <div style={styles.taskCheer}>{taskCheer(doneCount, tasks.length, doneCount)}</div>
+          {totalMin > 0 && (
+            <div style={styles.taskBudget}>
+              ⏳ Time budget: <b>{fmtMin(totalMin)}</b>
+              {budgetMin > 0 ? (
+                <>
+                  {" "}
+                  of <b>{fmtMin(budgetMin)}</b> scheduled study
+                </>
+              ) : (
+                " of tasks today"
+              )}
+              {budgetMin > 0 && totalMin > budgetMin
+                ? ` · ${fmtMin(totalMin - budgetMin)} over your schedule`
+                : leftMin > 0 && leftMin !== totalMin
+                  ? ` · ${fmtMin(leftMin)} left`
+                  : ""}
+              {leftMin === 0 ? " · all done 🎉" : ""}
             </div>
-          ))}
+          )}
+
+          {/* Split a fixed block of time across today's tasks by priority. */}
+          <div style={styles.budgetSplit}>
+            <span style={styles.budgetSplitLabel}>Split</span>
+            <input
+              type="number"
+              min={5}
+              step={5}
+              style={styles.timeInput}
+              value={blockMin || ""}
+              aria-label="Minutes to split across tasks"
+              onChange={(e) =>
+                setBlockMin(Math.max(0, parseInt(e.target.value, 10) || 0))
+              }
+            />
+            <span style={styles.budgetSplitLabel}>
+              min by priority
+              {budgetMin > 0 ? " (from your schedule)" : ""}
+            </span>
+            <button
+              style={styles.budgetSplitBtn}
+              disabled={blockMin < 5}
+              onClick={() => onBudget(blockMin)}
+              title="Give each task minutes based on its priority"
+            >
+              ⚖️ Budget it
+            </button>
+          </div>
+
+          {ordered.map(({ t, i }) => {
+            const p = taskPriority(t);
+            const next =
+              PRIORITY_ORDER[(PRIORITY_ORDER.indexOf(p) + 1) % 3];
+            return (
+              <div key={i} style={styles.assignItem}>
+                <button
+                  style={{
+                    ...styles.assignCheck,
+                    ...(t.done ? styles.assignCheckDone : {}),
+                  }}
+                  onClick={() => onToggle(i)}
+                  aria-label={t.done ? "Mark not done" : "Mark done"}
+                >
+                  {t.done ? "✓" : ""}
+                </button>
+                <div style={{ flex: 1 }}>
+                  <div style={styles.taskTitleRow}>
+                    <button
+                      style={{ ...styles.prioBadge, ...styles[`prio_${p}`] }}
+                      onClick={() => onSetPriority(i, next)}
+                      title={`Priority: ${PRIORITY_LABEL[p]} — tap to change`}
+                      aria-label={`Priority ${PRIORITY_LABEL[p]}, tap to set ${PRIORITY_LABEL[next]}`}
+                    >
+                      {PRIORITY_LABEL[p]}
+                    </button>
+                    <span
+                      style={t.done ? styles.assignTitleDone : styles.assignTitle}
+                    >
+                      {t.title}
+                    </span>
+                  </div>
+                  {(t.subject || t.why) && (
+                    <div style={styles.assignMeta}>
+                      {t.subject}
+                      {t.subject && t.why ? " · " : ""}
+                      {t.why}
+                    </div>
+                  )}
+                  <div style={styles.timeRow}>
+                    <input
+                      type="number"
+                      min={0}
+                      step={5}
+                      style={styles.timeInput}
+                      value={t.estMin ?? ""}
+                      placeholder="min"
+                      aria-label="Time budget in minutes"
+                      onChange={(e) =>
+                        onSetMin(i, parseInt(e.target.value, 10) || 0)
+                      }
+                    />
+                    <span style={styles.timeLabel}>min to budget</span>
+                  </div>
+                </div>
+              </div>
+            );
+          })}
           <div
             style={{
               display: "flex",
@@ -2070,10 +3204,165 @@ function RewardsCard({
     </div>
   );
 }
+
+// Learner-created rewards: personal treats the student defines and "buys" with
+// the XP they earn. Redeeming spends from an AVAILABLE balance (earned − spent)
+// so cumulative XP for badges, streaks, and study rooms is never reduced.
+type CustomReward = {
+  id: string;
+  emoji: string;
+  title: string;
+  cost: number;
+  redeemed: number; // how many times it's been claimed
+};
+
+const REWARD_EMOJIS = [
+  "🎁", "🍦", "🎮", "📺", "🍕", "☕", "🛍️", "😴", "🎧", "🍫", "⚽", "🎬",
+];
+
+function MyRewardsCard({
+  availableXp,
+  rewards,
+  onAdd,
+  onRedeem,
+  onRemove,
+}: {
+  availableXp: number;
+  rewards: CustomReward[];
+  onAdd: (emoji: string, title: string, cost: number) => void;
+  onRedeem: (id: string) => void;
+  onRemove: (id: string) => void;
+}) {
+  const [emoji, setEmoji] = useState(REWARD_EMOJIS[0]);
+  const [title, setTitle] = useState("");
+  const [cost, setCost] = useState("");
+  const costNum = parseInt(cost, 10);
+  const canAdd = !!title.trim() && Number.isFinite(costNum) && costNum > 0;
+  const add = () => {
+    if (!canAdd) return;
+    onAdd(emoji, title.trim(), costNum);
+    setTitle("");
+    setCost("");
+    setEmoji(REWARD_EMOJIS[0]);
+  };
+  return (
+    <div style={styles.card}>
+      <div style={styles.cardHead}>
+        <span style={styles.cardClass}>🎁 My rewards</span>
+        <span style={styles.subjectsCount}>⭐ {availableXp} to spend</span>
+      </div>
+      <p style={{ color: "var(--muted)", margin: "2px 0 10px", fontSize: 13 }}>
+        Set your own rewards and treat yourself with the XP you earn. Redeeming
+        spends XP but keeps your badges, streak, and study rooms.
+      </p>
+      {rewards.length === 0 ? (
+        <p style={styles.assignEmpty}>
+          No rewards yet — add one below (e.g. &ldquo;30 min of gaming&rdquo; for
+          100 XP).
+        </p>
+      ) : (
+        rewards.map((r) => {
+          const afford = availableXp >= r.cost;
+          const pct = Math.min(
+            100,
+            Math.round((availableXp / Math.max(1, r.cost)) * 100),
+          );
+          return (
+            <div key={r.id} style={styles.rewardItem}>
+              <span style={styles.rewardEmoji}>{r.emoji}</span>
+              <div style={{ flex: 1, minWidth: 0 }}>
+                <div style={styles.rewardTitle}>
+                  {r.title}
+                  {r.redeemed > 0 && (
+                    <span style={styles.rewardRedeemed}>
+                      {" "}
+                      · claimed ×{r.redeemed}
+                    </span>
+                  )}
+                </div>
+                <div style={styles.rewardTrack}>
+                  <div style={{ ...styles.rewardFill, width: `${pct}%` }} />
+                </div>
+              </div>
+              <span style={styles.rewardCost}>{r.cost} XP</span>
+              <button
+                style={{
+                  ...styles.rewardRedeemBtn,
+                  ...(afford ? {} : styles.rewardRedeemOff),
+                }}
+                disabled={!afford}
+                onClick={() => onRedeem(r.id)}
+                title={
+                  afford
+                    ? "Redeem this reward"
+                    : `Earn ${r.cost - availableXp} more XP`
+                }
+              >
+                {afford ? "Redeem" : "🔒"}
+              </button>
+              <button
+                style={styles.assignRemove}
+                onClick={() => onRemove(r.id)}
+                aria-label="Remove reward"
+              >
+                ×
+              </button>
+            </div>
+          );
+        })
+      )}
+      <div style={styles.rewardAddBox}>
+        <div style={styles.rewardEmojiRow}>
+          {REWARD_EMOJIS.map((e) => (
+            <button
+              key={e}
+              onClick={() => setEmoji(e)}
+              style={{
+                ...styles.rewardEmojiPick,
+                ...(emoji === e ? styles.rewardEmojiPickOn : {}),
+              }}
+              aria-label={`Use ${e}`}
+            >
+              {e}
+            </button>
+          ))}
+        </div>
+        <div style={styles.rewardAddRow}>
+          <input
+            style={styles.assignInput}
+            value={title}
+            placeholder="Reward (e.g. 30 min of gaming)"
+            onChange={(e) => setTitle(e.target.value)}
+            onKeyDown={(e) => e.key === "Enter" && add()}
+          />
+          <input
+            type="number"
+            min={1}
+            step={10}
+            style={styles.rewardCostInput}
+            value={cost}
+            placeholder="XP"
+            onChange={(e) => setCost(e.target.value)}
+            onKeyDown={(e) => e.key === "Enter" && add()}
+          />
+          <button style={styles.rewardAddBtn} onClick={add} disabled={!canAdd}>
+            ＋ Add
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
 // Profile badges. Each has its own designed medallion (a gradient + emoji), a
 // bit of flavor text, and the criteria to earn it. `met` is checked against the
 // learner's live stats so we can show earned ones in color and the rest dimmed.
-type BadgeStats = { total: number; activeDays: number; streak: number };
+type BadgeStats = {
+  total: number;
+  activeDays: number;
+  streak: number;
+  goalsAchieved: number; // how many goals the learner has marked achieved
+  goalHorizons: number; // distinct horizons (short/mid/long) among achieved goals
+};
 type BadgeDef = {
   id: string;
   emoji: string;
@@ -2197,13 +3486,72 @@ const BADGE_DEFS: BadgeDef[] = [
     reward: 300,
     met: (s) => s.total >= 5000,
   },
+  // Goal achievements — earned by marking SMART goals as achieved.
+  {
+    id: "goal-getter",
+    emoji: "🎯",
+    label: "Goal Getter",
+    blurb: "You set a goal and saw it through. That's how big things start.",
+    hint: "Achieve your first goal.",
+    bg: "linear-gradient(135deg,#f6d365,#f9a03f)",
+    reward: 30,
+    met: (s) => s.goalsAchieved >= 1,
+  },
+  {
+    id: "goal-triple",
+    emoji: "🥉",
+    label: "Triple Threat",
+    blurb: "Three goals achieved — you're building real momentum.",
+    hint: "Achieve 3 goals.",
+    bg: "linear-gradient(135deg,#f7971e,#ffd200)",
+    reward: 60,
+    met: (s) => s.goalsAchieved >= 3,
+  },
+  {
+    id: "goal-crusher",
+    emoji: "🏅",
+    label: "Goal Crusher",
+    blurb: "Five goals done. Following through is becoming your habit.",
+    hint: "Achieve 5 goals.",
+    bg: "linear-gradient(135deg,#43cea2,#185a9d)",
+    reward: 90,
+    met: (s) => s.goalsAchieved >= 5,
+  },
+  {
+    id: "goal-champion",
+    emoji: "🏆",
+    label: "Goal Champion",
+    blurb: "Ten goals achieved. You finish what you start — that's rare.",
+    hint: "Achieve 10 goals.",
+    bg: "linear-gradient(135deg,#8e2de2,#4a00e0)",
+    reward: 180,
+    met: (s) => s.goalsAchieved >= 10,
+  },
+  {
+    id: "goal-horizons",
+    emoji: "🧭",
+    label: "Big-Picture Thinker",
+    blurb: "A short, a mid, and a long-term goal — all achieved. Balance!",
+    hint: "Achieve a short-, mid-, and long-term goal.",
+    bg: "linear-gradient(135deg,#11998e,#38ef7d)",
+    reward: 120,
+    met: (s) => s.goalHorizons >= 3,
+  },
 ];
 
-function badgeStats(log: Record<string, number>, streak: number): BadgeStats {
+function badgeStats(
+  log: Record<string, number>,
+  streak: number,
+  goals: SmartGoal[] = [],
+): BadgeStats {
+  const achieved = goals.filter((g) => g.done);
+  const horizons = new Set(achieved.map((g) => g.horizon).filter(Boolean));
   return {
     total: Object.values(log).reduce((a, b) => a + b, 0),
     activeDays: Object.values(log).filter((v) => v > 0).length,
     streak,
+    goalsAchieved: achieved.length,
+    goalHorizons: horizons.size,
   };
 }
 
@@ -2220,13 +3568,24 @@ function computeStreak(log: Record<string, number>): number {
 }
 
 // The set of badge ids currently earned for a given progress log.
-function earnedBadgeIds(log: Record<string, number>): string[] {
-  const s = badgeStats(log, computeStreak(log));
+function earnedBadgeIds(
+  log: Record<string, number>,
+  goals: SmartGoal[] = [],
+): string[] {
+  const s = badgeStats(log, computeStreak(log), goals);
   return BADGE_DEFS.filter((b) => b.met(s)).map((b) => b.id);
 }
 // A Duolingo-style progress card: daily streak 🔥, total XP ⭐, this week's
 // activity, and a daily-goal ring. `log` maps YYYY-MM-DD → XP earned that day.
-function ProgressCard({ log }: { log: Record<string, number> }) {
+function ProgressCard({
+  log,
+  study = {},
+  goals = [],
+}: {
+  log: Record<string, number>;
+  study?: Record<string, number>; // minutes studied per YYYY-MM-DD
+  goals?: SmartGoal[];
+}) {
   // Which badge's detail card is open (null = closed).
   const [openBadge, setOpenBadge] = useState<BadgeDef | null>(null);
   const total = Object.values(log).reduce((a, b) => a + b, 0);
@@ -2255,7 +3614,7 @@ function ProgressCard({ log }: { log: Record<string, number> }) {
     };
   });
   const pct = Math.min(100, Math.round((todayXp / DAILY_XP_GOAL) * 100));
-  const stats = badgeStats(log, streak);
+  const stats = badgeStats(log, streak, goals);
   const earnedCount = BADGE_DEFS.filter((b) => b.met(stats)).length;
   // Everyday progress: XP earned each of the last 14 days, as a bar chart.
   const days14 = Array.from({ length: 14 }, (_, i) => {
@@ -2295,6 +3654,51 @@ function ProgressCard({ log }: { log: Record<string, number> }) {
     .map(([x, y]) => `L${x.toFixed(1)},${y.toFixed(1)}`)
     .join(" ")} L${GW},${GH} Z`;
   const gained30 = cum - base;
+  // Y-axis ticks (cumulative XP) + X-axis start label + today's point, for the
+  // growth graph's axes, scale, and end-marker.
+  const gTop = Math.round(hi);
+  const gMid = Math.round((hi + lo) / 2);
+  const gBot = Math.round(lo);
+  const gStartLabel = startDt.toLocaleDateString(undefined, {
+    month: "short",
+    day: "numeric",
+  });
+  const gLastYPct = (gpts[gpts.length - 1][1] / GH) * 100;
+  const gEmpty = gained30 === 0;
+  // Hours studied each week: the last 6 weeks (Sunday-started, to match the week
+  // strip above). Each week sums that week's daily study minutes into hours.
+  const WEEKS = 6;
+  const thisSunday = new Date(now);
+  thisSunday.setDate(now.getDate() - now.getDay());
+  thisSunday.setHours(0, 0, 0, 0);
+  const weeks = Array.from({ length: WEEKS }, (_, i) => {
+    const wStart = new Date(thisSunday);
+    wStart.setDate(thisSunday.getDate() - (WEEKS - 1 - i) * 7);
+    let mins = 0;
+    for (let d = 0; d < 7; d++) {
+      const dt = new Date(wStart);
+      dt.setDate(wStart.getDate() + d);
+      mins += study[localISO(dt)] || 0;
+    }
+    return {
+      hours: mins / 60,
+      isThisWeek: i === WEEKS - 1,
+      label: wStart.toLocaleDateString(undefined, {
+        month: "short",
+        day: "numeric",
+      }),
+    };
+  });
+  const maxWeekHours = Math.max(1, ...weeks.map((w) => w.hours));
+  const thisWeekHours = weeks[WEEKS - 1].hours;
+  const totalStudyMin = Object.values(study).reduce((a, b) => a + b, 0);
+  // "3h 20m" / "45m" / "0m" — friendly hours+minutes from a minute count.
+  const fmtDuration = (mins: number) => {
+    const m = Math.round(mins);
+    const h = Math.floor(m / 60);
+    const r = m % 60;
+    return h > 0 ? (r ? `${h}h ${r}m` : `${h}h`) : `${r}m`;
+  };
   return (
     <div style={styles.progCard}>
       <div style={styles.progTop}>
@@ -2442,24 +3846,108 @@ function ProgressCard({ log }: { log: Record<string, number> }) {
         ))}
       </div>
       <div style={styles.progBarsHead}>
-        📈 Progress over time · +{gained30} XP in 30 days
+        📈 Progress over time
+        <span style={styles.growthGain}>
+          {gained30 > 0 ? `+${gained30} XP` : "no XP yet"} · 30 days
+        </span>
       </div>
-      <svg
-        viewBox={`0 0 ${GW} ${GH}`}
-        preserveAspectRatio="none"
-        style={styles.progGraph}
-        aria-hidden
-      >
-        <path d={gArea} fill="var(--accent-soft)" />
-        <path
-          d={gLine}
-          fill="none"
-          stroke="var(--accent)"
-          strokeWidth={2}
-          strokeLinejoin="round"
-          vectorEffect="non-scaling-stroke"
-        />
-      </svg>
+      <div style={styles.growthWrap}>
+        <div style={styles.growthYAxis}>
+          <span>{gTop}</span>
+          <span>{gMid}</span>
+          <span>{gBot}</span>
+        </div>
+        <div style={styles.growthPlot}>
+          <svg
+            viewBox={`0 0 ${GW} ${GH}`}
+            preserveAspectRatio="none"
+            style={styles.progGraph}
+            aria-hidden
+          >
+            {[0, GH / 2, GH].map((y, i) => (
+              <line
+                key={i}
+                x1={0}
+                y1={y}
+                x2={GW}
+                y2={y}
+                stroke="var(--border)"
+                strokeWidth={1}
+                strokeDasharray={i === 2 ? undefined : "3 4"}
+                vectorEffect="non-scaling-stroke"
+              />
+            ))}
+            <path d={gArea} fill="var(--accent-soft)" />
+            <path
+              d={gLine}
+              fill="none"
+              stroke="var(--accent)"
+              strokeWidth={2.5}
+              strokeLinejoin="round"
+              strokeLinecap="round"
+              vectorEffect="non-scaling-stroke"
+            />
+          </svg>
+          {gEmpty ? (
+            <span style={styles.growthEmpty}>Earn XP to grow this line 🌱</span>
+          ) : (
+            <span
+              style={{ ...styles.growthDot, top: `${gLastYPct}%` }}
+              title={`${gTop} XP so far`}
+            />
+          )}
+        </div>
+      </div>
+      <div style={styles.growthXAxis}>
+        <span>{gStartLabel}</span>
+        <span>Today</span>
+      </div>
+      <div style={styles.progBarsHead}>
+        ⏱️ Hours studied · per week
+        <span style={styles.growthGain}>
+          {thisWeekHours > 0 ? fmtDuration(thisWeekHours * 60) : "0m"} this week
+        </span>
+      </div>
+      {totalStudyMin === 0 ? (
+        <div style={styles.studyEmpty}>
+          Run a focus timer on a study block to start banking hours ⏱️
+        </div>
+      ) : (
+        <div style={styles.studyWeeks}>
+          {weeks.map((w, i) => (
+            <div
+              key={i}
+              style={styles.studyWeekCol}
+              title={`Week of ${w.label}: ${fmtDuration(w.hours * 60)}`}
+            >
+              <span style={styles.studyWeekVal}>
+                {w.hours > 0
+                  ? w.hours >= 1
+                    ? `${w.hours.toFixed(w.hours < 10 ? 1 : 0)}h`
+                    : `${Math.round(w.hours * 60)}m`
+                  : ""}
+              </span>
+              <div style={styles.studyWeekTrack}>
+                <div
+                  style={{
+                    ...styles.studyWeekFill,
+                    height: `${Math.max(w.hours > 0 ? 8 : 0, Math.round((w.hours / maxWeekHours) * 100))}%`,
+                    ...(w.isThisWeek ? styles.studyWeekFillNow : {}),
+                  }}
+                />
+              </div>
+              <span
+                style={{
+                  ...styles.studyWeekLbl,
+                  ...(w.isThisWeek ? styles.studyWeekLblNow : {}),
+                }}
+              >
+                {w.isThisWeek ? "This wk" : w.label}
+              </span>
+            </div>
+          ))}
+        </div>
+      )}
     </div>
   );
 }
@@ -2652,6 +4140,550 @@ function WeeklyRecap({
               {overdue}
             </span>
           </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+// "📈 Monthly report": one calendar month at a time. The top half is a factual
+// recap built only from time-stamped data (the XP log, study-minutes log, mistake
+// timestamps, and item due dates) plus current standings (goals, GPA) — so it never
+// overstates. The bottom half is Eliora's warm AI recap, generated on demand and
+// cached per month. Navigate months with the arrows; you can't go past this month.
+function MonthlyReport({
+  log,
+  study,
+  goals,
+  assignments,
+  mistakes,
+  fourYearPlan,
+  reports,
+  busyKey,
+  onGenerate,
+}: {
+  log: Record<string, number>;
+  study: Record<string, number>;
+  goals: SmartGoal[];
+  assignments: Assignment[];
+  mistakes: Mistake[];
+  fourYearPlan: FourYearPlan | null;
+  reports: Record<string, { message: string; focus: string[]; generatedAt: string }>;
+  busyKey: string | null;
+  onGenerate: (monthKey: string, payload: Record<string, unknown>) => void;
+}) {
+  const now = new Date();
+  const thisMonthStart = new Date(now.getFullYear(), now.getMonth(), 1);
+  // Offset in months back from the current month (0 = this month).
+  const [offset, setOffset] = useState(0);
+  const sel = new Date(now.getFullYear(), now.getMonth() - offset, 1);
+  const year = sel.getFullYear();
+  const month = sel.getMonth();
+  const isCurrentMonth = offset === 0;
+  const monthKey = `${year}-${String(month + 1).padStart(2, "0")}`; // YYYY-MM
+  const monthLabel = sel.toLocaleDateString("en-US", {
+    month: "long",
+    year: "numeric",
+  });
+  const daysInMonth = new Date(year, month + 1, 0).getDate();
+  const monthISOs = Array.from({ length: daysInMonth }, (_, i) =>
+    localISO(new Date(year, month, i + 1)),
+  );
+
+  const xp = monthISOs.reduce((n, iso) => n + (log[iso] || 0), 0);
+  const minutes = monthISOs.reduce((n, iso) => n + (study[iso] || 0), 0);
+  const hours = Math.round((minutes / 60) * 10) / 10;
+  const activeDays = monthISOs.filter(
+    (iso) => (log[iso] || 0) > 0 || (study[iso] || 0) > 0,
+  ).length;
+  let bestIso = monthISOs[0];
+  for (const iso of monthISOs)
+    if ((log[iso] || 0) > (log[bestIso] || 0)) bestIso = iso;
+  const bestDayXp = log[bestIso] || 0;
+  const bestLabel = new Date(`${bestIso}T00:00:00`).toLocaleDateString("en-US", {
+    month: "short",
+    day: "numeric",
+  });
+  // Streak only means something as of *now* — don't show it for past months.
+  const streak = isCurrentMonth ? currentStreak(log) : undefined;
+
+  const activeGoals = goals.filter((g) => !g.done);
+  const goalsDone = goals.filter((g) => g.done).length;
+  const goalProgress = activeGoals
+    .filter((g) => typeof g.target === "number")
+    .map(
+      (g) =>
+        `${g.statement?.trim() || g.specific} — ${g.current ?? 0}/${g.target}`,
+    );
+  // Goals whose deadline lands in this month (or is already overdue this month).
+  const goalsDueSoon = activeGoals
+    .filter((g) => g.timeBound && g.timeBound.slice(0, 7) <= monthKey)
+    .filter((g) => g.timeBound!.slice(0, 7) === monthKey || isCurrentMonth)
+    .map((g) => {
+      const head = g.statement?.trim() || g.specific;
+      return `${head} (by ${g.timeBound})`;
+    });
+
+  const assignmentsDue = assignments.filter(
+    (a) => a.due && a.due.slice(0, 7) === monthKey,
+  ).length;
+  const assignmentsDone = assignments.filter((a) => a.done).length;
+
+  const mistakesLogged = mistakes.filter(
+    (m) => typeof m.createdAt === "string" && m.createdAt.slice(0, 7) === monthKey,
+  ).length;
+  const mistakesOpen = mistakes
+    .filter((m) => !m.resolved)
+    .map((m) => (m.subject ? `${m.subject}: ${m.concept}` : m.concept));
+
+  const gpa = fourYearPlan ? fypCredits(fourYearPlan).weightedGpa : undefined;
+  const projectedGpa = fourYearPlan
+    ? fypProjection(fourYearPlan).projectedWeightedGpa
+    : undefined;
+
+  const quiet = xp === 0 && minutes === 0;
+  const report = reports[monthKey];
+  const busy = busyKey === monthKey;
+
+  const payload: Record<string, unknown> = {
+    monthLabel,
+    career: fourYearPlan?.destination,
+    xp,
+    studyHours: hours,
+    activeDays,
+    daysInMonth,
+    bestDayXp,
+    streak,
+    gpa,
+    projectedGpa,
+    goalsActive: activeGoals.length,
+    goalsDone,
+    goalsDueSoon,
+    goalProgress,
+    mistakesLogged,
+    mistakesOpen,
+    assignmentsDue,
+    assignmentsDone,
+    quiet,
+  };
+
+  return (
+    <div style={styles.card}>
+      <div style={styles.cardHead}>
+        <span style={styles.cardClass}>📈 {monthLabel}</span>
+        <span style={{ display: "flex", gap: 6, alignItems: "center" }}>
+          <button
+            style={styles.monthNavBtn}
+            onClick={() => setOffset((o) => o + 1)}
+            aria-label="Previous month"
+            title="Previous month"
+          >
+            ‹
+          </button>
+          <button
+            style={{
+              ...styles.monthNavBtn,
+              ...(isCurrentMonth ? styles.monthNavBtnOff : {}),
+            }}
+            onClick={() => setOffset((o) => Math.max(0, o - 1))}
+            disabled={isCurrentMonth}
+            aria-label="Next month"
+            title="Next month"
+          >
+            ›
+          </button>
+        </span>
+      </div>
+
+      <div style={styles.recapStatRow}>
+        <div style={styles.recapStat}>
+          <span style={styles.recapStatBig}>⭐ {xp}</span>
+          <span style={styles.recapStatLbl}>XP this month</span>
+        </div>
+        <div style={styles.recapStat}>
+          <span style={styles.recapStatBig}>{hours > 0 ? hours : "—"}</span>
+          <span style={styles.recapStatLbl}>hours studied</span>
+        </div>
+        <div style={styles.recapStat}>
+          <span style={styles.recapStatBig}>
+            {activeDays}
+            <span style={{ fontSize: 15, color: "var(--muted)" }}>
+              /{daysInMonth}
+            </span>
+          </span>
+          <span style={styles.recapStatLbl}>active days</span>
+        </div>
+      </div>
+
+      <div style={styles.recapList}>
+        {bestDayXp > 0 && (
+          <div style={styles.recapItem}>
+            <span>🏆</span>
+            <span style={{ flex: 1 }}>Best day · {bestLabel}</span>
+            <span style={styles.recapTag}>{bestDayXp} XP</span>
+          </div>
+        )}
+        {typeof streak === "number" && streak > 0 && (
+          <div style={styles.recapItem}>
+            <span>🔥</span>
+            <span style={{ flex: 1 }}>Current streak</span>
+            <span style={styles.recapTag}>{streak} days</span>
+          </div>
+        )}
+        {(goalsDone > 0 || activeGoals.length > 0) && (
+          <div style={styles.recapItem}>
+            <span>🌟</span>
+            <span style={{ flex: 1 }}>Goals</span>
+            <span style={styles.recapTag}>
+              {goalsDone} done · {activeGoals.length} active
+            </span>
+          </div>
+        )}
+        {assignmentsDue > 0 && (
+          <div style={styles.recapItem}>
+            <span>📌</span>
+            <span style={{ flex: 1 }}>Assignments due this month</span>
+            <span style={styles.recapTag}>{assignmentsDue}</span>
+          </div>
+        )}
+        {mistakesLogged > 0 && (
+          <div style={styles.recapItem}>
+            <span>🧩</span>
+            <span style={{ flex: 1 }}>Mistakes captured to work on</span>
+            <span style={styles.recapTag}>{mistakesLogged}</span>
+          </div>
+        )}
+        {typeof gpa === "number" && (
+          <div style={styles.recapItem}>
+            <span>🎓</span>
+            <span style={{ flex: 1 }}>Weighted GPA so far</span>
+            <span style={styles.recapTag}>{gpa.toFixed(2)}</span>
+          </div>
+        )}
+      </div>
+
+      {/* Eliora's AI recap for the month — generated on demand, cached per month. */}
+      <div style={styles.reflSection}>
+        {report ? (
+          <>
+            <div style={styles.reflBox}>
+              <p style={styles.reflSavedMsg}>{report.message}</p>
+              {report.focus.length > 0 && (
+                <div style={styles.reflFocusList}>
+                  {report.focus.map((f, i) => (
+                    <div key={i} style={styles.reflFocusItem}>
+                      → {f}
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
+            <button
+              style={styles.linkBtn}
+              disabled={busy}
+              onClick={() => onGenerate(monthKey, payload)}
+            >
+              {busy ? "…" : "↻ Regenerate recap"}
+            </button>
+          </>
+        ) : (
+          <>
+            <p style={styles.fypJoinsSub}>
+              {quiet
+                ? "No tracked activity yet this month — a recap will be light, but you can still get an encouraging note and a fresh focus for the month ahead."
+                : "Get a warm recap of your month from Eliora — what went well, and a few focuses for next month."}
+            </p>
+            <button
+              style={styles.reflOpenBtn}
+              disabled={busy}
+              onClick={() => onGenerate(monthKey, payload)}
+            >
+              {busy ? "Writing your recap…" : "✨ Generate monthly recap"}
+            </button>
+          </>
+        )}
+      </div>
+    </div>
+  );
+}
+
+// "What you learned this week" recap: a Monday–Sunday window of the learner's
+// tracked activity (XP/effort, study hours, active days, streak, subjects &
+// concepts practiced, goal progress, what's due) plus Eliora's warm AI recap +
+// focuses for next week. Mirrors MonthlyReport, scoped to a 7-day week and cached
+// per week (keyed by the Monday's YYYY-MM-DD).
+function WeeklyLearnedRecap({
+  log,
+  study,
+  goals,
+  assignments,
+  mistakes,
+  fourYearPlan,
+  reports,
+  busyKey,
+  onGenerate,
+}: {
+  log: Record<string, number>;
+  study: Record<string, number>;
+  goals: SmartGoal[];
+  assignments: Assignment[];
+  mistakes: Mistake[];
+  fourYearPlan: FourYearPlan | null;
+  reports: Record<string, { message: string; focus: string[]; generatedAt: string }>;
+  busyKey: string | null;
+  onGenerate: (weekKey: string, payload: Record<string, unknown>) => void;
+}) {
+  const now = new Date();
+  // Offset in weeks back from the current week (0 = this week).
+  const [offset, setOffset] = useState(0);
+  // Monday-start week. dow: 0 = Monday … 6 = Sunday.
+  const dow = (now.getDay() + 6) % 7;
+  const weekStart = new Date(
+    now.getFullYear(),
+    now.getMonth(),
+    now.getDate() - dow - offset * 7,
+  );
+  const weekEnd = new Date(
+    weekStart.getFullYear(),
+    weekStart.getMonth(),
+    weekStart.getDate() + 6,
+  );
+  const isCurrentWeek = offset === 0;
+  const weekKey = localISO(weekStart); // Monday's YYYY-MM-DD
+  const weekISOs = Array.from({ length: 7 }, (_, i) =>
+    localISO(
+      new Date(
+        weekStart.getFullYear(),
+        weekStart.getMonth(),
+        weekStart.getDate() + i,
+      ),
+    ),
+  );
+  const weekSet = new Set(weekISOs);
+  const fmt = (d: Date) =>
+    d.toLocaleDateString("en-US", { month: "short", day: "numeric" });
+  const weekLabel = `${fmt(weekStart)} – ${fmt(weekEnd)}`;
+
+  const xp = weekISOs.reduce((n, iso) => n + (log[iso] || 0), 0);
+  const minutes = weekISOs.reduce((n, iso) => n + (study[iso] || 0), 0);
+  const hours = Math.round((minutes / 60) * 10) / 10;
+  const activeDays = weekISOs.filter(
+    (iso) => (log[iso] || 0) > 0 || (study[iso] || 0) > 0,
+  ).length;
+  let bestIso = weekISOs[0];
+  for (const iso of weekISOs)
+    if ((log[iso] || 0) > (log[bestIso] || 0)) bestIso = iso;
+  const bestDayXp = log[bestIso] || 0;
+  const bestLabel = new Date(`${bestIso}T00:00:00`).toLocaleDateString("en-US", {
+    weekday: "short",
+  });
+  // Streak only means something as of *now* — don't show it for past weeks.
+  const streak = isCurrentWeek ? currentStreak(log) : undefined;
+
+  // Concepts they engaged this week (captured to work on), and the subjects/
+  // topics those touch — the honest, timestamped signal for "what you practiced".
+  const mistakesThisWeek = mistakes.filter(
+    (m) => typeof m.createdAt === "string" && weekSet.has(m.createdAt.slice(0, 10)),
+  );
+  const assignmentsDueList = assignments.filter(
+    (a) => a.due && weekSet.has(a.due),
+  );
+  const topics = Array.from(
+    new Set(
+      [
+        ...mistakesThisWeek.map((m) => m.subject?.trim() || m.concept?.trim()),
+        ...assignmentsDueList.map((a) => a.subject?.trim()),
+      ].filter((t): t is string => Boolean(t)),
+    ),
+  );
+  const mistakesLogged = mistakesThisWeek.length;
+  const mistakesOpen = mistakes
+    .filter((m) => !m.resolved)
+    .map((m) => (m.subject ? `${m.subject}: ${m.concept}` : m.concept));
+
+  const activeGoals = goals.filter((g) => !g.done);
+  const goalsDone = goals.filter((g) => g.done).length;
+  const goalProgress = activeGoals
+    .filter((g) => typeof g.target === "number")
+    .map(
+      (g) =>
+        `${g.statement?.trim() || g.specific} — ${g.current ?? 0}/${g.target}`,
+    );
+  // Goals whose deadline lands in this week.
+  const goalsDueSoon = activeGoals
+    .filter((g) => g.timeBound && weekSet.has(g.timeBound))
+    .map((g) => {
+      const head = g.statement?.trim() || g.specific;
+      return `${head} (by ${g.timeBound})`;
+    });
+  const assignmentsDue = assignmentsDueList.length;
+
+  const quiet = xp === 0 && minutes === 0;
+  const report = reports[weekKey];
+  const busy = busyKey === weekKey;
+
+  const payload: Record<string, unknown> = {
+    weekLabel,
+    career: fourYearPlan?.destination,
+    xp,
+    studyHours: hours,
+    activeDays,
+    bestDayXp,
+    bestDayLabel: bestDayXp > 0 ? bestLabel : undefined,
+    streak,
+    topics,
+    mistakesLogged,
+    mistakesOpen,
+    goalsActive: activeGoals.length,
+    goalsDone,
+    goalsDueSoon,
+    goalProgress,
+    assignmentsDue,
+    quiet,
+  };
+
+  return (
+    <div style={styles.card}>
+      <div style={styles.cardHead}>
+        <span style={styles.cardClass}>📚 What you learned</span>
+        <span style={{ display: "flex", gap: 6, alignItems: "center" }}>
+          <button
+            style={styles.monthNavBtn}
+            onClick={() => setOffset((o) => o + 1)}
+            aria-label="Previous week"
+            title="Previous week"
+          >
+            ‹
+          </button>
+          <button
+            style={{
+              ...styles.monthNavBtn,
+              ...(isCurrentWeek ? styles.monthNavBtnOff : {}),
+            }}
+            onClick={() => setOffset((o) => Math.max(0, o - 1))}
+            disabled={isCurrentWeek}
+            aria-label="Next week"
+            title="Next week"
+          >
+            ›
+          </button>
+        </span>
+      </div>
+      <p
+        style={{
+          color: "var(--muted)",
+          margin: "0 0 10px",
+          fontSize: 13,
+          fontWeight: 600,
+        }}
+      >
+        {isCurrentWeek ? "This week" : "Week of"} · {weekLabel}
+      </p>
+
+      <div style={styles.recapStatRow}>
+        <div style={styles.recapStat}>
+          <span style={styles.recapStatBig}>⭐ {xp}</span>
+          <span style={styles.recapStatLbl}>XP this week</span>
+        </div>
+        <div style={styles.recapStat}>
+          <span style={styles.recapStatBig}>{hours > 0 ? hours : "—"}</span>
+          <span style={styles.recapStatLbl}>hours studied</span>
+        </div>
+        <div style={styles.recapStat}>
+          <span style={styles.recapStatBig}>
+            {activeDays}
+            <span style={{ fontSize: 15, color: "var(--muted)" }}>/7</span>
+          </span>
+          <span style={styles.recapStatLbl}>active days</span>
+        </div>
+      </div>
+
+      <div style={styles.recapList}>
+        {topics.length > 0 && (
+          <div style={styles.recapItem}>
+            <span>🧠</span>
+            <span style={{ flex: 1 }}>Practiced</span>
+            <span style={styles.recapTag}>{topics.slice(0, 3).join(", ")}</span>
+          </div>
+        )}
+        {bestDayXp > 0 && (
+          <div style={styles.recapItem}>
+            <span>🏆</span>
+            <span style={{ flex: 1 }}>Best day · {bestLabel}</span>
+            <span style={styles.recapTag}>{bestDayXp} XP</span>
+          </div>
+        )}
+        {typeof streak === "number" && streak > 0 && (
+          <div style={styles.recapItem}>
+            <span>🔥</span>
+            <span style={{ flex: 1 }}>Current streak</span>
+            <span style={styles.recapTag}>{streak} days</span>
+          </div>
+        )}
+        {mistakesLogged > 0 && (
+          <div style={styles.recapItem}>
+            <span>🧩</span>
+            <span style={{ flex: 1 }}>Concepts captured to work on</span>
+            <span style={styles.recapTag}>{mistakesLogged}</span>
+          </div>
+        )}
+        {assignmentsDue > 0 && (
+          <div style={styles.recapItem}>
+            <span>📌</span>
+            <span style={{ flex: 1 }}>Assignments due this week</span>
+            <span style={styles.recapTag}>{assignmentsDue}</span>
+          </div>
+        )}
+        {(goalsDone > 0 || activeGoals.length > 0) && (
+          <div style={styles.recapItem}>
+            <span>🌟</span>
+            <span style={{ flex: 1 }}>Goals</span>
+            <span style={styles.recapTag}>
+              {goalsDone} done · {activeGoals.length} active
+            </span>
+          </div>
+        )}
+      </div>
+
+      {/* Eliora's AI recap for the week — generated on demand, cached per week. */}
+      <div style={styles.reflSection}>
+        {report ? (
+          <>
+            <div style={styles.reflBox}>
+              <p style={styles.reflSavedMsg}>{report.message}</p>
+              {report.focus.length > 0 && (
+                <div style={styles.reflFocusList}>
+                  {report.focus.map((f, i) => (
+                    <div key={i} style={styles.reflFocusItem}>
+                      → {f}
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
+            <button
+              style={styles.linkBtn}
+              disabled={busy}
+              onClick={() => onGenerate(weekKey, payload)}
+            >
+              {busy ? "…" : "↻ Regenerate recap"}
+            </button>
+          </>
+        ) : (
+          <>
+            <p style={styles.fypJoinsSub}>
+              {quiet
+                ? "No tracked activity yet this week — a recap will be light, but you can still get an encouraging note and a fresh focus for the week ahead."
+                : "Get a warm recap from Eliora of what you learned this week — and a few focuses for next week."}
+            </p>
+            <button
+              style={styles.reflOpenBtn}
+              disabled={busy}
+              onClick={() => onGenerate(weekKey, payload)}
+            >
+              {busy ? "Writing your recap…" : "✨ Recap what I learned"}
+            </button>
+          </>
         )}
       </div>
     </div>
@@ -3170,14 +5202,93 @@ function CreditTracker({
   onAddRequirement,
   onRemoveRequirement,
   onSetTotalRequired,
+  onSetGpaGoal,
+  onSetProjectedGrade,
+  onUseDefaultRequirements,
+  onApplyGrades,
 }: {
   plan: FourYearPlan;
   onSetRequirement: (i: number, required: number) => void;
   onAddRequirement: (subject: string, required: number) => void;
   onRemoveRequirement: (i: number) => void;
   onSetTotalRequired: (n: number | undefined) => void;
+  onSetGpaGoal: (n: number | undefined) => void;
+  onSetProjectedGrade: (grade: string) => void;
+  onUseDefaultRequirements: () => void;
+  onApplyGrades: (
+    entries: {
+      title: string;
+      grade: string;
+      credits?: number;
+      level?: CourseLevel;
+    }[],
+  ) => { matched: number; added: number };
 }) {
   const [editing, setEditing] = useState(false);
+  const [gradeBusy, setGradeBusy] = useState(false);
+  const [gradeMsg, setGradeMsg] = useState<string | null>(null);
+  // Read an uploaded transcript / report card, ask the API to pull out the
+  // graded courses, then fold them into the plan's GPA via onApplyGrades.
+  async function onGradeFiles(files: FileList | null) {
+    if (!files?.length || gradeBusy) return;
+    setGradeBusy(true);
+    setGradeMsg(null);
+    const read = (file: File) =>
+      new Promise<{ base64: string; mediaType: string; name: string }>(
+        (resolve, reject) => {
+          const r = new FileReader();
+          r.onload = () => {
+            const s = String(r.result);
+            resolve({
+              base64: s.slice(s.indexOf(",") + 1),
+              mediaType: file.type || "text/plain",
+              name: file.name,
+            });
+          };
+          r.onerror = reject;
+          r.readAsDataURL(file);
+        },
+      );
+    try {
+      const docs = await Promise.all(Array.from(files).slice(0, 4).map(read));
+      const courseTitles = plan.years.flatMap((y) =>
+        y.courses.map((c) => c.title),
+      );
+      const res = await fetch("/api/grades/extract", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ docs, courseTitles }),
+      });
+      const data = (await res.json()) as {
+        courses?: {
+          title: string;
+          grade: string;
+          credits?: number;
+          level?: CourseLevel;
+        }[];
+        error?: string;
+      };
+      if (!data.courses?.length) {
+        setGradeMsg(
+          data.error
+            ? "Couldn't read those grades — try a clearer file."
+            : "No graded courses found in that file.",
+        );
+        return;
+      }
+      const { matched, added } = onApplyGrades(data.courses);
+      const parts = [
+        `Found ${data.courses.length} grade${data.courses.length === 1 ? "" : "s"}`,
+        matched ? `${matched} matched to your plan` : "",
+        added ? `${added} added to Year 1` : "",
+      ].filter(Boolean);
+      setGradeMsg(`✓ ${parts.join(" · ")}.`);
+    } catch {
+      setGradeMsg("Couldn't read those grades — try again.");
+    } finally {
+      setGradeBusy(false);
+    }
+  }
   const [newSubject, setNewSubject] = useState("");
   const [newReq, setNewReq] = useState("");
   const {
@@ -3191,7 +5302,9 @@ function CreditTracker({
     shortOverall,
     shortCats,
     onTrack,
+    uncategorized,
   } = fypCredits(plan);
+  const proj = fypProjection(plan);
   const left = required != null ? Math.max(0, required - earned) : null;
   const pct =
     required && required > 0
@@ -3260,6 +5373,109 @@ function CreditTracker({
             <span style={styles.fypGpaNum}>{gpa?.toFixed(2)}</span> GPA
             <span style={styles.fypGpaSub}> unweighted</span>
           </span>
+        </div>
+      )}
+      <label style={styles.fypGradeUpload}>
+        <span style={styles.fypGradeUploadHead}>
+          📄 Upload your grades
+          <span style={styles.fypGradeUploadHint}>
+            {" "}
+            — transcript or report card (PDF, image, or text). Eliora reads the
+            letter grades and drops them onto your courses to fill in your GPA.
+          </span>
+        </span>
+        <input
+          type="file"
+          multiple
+          accept=".pdf,.txt,.md,.csv,image/*,application/pdf"
+          disabled={gradeBusy}
+          style={styles.fypFileInput}
+          onChange={(e) => {
+            onGradeFiles(e.target.files);
+            e.target.value = "";
+          }}
+        />
+      </label>
+      {gradeBusy && (
+        <div style={styles.mcHint}>Reading your grades…</div>
+      )}
+      {gradeMsg && !gradeBusy && (
+        <div
+          style={{
+            ...styles.fypStatus,
+            ...(gradeMsg.startsWith("✓") ? styles.fypStatusOk : {}),
+          }}
+        >
+          {gradeMsg}
+        </div>
+      )}
+      {proj.hasCourses && (
+        <div style={styles.fypProjBox}>
+          <div style={styles.fypProjHead}>
+            <span style={styles.fypProjTitle}>📈 Projected GPA</span>
+            <label style={styles.fypProjAssume}>
+              assume
+              <select
+                style={styles.fypProjSelect}
+                value={proj.assumed}
+                onChange={(e) => onSetProjectedGrade(e.target.value)}
+              >
+                {GRADE_OPTIONS.map((g) => (
+                  <option key={g} value={g}>
+                    {g}
+                  </option>
+                ))}
+              </select>
+              on the rest
+            </label>
+          </div>
+          <div style={styles.fypGpaRow}>
+            <span style={styles.fypGpaItem}>
+              <span style={styles.fypGpaNum}>
+                {proj.projectedWeightedGpa?.toFixed(2)}
+              </span>{" "}
+              proj.<span style={styles.fypGpaSub}> weighted</span>
+            </span>
+            <span style={styles.fypGpaItem}>
+              <span style={styles.fypGpaNum}>
+                {proj.projectedGpa?.toFixed(2)}
+              </span>{" "}
+              proj.<span style={styles.fypGpaSub}> unweighted</span>
+            </span>
+          </div>
+          <label style={styles.fypProjGoalRow}>
+            <span>🎯 Goal (weighted GPA)</span>
+            <input
+              type="number"
+              min={0}
+              max={5}
+              step={0.1}
+              style={styles.fypProjGoalInput}
+              value={proj.goal ?? ""}
+              placeholder="e.g. 3.5"
+              onChange={(e) => {
+                const v = parseFloat(e.target.value);
+                onSetGpaGoal(Number.isFinite(v) && v > 0 ? v : undefined);
+              }}
+            />
+          </label>
+          {proj.goal != null &&
+            (proj.meetsGoal ? (
+              <div style={{ ...styles.fypStatus, ...styles.fypStatusOk }}>
+                ✓ On pace for a {proj.goal.toFixed(2)} weighted GPA (if you get{" "}
+                {proj.assumed} on the rest).
+              </div>
+            ) : (
+              <div style={{ ...styles.fypStatus, ...styles.fypStatusWarn }}>
+                {proj.neededBase == null
+                  ? `Below your ${proj.goal.toFixed(2)} goal — add graded courses to project.`
+                  : proj.neededBase > 4.001
+                    ? `A ${proj.goal.toFixed(2)} goal isn't reachable with the courses left — even straight A's fall short. Add rigor (Honors/AP) or adjust the goal.`
+                    : `To reach ${proj.goal.toFixed(2)}, average about ${fypLetterFor(
+                        proj.neededBase,
+                      )} on your remaining ${proj.remainingCredits} credits.`}
+              </div>
+            ))}
         </div>
       )}
       {overloaded.length > 0 && (
@@ -3336,6 +5552,22 @@ function CreditTracker({
               </div>
             );
           })}
+          {uncategorized > 0 && (
+            <div style={styles.fypProgressMeta}>
+              ⚠︎ {uncategorized} credit{uncategorized === 1 ? "" : "s"} aren&apos;t
+              tagged with a subject above, so they don&apos;t count in these bars —
+              set each course&apos;s category to fix the tally.
+            </div>
+          )}
+        </div>
+      )}
+      {byCategory.length === 0 && (
+        <div style={styles.fypProgressMeta}>
+          No graduation requirements set yet —{" "}
+          <button style={styles.linkBtn} onClick={onUseDefaultRequirements}>
+            use typical US requirements
+          </button>{" "}
+          or add your school&apos;s own with &ldquo;Edit requirements&rdquo;.
         </div>
       )}
       {editing && (
@@ -3587,6 +5819,10 @@ function FourYearPlanPanel({
   onAddRequirement,
   onRemoveRequirement,
   onSetTotalRequired,
+  onSetGpaGoal,
+  onSetProjectedGrade,
+  onUseDefaultRequirements,
+  onApplyGrades,
   planTitles,
   reflections,
   onReflect,
@@ -3617,6 +5853,17 @@ function FourYearPlanPanel({
   onAddRequirement: (subject: string, required: number) => void;
   onRemoveRequirement: (i: number) => void;
   onSetTotalRequired: (n: number | undefined) => void;
+  onSetGpaGoal: (n: number | undefined) => void;
+  onSetProjectedGrade: (grade: string) => void;
+  onUseDefaultRequirements: () => void;
+  onApplyGrades: (
+    entries: {
+      title: string;
+      grade: string;
+      credits?: number;
+      level?: CourseLevel;
+    }[],
+  ) => { matched: number; added: number };
   planTitles: Set<string>;
   reflections: Record<string, { message: string; focus: string[] }>;
   onReflect: (
@@ -4245,6 +6492,10 @@ function FourYearPlanPanel({
         onAddRequirement={onAddRequirement}
         onRemoveRequirement={onRemoveRequirement}
         onSetTotalRequired={onSetTotalRequired}
+        onSetGpaGoal={onSetGpaGoal}
+        onSetProjectedGrade={onSetProjectedGrade}
+        onUseDefaultRequirements={onUseDefaultRequirements}
+        onApplyGrades={onApplyGrades}
       />
 
       <div style={styles.fypJoins}>
@@ -4484,6 +6735,43 @@ function FourYearPlanPanel({
   );
 }
 
+// Multiple-choice options for the study plan survey. `value` is stored on the
+// answer string and forwarded to /api/study-plan, which weaves it into the plan
+// prompt — so the labels read as plain phrases the model can use directly.
+const PLAN_FOCUS_OPTIONS = [
+  "Understanding new concepts",
+  "Homework / practice problems",
+  "Memorizing facts or terms",
+  "Reviewing for a test",
+  "Catching up on missed material",
+] as const;
+const PLAN_GOAL_OPTIONS = [
+  "Ace an upcoming test or quiz",
+  "Finish an assignment or project",
+  "Understand the material better",
+  "Raise my grade",
+  "Get ahead / review early",
+] as const;
+const PLAN_DEADLINE_OPTIONS = [
+  "In a few days",
+  "Within 2 weeks",
+  "This month",
+  "No set deadline",
+] as const;
+const PLAN_STYLE_OPTIONS = [
+  "Watching videos",
+  "Practice problems",
+  "Flashcards / quizzing",
+  "Reading & notes",
+  "Explaining it out loud",
+] as const;
+const PLAN_TIME_OPTIONS = [
+  "15–30 min a day",
+  "About an hour a day",
+  "A few times a week",
+  "Mostly weekends",
+] as const;
+
 // A guided survey that builds the study plan (milestones) from a few answers.
 function StudyPlanSurvey({
   profile,
@@ -4514,26 +6802,52 @@ function StudyPlanSurvey({
   const canBuild = subject.trim().length > 0 && !generating;
   const build = () =>
     onBuild({ subject, working, goal, deadline, learningStyle, time });
+  // Free-text field — only the class/subject name, which is an open identifier.
   const field = (
     label: string,
     value: string,
     set: (s: string) => void,
     placeholder: string,
-    type = "text",
   ) => (
     <label style={styles.classSurveyLabel}>
       {label}
       <input
-        type={type}
         style={styles.assignInput}
         value={value}
         placeholder={placeholder}
         onChange={(e) => set(e.target.value)}
         onKeyDown={(e) => {
-          if (e.key === "Enter" && canBuild && type !== "date") build();
+          if (e.key === "Enter" && canBuild) build();
         }}
       />
     </label>
+  );
+  // Multiple-choice field — a row of single-select toggle buttons. Clicking the
+  // active option again clears it, so every choice stays optional.
+  const choice = (
+    label: string,
+    value: string,
+    set: (s: string) => void,
+    options: readonly string[],
+  ) => (
+    <span style={styles.classSurveyLabel}>
+      {label}
+      <div style={styles.horizonRow}>
+        {options.map((o) => (
+          <button
+            key={o}
+            type="button"
+            onClick={() => set(value === o ? "" : o)}
+            style={{
+              ...styles.horizonBtn,
+              ...(value === o ? styles.horizonBtnActive : {}),
+            }}
+          >
+            {o}
+          </button>
+        ))}
+      </div>
+    </span>
   );
   return (
     <div style={styles.card}>
@@ -4549,30 +6863,30 @@ function StudyPlanSurvey({
         setSubject,
         "e.g. AP Biology, Algebra 2",
       )}
-      {field(
-        "2. What are you working on or stuck on?",
+      {choice(
+        "2. What do you want to focus on?",
         working,
         setWorking,
-        "e.g. cellular respiration, word problems",
+        PLAN_FOCUS_OPTIONS,
       )}
-      {field(
+      {choice(
         "3. What do you want to accomplish?",
         goal,
         setGoal,
-        "e.g. be ready for the Unit 4 test",
+        PLAN_GOAL_OPTIONS,
       )}
-      {field("4. By when? (optional)", deadline, setDeadline, "", "date")}
-      {field(
+      {choice("4. By when?", deadline, setDeadline, PLAN_DEADLINE_OPTIONS)}
+      {choice(
         "5. How do you like to learn?",
         learningStyle,
         setStyle,
-        "e.g. videos, practice problems, flashcards",
+        PLAN_STYLE_OPTIONS,
       )}
-      {field(
+      {choice(
         "6. How much time can you give it?",
         time,
         setTime,
-        "e.g. 30 min a day, a few evenings",
+        PLAN_TIME_OPTIONS,
       )}
       <div style={styles.classSurveyActions}>
         <button style={styles.classSurveyCancel} onClick={onCancel}>
@@ -4813,24 +7127,467 @@ function GoalStrip({
   );
 }
 
+const MISTAKE_SOURCE_ICON: Record<MistakeSource, string> = {
+  quiz: "📝",
+  chat: "💬",
+  feedback: "✍️",
+  manual: "✋",
+};
+
+// The mistake tracker on the Home dashboard: a compact strip that expands in
+// place into the full, manageable list of concepts the learner keeps missing.
+// Open items sort most-missed first. Each can be re-taught (jump to chat), marked
+// "Got it" (resolved), or removed; new concepts can be added by hand. Captured
+// entries flow in from quizzes, chat, and assignment feedback (see `source`).
+function MistakeCenter({
+  mistakes,
+  onAdd,
+  onReview,
+  onResolve,
+  onRemove,
+}: {
+  mistakes: Mistake[];
+  onAdd: (m: {
+    concept: string;
+    subject?: string;
+    source: MistakeSource;
+  }) => void;
+  onReview: (m: Mistake) => void;
+  onResolve: (id: string, resolved: boolean) => void;
+  onRemove: (id: string) => void;
+}) {
+  const [expanded, setExpanded] = useState(false);
+  const [showResolved, setShowResolved] = useState(false);
+  const [draft, setDraft] = useState("");
+  const [draftSubject, setDraftSubject] = useState("");
+
+  const open = mistakes.filter((m) => !m.resolved);
+  const resolved = mistakes.filter((m) => m.resolved);
+  const sorted = [...open].sort(
+    (a, b) => b.count - a.count || b.lastSeen.localeCompare(a.lastSeen),
+  );
+
+  function submitAdd() {
+    const c = draft.trim();
+    if (!c) return;
+    onAdd({
+      concept: c,
+      subject: draftSubject.trim() || undefined,
+      source: "manual",
+    });
+    setDraft("");
+    setDraftSubject("");
+  }
+
+  const addForm = (
+    <div style={styles.mtAddRow}>
+      <input
+        style={styles.mtInput}
+        value={draft}
+        onChange={(e) => setDraft(e.target.value)}
+        onKeyDown={(e) => e.key === "Enter" && submitAdd()}
+        placeholder="A concept you keep missing…"
+      />
+      <input
+        style={styles.mtInputSm}
+        value={draftSubject}
+        onChange={(e) => setDraftSubject(e.target.value)}
+        placeholder="Subject"
+      />
+      <button style={styles.mtAddBtn} onClick={submitAdd} disabled={!draft.trim()}>
+        Add
+      </button>
+    </div>
+  );
+
+  // Nothing tracked yet — offer a slim add affordance so manual entry stays
+  // reachable without cluttering the dashboard.
+  if (!mistakes.length) {
+    return (
+      <div style={styles.mtStrip}>
+        {expanded ? (
+          addForm
+        ) : (
+          <button style={styles.mtEmptyBtn} onClick={() => setExpanded(true)}>
+            🧩 Track a concept you keep missing
+          </button>
+        )}
+      </div>
+    );
+  }
+
+  return (
+    <div style={styles.mtStrip}>
+      <div style={styles.mtHead}>
+        <span style={styles.mtLabel}>🧩 Concepts to fix · {open.length}</span>
+        <button style={styles.linkBtn} onClick={() => setExpanded((v) => !v)}>
+          {expanded ? "Hide" : "Review"}
+        </button>
+      </div>
+
+      {!expanded && sorted[0] && (
+        <button style={styles.mtTop} onClick={() => setExpanded(true)}>
+          <span style={{ flex: 1, textAlign: "left" }}>
+            {sorted[0].subject ? `${sorted[0].subject}: ` : ""}
+            {sorted[0].concept}
+          </span>
+          {sorted[0].count > 1 && (
+            <span style={styles.mtCount}>missed {sorted[0].count}×</span>
+          )}
+        </button>
+      )}
+
+      {expanded && (
+        <div style={styles.mtList}>
+          {sorted.map((m) => (
+            <div key={m.id} style={styles.mtItem}>
+              <div style={styles.mtItemTop}>
+                <span style={styles.mtItemTitle}>
+                  <span title={m.source}>{MISTAKE_SOURCE_ICON[m.source]}</span>{" "}
+                  {m.concept}
+                </span>
+                {m.count > 1 && <span style={styles.mtCount}>×{m.count}</span>}
+              </div>
+              {(m.subject || m.why || m.fix) && (
+                <div style={styles.mtItemMeta}>
+                  {m.subject && <span style={styles.mtChip}>{m.subject}</span>}
+                  {m.why && <span style={styles.mtWhy}>{m.why}</span>}
+                  {m.fix && <div style={styles.mtFix}>✓ {m.fix}</div>}
+                </div>
+              )}
+              <div style={styles.mtBtnRow}>
+                <button style={styles.mtReviewBtn} onClick={() => onReview(m)}>
+                  Re-teach me
+                </button>
+                <button
+                  style={styles.mtGotBtn}
+                  onClick={() => onResolve(m.id, true)}
+                >
+                  Got it ✓
+                </button>
+                <button
+                  style={styles.mtRemoveBtn}
+                  title="Remove"
+                  onClick={() => onRemove(m.id)}
+                >
+                  ✕
+                </button>
+              </div>
+            </div>
+          ))}
+
+          {addForm}
+
+          {resolved.length > 0 && (
+            <div style={styles.mtResolvedBox}>
+              <button
+                style={styles.mtResolvedToggle}
+                onClick={() => setShowResolved((v) => !v)}
+              >
+                {showResolved ? "▾" : "▸"} Mastered · {resolved.length}
+              </button>
+              {showResolved &&
+                resolved.map((m) => (
+                  <div key={m.id} style={styles.mtResolvedItem}>
+                    <span style={{ flex: 1 }}>✅ {m.concept}</span>
+                    <button
+                      style={styles.linkBtn}
+                      onClick={() => onResolve(m.id, false)}
+                    >
+                      Reopen
+                    </button>
+                    <button
+                      style={styles.mtRemoveBtn}
+                      title="Remove"
+                      onClick={() => onRemove(m.id)}
+                    >
+                      ✕
+                    </button>
+                  </div>
+                ))}
+            </div>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
+// A 9am–9pm day planner: one editable row per hour. Each block has a text field
+// and a tappable tag (study / break / class / other) that colors the block. The
+// row for the current hour is highlighted so "now" is easy to find.
+function ScheduleGrid({
+  schedule,
+  onSet,
+  onClear,
+  homeHour,
+  onSetHomeHour,
+  onGenerate,
+  generating,
+  onStudyMinutes,
+}: {
+  schedule: DaySchedule | null;
+  onSet: (hour: number, patch: Partial<ScheduleBlock>) => void;
+  onClear: () => void;
+  homeHour: number;
+  onSetHomeHour: (h: number) => void;
+  onGenerate: () => void;
+  generating: boolean;
+  onStudyMinutes: (mins: number) => void;
+}) {
+  const today = localISO();
+  const fresh = schedule && schedule.date === today ? schedule : null;
+  const blocks = fresh?.blocks ?? {};
+  const currentHour = new Date().getHours();
+  const filled = SCHEDULE_HOURS.filter(
+    (h) => (blocks[h]?.text ?? "").trim(),
+  ).length;
+  const prettyDate = new Date(`${today}T00:00:00`).toLocaleDateString(undefined, {
+    weekday: "short",
+    month: "short",
+    day: "numeric",
+  });
+  const cycleKind = (h: number) => {
+    const cur = blocks[h]?.kind ?? "study";
+    const idx = SCHEDULE_KINDS.findIndex((k) => k.key === cur);
+    onSet(h, { kind: SCHEDULE_KINDS[(idx + 1) % SCHEDULE_KINDS.length].key });
+  };
+
+  // Per-task countdown timer. One block runs at a time. `total`/`study` let us
+  // credit the finished session's minutes toward "hours studied" (study blocks
+  // only), logged once when the countdown runs out.
+  const [timer, setTimer] = useState<{
+    hour: number;
+    left: number;
+    running: boolean;
+    total: number; // full session length, seconds
+    study: boolean; // whether this block counts as study time
+  } | null>(null);
+  // Build a fresh running-timer state for an hour block, tagging it study or not.
+  const mkTimer = (h: number, mins = TIMER_DEFAULT_MIN) => ({
+    hour: h,
+    left: mins * 60,
+    running: true,
+    total: mins * 60,
+    study: (blocks[h]?.kind ?? "study") === "study",
+  });
+  useEffect(() => {
+    if (!timer?.running) return;
+    const id = setInterval(() => {
+      setTimer((t) => {
+        if (!t || !t.running) return t;
+        if (t.left <= 1) {
+          playTimerChime();
+          // Credit the completed session. Defer out of the state updater so we
+          // don't call the parent's setState while updating this component.
+          if (t.study) {
+            const mins = Math.round(t.total / 60);
+            queueMicrotask(() => onStudyMinutes(mins));
+          }
+          return { ...t, left: 0, running: false };
+        }
+        return { ...t, left: t.left - 1 };
+      });
+    }, 1000);
+    return () => clearInterval(id);
+  }, [timer?.running, timer?.hour]);
+  const startTimer = (h: number, mins = TIMER_DEFAULT_MIN) =>
+    setTimer(mkTimer(h, mins));
+  const toggleTimer = (h: number) =>
+    setTimer((t) =>
+      t && t.hour === h
+        ? t.left <= 0
+          ? mkTimer(h)
+          : { ...t, running: !t.running }
+        : mkTimer(h),
+    );
+  return (
+    <div style={styles.card}>
+      <div style={styles.cardHead}>
+        <span style={styles.cardClass}>🕘 Today&apos;s schedule</span>
+        <span style={styles.subjectsCount}>
+          {filled ? `${filled} planned · ` : ""}
+          {prettyDate}
+        </span>
+      </div>
+      <p style={{ color: "var(--muted)", margin: "2px 0 10px", fontSize: 13 }}>
+        Plan your day from 9 AM to 9 PM, or let me build your study time around
+        when you get home. Tap a block&apos;s tag to change study / break / class.
+      </p>
+      <div style={styles.schedBuildRow}>
+        <label style={styles.schedBuildLabel}>
+          I get home at
+          <select
+            style={styles.schedHomeSelect}
+            value={homeHour}
+            onChange={(e) => onSetHomeHour(parseInt(e.target.value, 10))}
+          >
+            {SCHEDULE_HOURS.filter((h) => h >= 11 && h <= 20).map((h) => (
+              <option key={h} value={h}>
+                {hourLabel(h)}
+              </option>
+            ))}
+          </select>
+        </label>
+        <button
+          style={styles.schedBuildBtn}
+          disabled={generating}
+          onClick={onGenerate}
+        >
+          {generating ? "Building…" : "✨ Build my study schedule"}
+        </button>
+      </div>
+      <div style={styles.schedList}>
+        {SCHEDULE_HOURS.map((h) => {
+          const b = blocks[h];
+          const hasText = !!(b?.text ?? "").trim();
+          const kind = scheduleKind(b?.kind ?? "study");
+          const isNow = h === currentHour;
+          return (
+            <div
+              key={h}
+              style={{
+                ...styles.schedRow,
+                ...(isNow ? styles.schedRowNow : {}),
+                borderLeft: `4px solid ${
+                  hasText ? kind.color : "var(--border)"
+                }`,
+              }}
+            >
+              <span style={styles.schedTime}>
+                {hourLabel(h)}
+                {isNow && <span style={styles.schedNowDot}>now</span>}
+              </span>
+              <button
+                style={{
+                  ...styles.schedKind,
+                  ...(hasText ? { color: kind.color } : { opacity: 0.45 }),
+                }}
+                onClick={() => cycleKind(h)}
+                aria-label={`Block type: ${kind.label}. Tap to change.`}
+                title={`${kind.label} — tap to change`}
+              >
+                {kind.emoji}
+              </button>
+              <input
+                style={styles.schedInput}
+                value={b?.text ?? ""}
+                placeholder={isNow ? "Now — what's the plan?" : "—"}
+                onChange={(e) => onSet(h, { text: e.target.value })}
+              />
+              {hasText &&
+                (timer?.hour === h ? (
+                  <div style={styles.schedTimer}>
+                    <button
+                      style={styles.schedTimerBtn}
+                      onClick={() => toggleTimer(h)}
+                      title={
+                        timer.left <= 0
+                          ? "Restart"
+                          : timer.running
+                            ? "Pause"
+                            : "Resume"
+                      }
+                      aria-label={
+                        timer.left <= 0
+                          ? "Restart timer"
+                          : timer.running
+                            ? "Pause timer"
+                            : "Resume timer"
+                      }
+                    >
+                      {timer.left <= 0 ? "↺" : timer.running ? "⏸" : "▶"}
+                    </button>
+                    <span
+                      style={{
+                        ...styles.schedTimerTime,
+                        ...(timer.left <= 0 ? styles.schedTimerDone : {}),
+                      }}
+                    >
+                      {timer.left <= 0 ? "done ✓" : fmtTimer(timer.left)}
+                    </span>
+                    <button
+                      style={styles.schedTimerClear}
+                      onClick={() => setTimer(null)}
+                      title="Clear timer"
+                      aria-label="Clear timer"
+                    >
+                      ✕
+                    </button>
+                  </div>
+                ) : (
+                  <button
+                    style={styles.schedTimerStart}
+                    onClick={() => startTimer(h)}
+                    title={`Start a ${TIMER_DEFAULT_MIN}-min focus countdown`}
+                    aria-label={`Start a ${TIMER_DEFAULT_MIN}-minute focus timer for this block`}
+                  >
+                    ⏱
+                  </button>
+                ))}
+            </div>
+          );
+        })}
+      </div>
+      {filled > 0 && (
+        <div style={{ marginTop: 12, textAlign: "right" }}>
+          <button style={styles.linkBtn} onClick={onClear}>
+            Clear day
+          </button>
+        </div>
+      )}
+    </div>
+  );
+}
+
 function PlanPanel({
   plan,
   onToggle,
   onAdd,
   onRemove,
+  onEdit,
 }: {
   plan: Milestone[];
   onToggle: (i: number) => void;
   onAdd?: (title: string) => void;
   onRemove?: (i: number) => void;
+  onEdit?: (
+    i: number,
+    patch: { title?: string; detail?: string; checkpoint?: boolean },
+  ) => void;
 }) {
   const [step, setStep] = useState("");
+  // Which row is being edited, plus the draft fields for that row.
+  const [editIdx, setEditIdx] = useState<number | null>(null);
+  const [editTitle, setEditTitle] = useState("");
+  const [editDetail, setEditDetail] = useState("");
+  const [editCheckpoint, setEditCheckpoint] = useState(false);
   const done = plan.filter((m) => m.done).length;
   const pct = plan.length ? Math.round((done / plan.length) * 100) : 0;
   function addStep() {
     if (!step.trim() || !onAdd) return;
     onAdd(step);
     setStep("");
+  }
+  function startEdit(i: number) {
+    const m = plan[i];
+    setEditIdx(i);
+    setEditTitle(m.title);
+    setEditDetail(m.detail ?? "");
+    setEditCheckpoint(!!m.checkpoint);
+  }
+  function cancelEdit() {
+    setEditIdx(null);
+  }
+  function saveEdit() {
+    if (editIdx == null || !onEdit) return;
+    if (!editTitle.trim()) return;
+    onEdit(editIdx, {
+      title: editTitle,
+      detail: editDetail,
+      checkpoint: editCheckpoint,
+    });
+    setEditIdx(null);
   }
   return (
     <div style={styles.plan}>
@@ -4844,50 +7601,111 @@ function PlanPanel({
         <div style={{ ...styles.progressFill, width: `${pct}%` }} />
       </div>
       <div style={styles.planList}>
-        {plan.map((m, i) => (
-          <div key={i} style={styles.planRow}>
-            <button
-              style={{ ...styles.planItem, flex: 1 }}
-              onClick={() => onToggle(i)}
-            >
-              <span
-                style={{
-                  ...styles.checkbox,
-                  borderColor: m.checkpoint ? "#b8742a" : "var(--accent)",
-                  background: m.done
-                    ? m.checkpoint
-                      ? "#b8742a"
-                      : "var(--accent)"
-                    : "transparent",
-                  color: m.done ? "#fff" : "transparent",
+        {plan.map((m, i) =>
+          editIdx === i ? (
+            <div key={i} style={styles.planEditRow}>
+              <input
+                style={styles.planEditInput}
+                value={editTitle}
+                placeholder="Step title"
+                autoFocus
+                onChange={(e) => setEditTitle(e.target.value)}
+                onKeyDown={(e) => {
+                  if (e.key === "Enter") saveEdit();
+                  if (e.key === "Escape") cancelEdit();
                 }}
-              >
-                ✓
-              </span>
-              <span
-                style={{
-                  textDecoration: m.done ? "line-through" : "none",
-                  color: m.done ? "var(--muted)" : "var(--assistant-text)",
+              />
+              <input
+                style={styles.planEditInput}
+                value={editDetail}
+                placeholder="Detail (optional) — e.g. Spend about 10 minutes…"
+                onChange={(e) => setEditDetail(e.target.value)}
+                onKeyDown={(e) => {
+                  if (e.key === "Enter") saveEdit();
+                  if (e.key === "Escape") cancelEdit();
                 }}
-              >
-                {m.checkpoint && (
-                  <span style={styles.checkpointBadge}>🚩 Checkpoint</span>
-                )}
-                {m.title}
-                {m.detail ? ` — ${m.detail}` : ""}
-              </span>
-            </button>
-            {m.added && onRemove && (
+              />
+              <div style={styles.planEditControls}>
+                <label style={styles.planEditCheckpoint}>
+                  <input
+                    type="checkbox"
+                    checked={editCheckpoint}
+                    onChange={(e) => setEditCheckpoint(e.target.checked)}
+                  />
+                  🚩 Checkpoint
+                </label>
+                <span style={{ flex: 1 }} />
+                <button
+                  style={styles.planEditCancel}
+                  onClick={cancelEdit}
+                >
+                  Cancel
+                </button>
+                <button
+                  style={styles.planEditSave}
+                  disabled={!editTitle.trim()}
+                  onClick={saveEdit}
+                >
+                  Save
+                </button>
+              </div>
+            </div>
+          ) : (
+            <div key={i} style={styles.planRow}>
               <button
-                style={styles.folderRemove}
-                onClick={() => onRemove(i)}
-                aria-label={`Remove step ${m.title}`}
+                style={{ ...styles.planItem, flex: 1 }}
+                onClick={() => onToggle(i)}
               >
-                ×
+                <span
+                  style={{
+                    ...styles.checkbox,
+                    borderColor: m.checkpoint ? "#b8742a" : "var(--accent)",
+                    background: m.done
+                      ? m.checkpoint
+                        ? "#b8742a"
+                        : "var(--accent)"
+                      : "transparent",
+                    color: m.done ? "#fff" : "transparent",
+                  }}
+                >
+                  ✓
+                </span>
+                <span
+                  style={{
+                    textDecoration: m.done ? "line-through" : "none",
+                    color: m.done ? "var(--muted)" : "var(--assistant-text)",
+                  }}
+                >
+                  {m.checkpoint && (
+                    <span style={styles.checkpointBadge}>🚩 Checkpoint</span>
+                  )}
+                  {m.title}
+                  {m.detail ? ` — ${m.detail}` : ""}
+                </span>
               </button>
-            )}
-          </div>
-        ))}
+              {onEdit && (
+                <button
+                  style={styles.planRowAction}
+                  onClick={() => startEdit(i)}
+                  aria-label={`Edit step ${m.title}`}
+                  title="Edit step"
+                >
+                  ✎
+                </button>
+              )}
+              {onRemove && (
+                <button
+                  style={styles.folderRemove}
+                  onClick={() => onRemove(i)}
+                  aria-label={`Remove step ${m.title}`}
+                  title="Delete step"
+                >
+                  ×
+                </button>
+              )}
+            </div>
+          ),
+        )}
       </div>
       {onAdd && (
         <div style={styles.assignAddRow}>
@@ -4913,10 +7731,12 @@ function PlanPanel({
 function MonthGrid({
   events,
   assignments = [],
+  dailyTasks = null,
   onPickDate,
 }: {
   events: StudyEvent[];
   assignments?: Assignment[];
+  dailyTasks?: DailyTasksState | null;
   onPickDate: (iso: string) => void;
 }) {
   const now = new Date();
@@ -4954,6 +7774,13 @@ function MonthGrid({
         label: `⏳ work on: ${a.title}${
           a.estMin ? ` (${a.estMin} min)` : ""
         }`,
+      });
+  // Daily to-do list (purple) — one dot per task on the day it's scheduled for.
+  if (dailyTasks?.date)
+    for (const t of dailyTasks.tasks)
+      (dotsByDate[dailyTasks.date] ||= []).push({
+        color: "#6b5bd6",
+        label: `📝 ${t.title}${t.done ? " ✓" : ""}`,
       });
   const cells: (number | null)[] = [];
   for (let i = 0; i < startWeekday; i++) cells.push(null);
@@ -5025,7 +7852,8 @@ function MonthGrid({
           );
         })}
       </div>
-      {assignments.some((a) => a.planDate && !a.done) && (
+      {(assignments.some((a) => a.planDate && !a.done) ||
+        (dailyTasks?.tasks.length ?? 0) > 0) && (
         <div style={styles.calLegend}>
           <span style={styles.calLegendItem}>
             <span style={{ ...styles.calDot, background: "#2f6f4f" }} /> due
@@ -5033,6 +7861,11 @@ function MonthGrid({
           <span style={styles.calLegendItem}>
             <span style={{ ...styles.calDot, background: "#d98a2b" }} /> work on
           </span>
+          {(dailyTasks?.tasks.length ?? 0) > 0 && (
+            <span style={styles.calLegendItem}>
+              <span style={{ ...styles.calDot, background: "#6b5bd6" }} /> tasks
+            </span>
+          )}
         </div>
       )}
     </div>
@@ -5042,6 +7875,7 @@ function MonthGrid({
 function CalendarPanel({
   events,
   assignments = [],
+  dailyTasks = null,
   profile,
   career,
   onAdd,
@@ -5052,6 +7886,7 @@ function CalendarPanel({
 }: {
   events: StudyEvent[];
   assignments?: Assignment[];
+  dailyTasks?: DailyTasksState | null;
   profile?: LearnerProfile | null;
   career?: string;
   onAdd: (e: StudyEvent) => void;
@@ -5153,6 +7988,7 @@ function CalendarPanel({
       <MonthGrid
         events={events}
         assignments={assignments}
+        dailyTasks={dailyTasks}
         onPickDate={(iso) => {
           setDate(iso);
           setAdding(true);
@@ -5344,6 +8180,568 @@ function isBareYouTubeUrl(s: string): boolean {
   );
 }
 
+// Upload a rubric + a project; Eliora grades the project against the rubric and
+// returns a score + strengths + gaps per criterion, an overall grade, and next
+// steps. Files (pdf/image/text) are read to base64 and posted to the API.
+type GradeDoc = { name: string; base64: string; mediaType: string };
+type CriterionScore = {
+  criterion: string;
+  estimatedScore: string;
+  strengths: string;
+  gaps: string;
+};
+type ProjectFeedbackResult = {
+  overallGrade: string;
+  summary: string;
+  criteria: CriterionScore[];
+  topNextSteps: string[];
+};
+
+function ProjectGrader({ profile }: { profile: LearnerProfile }) {
+  const [rubricDocs, setRubricDocs] = useState<GradeDoc[]>([]);
+  const [projectDocs, setProjectDocs] = useState<GradeDoc[]>([]);
+  const [rubricText, setRubricText] = useState("");
+  const [projectText, setProjectText] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [feedback, setFeedback] = useState<ProjectFeedbackResult | null>(null);
+
+  const readFiles = (files: FileList) =>
+    Promise.all(
+      Array.from(files)
+        .slice(0, 4)
+        .map(
+          (file) =>
+            new Promise<GradeDoc>((resolve, reject) => {
+              const r = new FileReader();
+              r.onload = () => {
+                const s = String(r.result);
+                resolve({
+                  name: file.name,
+                  base64: s.slice(s.indexOf(",") + 1),
+                  mediaType: file.type || "text/plain",
+                });
+              };
+              r.onerror = reject;
+              r.readAsDataURL(file);
+            }),
+        ),
+    );
+
+  async function onPick(which: "rubric" | "project", files: FileList | null) {
+    if (!files?.length) return;
+    const docs = await readFiles(files);
+    if (which === "rubric") setRubricDocs(docs);
+    else setProjectDocs(docs);
+  }
+
+  const hasRubric = rubricDocs.length > 0 || rubricText.trim().length > 0;
+  const hasProject = projectDocs.length > 0 || projectText.trim().length > 0;
+  const canRun = hasRubric && hasProject && !busy;
+
+  async function run() {
+    if (!canRun) return;
+    setBusy(true);
+    setError(null);
+    setFeedback(null);
+    try {
+      const res = await fetch("/api/project-feedback", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          rubricDocs,
+          rubricText: rubricText.trim() || undefined,
+          projectDocs,
+          projectText: projectText.trim() || undefined,
+          profile,
+        }),
+      });
+      const data = (await res.json()) as {
+        feedback?: ProjectFeedbackResult;
+        error?: string;
+      };
+      if (data.feedback?.criteria?.length) setFeedback(data.feedback);
+      else
+        setError(
+          data.error === "missing_input"
+            ? "Add both a rubric and your project first."
+            : "Couldn't grade that — try clearer files or paste the text.",
+        );
+    } catch {
+      setError("Something went wrong. Please try again.");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <div style={styles.tabPanel}>
+      <div style={styles.modalHead}>
+        <h2 style={styles.modalTitle}>Grade a project</h2>
+      </div>
+      <p style={styles.calEmpty}>
+        Upload the rubric and your project — I&apos;ll grade it against the
+        rubric and show you what to improve. (PDF, image, or text; you can paste
+        instead.)
+      </p>
+
+      <div style={styles.outputLabel}>1. Rubric</div>
+      <input
+        type="file"
+        multiple
+        accept=".txt,.md,.pdf,image/*"
+        onChange={(e) => onPick("rubric", e.target.files)}
+      />
+      {rubricDocs.length > 0 && (
+        <p style={styles.calEmpty}>
+          Selected: {rubricDocs.map((d) => d.name).join(", ")}
+        </p>
+      )}
+      <textarea
+        style={styles.modalTextarea}
+        value={rubricText}
+        onChange={(e) => setRubricText(e.target.value)}
+        placeholder="…or paste the rubric here"
+        rows={3}
+      />
+
+      <div style={styles.outputLabel}>2. Your project</div>
+      <input
+        type="file"
+        multiple
+        accept=".txt,.md,.pdf,image/*"
+        onChange={(e) => onPick("project", e.target.files)}
+      />
+      {projectDocs.length > 0 && (
+        <p style={styles.calEmpty}>
+          Selected: {projectDocs.map((d) => d.name).join(", ")}
+        </p>
+      )}
+      <textarea
+        style={styles.modalTextarea}
+        value={projectText}
+        onChange={(e) => setProjectText(e.target.value)}
+        placeholder="…or paste your project here"
+        rows={4}
+      />
+
+      <button onClick={run} disabled={!canRun} style={styles.primaryBtn}>
+        {busy ? "Grading…" : "Grade my project"}
+      </button>
+
+      {error && <p style={styles.resultText}>{error}</p>}
+
+      {feedback && (
+        <div style={styles.result}>
+          <div style={styles.qaHead}>Estimated grade: {feedback.overallGrade}</div>
+          {feedback.summary && (
+            <div style={styles.resultMd}>{feedback.summary}</div>
+          )}
+          {feedback.criteria.map((c, i) => (
+            <div key={i} style={styles.qaBox}>
+              <div style={styles.qaHead}>
+                {c.criterion} — {c.estimatedScore}
+              </div>
+              <div style={styles.resultText}>
+                <strong>Strengths:</strong> {c.strengths}
+              </div>
+              <div style={styles.resultText}>
+                <strong>To improve:</strong> {c.gaps}
+              </div>
+            </div>
+          ))}
+          {feedback.topNextSteps.length > 0 && (
+            <div style={styles.qaBox}>
+              <div style={styles.qaHead}>Next steps</div>
+              <ul>
+                {feedback.topNextSteps.map((s, i) => (
+                  <li key={i} style={styles.resultText}>
+                    {s}
+                  </li>
+                ))}
+              </ul>
+            </div>
+          )}
+          <p style={styles.calEmpty}>
+            This is an estimate to help you improve — your teacher&apos;s grade
+            may differ.
+          </p>
+        </div>
+      )}
+    </div>
+  );
+}
+
+// A self-contained presentation-rehearsal recorder. Uses getUserMedia +
+// MediaRecorder to capture the learner on camera+mic (or audio-only), keeps a
+// list of takes they can replay/download, and shows an optional teleprompter
+// script + practice tips. Nothing leaves the browser — takes live as object
+// URLs in memory and are revoked on unmount.
+type PracticeTake = {
+  id: string;
+  url: string;
+  durationSec: number;
+  createdAt: number;
+  audioOnly: boolean;
+};
+
+const PRACTICE_TIPS = [
+  "Open with a one-sentence hook so they know why to listen.",
+  "Look at the camera lens, not your own face — that's eye contact.",
+  "Pause instead of saying “um”; silence sounds confident.",
+  "Slow down — you're almost always faster than it feels.",
+  "End by restating your main point in one clear line.",
+];
+
+function fmtClock(totalSec: number) {
+  const m = Math.floor(totalSec / 60);
+  const s = Math.floor(totalSec % 60);
+  return `${m}:${s.toString().padStart(2, "0")}`;
+}
+
+function PresentationPractice() {
+  const liveVideoRef = useRef<HTMLVideoElement | null>(null);
+  const streamRef = useRef<MediaStream | null>(null);
+  const recorderRef = useRef<MediaRecorder | null>(null);
+  const chunksRef = useRef<Blob[]>([]);
+  const startedAtRef = useRef<number>(0);
+  const takeAudioOnlyRef = useRef<boolean>(false);
+  const tickRef = useRef<ReturnType<typeof setInterval> | null>(null);
+
+  const [ready, setReady] = useState(false);
+  const [starting, setStarting] = useState(false);
+  const [recording, setRecording] = useState(false);
+  const [elapsed, setElapsed] = useState(0);
+  const [error, setError] = useState<string | null>(null);
+  const [audioOnly, setAudioOnly] = useState(false);
+  const [takes, setTakes] = useState<PracticeTake[]>([]);
+  const [activeTakeId, setActiveTakeId] = useState<string | null>(null);
+  const [script, setScript] = useState("");
+  const [showScript, setShowScript] = useState(false);
+
+  // Mirror `takes` into a ref so the unmount cleanup (which runs with an empty
+  // dep list) can revoke the latest object URLs, not just the initial empties.
+  const takesRef = useRef<PracticeTake[]>([]);
+  takesRef.current = takes;
+
+  const supported =
+    typeof navigator !== "undefined" &&
+    !!navigator.mediaDevices?.getUserMedia &&
+    typeof window !== "undefined" &&
+    typeof window.MediaRecorder !== "undefined";
+
+  // Stop the camera/mic and clear the live preview.
+  function stopStream() {
+    streamRef.current?.getTracks().forEach((t) => t.stop());
+    streamRef.current = null;
+    if (liveVideoRef.current) liveVideoRef.current.srcObject = null;
+  }
+
+  // Turn the camera + mic on and show the live preview (no recording yet).
+  async function enableCamera() {
+    if (starting) return;
+    setError(null);
+    setStarting(true);
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({
+        video: audioOnly ? false : { facingMode: "user" },
+        audio: true,
+      });
+      streamRef.current = stream;
+      if (liveVideoRef.current && !audioOnly) {
+        liveVideoRef.current.srcObject = stream;
+        liveVideoRef.current.muted = true;
+        await liveVideoRef.current.play().catch(() => {});
+      }
+      setReady(true);
+    } catch {
+      setError(
+        "I couldn't reach your camera or microphone. Allow access in your browser (the 🔒 icon in the address bar) and try again.",
+      );
+    } finally {
+      setStarting(false);
+    }
+  }
+
+  function startRecording() {
+    const stream = streamRef.current;
+    if (!stream) return;
+    setError(null);
+    chunksRef.current = [];
+    takeAudioOnlyRef.current = audioOnly;
+    // Pick a container the browser actually supports.
+    const wanted = audioOnly
+      ? ["audio/webm", "audio/mp4"]
+      : ["video/webm;codecs=vp9,opus", "video/webm", "video/mp4"];
+    const mimeType = wanted.find((t) => MediaRecorder.isTypeSupported(t));
+    let rec: MediaRecorder;
+    try {
+      rec = new MediaRecorder(stream, mimeType ? { mimeType } : undefined);
+    } catch {
+      setError("Your browser couldn't start recording. Try Chrome or Safari.");
+      return;
+    }
+    rec.ondataavailable = (e) => {
+      if (e.data.size > 0) chunksRef.current.push(e.data);
+    };
+    rec.onstop = () => {
+      const type = rec.mimeType || (audioOnly ? "audio/webm" : "video/webm");
+      const blob = new Blob(chunksRef.current, { type });
+      const url = URL.createObjectURL(blob);
+      const durationSec = Math.max(1, Math.round((Date.now() - startedAtRef.current) / 1000));
+      const take: PracticeTake = {
+        id: `take-${Date.now().toString(36)}`,
+        url,
+        durationSec,
+        createdAt: Date.now(),
+        audioOnly: takeAudioOnlyRef.current,
+      };
+      setTakes((prev) => [take, ...prev]);
+      setActiveTakeId(take.id);
+    };
+    recorderRef.current = rec;
+    startedAtRef.current = Date.now();
+    setElapsed(0);
+    rec.start();
+    setRecording(true);
+    tickRef.current = setInterval(() => {
+      setElapsed(Math.round((Date.now() - startedAtRef.current) / 1000));
+    }, 250);
+  }
+
+  function stopRecording() {
+    if (tickRef.current) {
+      clearInterval(tickRef.current);
+      tickRef.current = null;
+    }
+    recorderRef.current?.stop();
+    recorderRef.current = null;
+    setRecording(false);
+  }
+
+  function deleteTake(id: string) {
+    setTakes((prev) => {
+      const gone = prev.find((t) => t.id === id);
+      if (gone) URL.revokeObjectURL(gone.url);
+      return prev.filter((t) => t.id !== id);
+    });
+    setActiveTakeId((cur) => (cur === id ? null : cur));
+  }
+
+  // Re-init the live preview when toggling audio-only while the camera is on.
+  useEffect(() => {
+    if (!ready || recording) return;
+    stopStream();
+    setReady(false);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [audioOnly]);
+
+  // Tear everything down on unmount so the camera light goes off and object
+  // URLs don't leak.
+  useEffect(() => {
+    return () => {
+      if (tickRef.current) clearInterval(tickRef.current);
+      recorderRef.current?.stop();
+      stopStream();
+      takesRef.current.forEach((t) => URL.revokeObjectURL(t.url));
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  const activeTake = takes.find((t) => t.id === activeTakeId) ?? null;
+
+  if (!supported) {
+    return (
+      <div style={styles.tabPanel}>
+        <div style={styles.modalHead}>
+          <h2 style={styles.modalTitle}>Practice a presentation</h2>
+        </div>
+        <p style={styles.calEmpty}>
+          Recording isn&apos;t supported in this browser. Try the latest Chrome,
+          Edge, or Safari on a device with a camera or microphone.
+        </p>
+      </div>
+    );
+  }
+
+  return (
+    <div style={styles.tabPanel}>
+      <div style={styles.modalHead}>
+        <h2 style={styles.modalTitle}>Practice a presentation</h2>
+      </div>
+      <p style={styles.calEmpty}>
+        Record yourself rehearsing, then watch it back to see how you come
+        across. Everything stays on your device — nothing is uploaded.
+      </p>
+
+      <div style={styles.practiceStage}>
+        {audioOnly ? (
+          <div style={styles.practiceAudioBox}>
+            <div style={styles.practiceAudioIcon}>{recording ? "🎙️" : "🎧"}</div>
+            <div style={styles.calEmpty}>
+              {recording
+                ? "Recording audio…"
+                : ready
+                  ? "Mic ready — press Record when you are."
+                  : "Audio-only mode."}
+            </div>
+          </div>
+        ) : (
+          <video
+            ref={liveVideoRef}
+            style={styles.practiceVideo}
+            playsInline
+            muted
+          />
+        )}
+        {recording && (
+          <div style={styles.practiceRecDot}>
+            <span style={styles.practiceRecPulse} /> REC {fmtClock(elapsed)}
+          </div>
+        )}
+        {showScript && script.trim() && (
+          <div style={styles.practiceTeleprompter}>{script}</div>
+        )}
+      </div>
+
+      <label style={styles.practiceToggle}>
+        <input
+          type="checkbox"
+          checked={audioOnly}
+          disabled={recording}
+          onChange={(e) => setAudioOnly(e.target.checked)}
+        />
+        Audio only (no camera)
+      </label>
+
+      <div style={styles.practiceControls}>
+        {!ready && (
+          <button
+            onClick={enableCamera}
+            disabled={starting}
+            style={styles.primaryBtn}
+          >
+            {starting
+              ? "Starting…"
+              : audioOnly
+                ? "Turn on mic"
+                : "Turn on camera"}
+          </button>
+        )}
+        {ready && !recording && (
+          <button onClick={startRecording} style={styles.primaryBtn}>
+            ⏺ Record
+          </button>
+        )}
+        {recording && (
+          <button onClick={stopRecording} style={styles.practiceStopBtn}>
+            ⏹ Stop ({fmtClock(elapsed)})
+          </button>
+        )}
+        {ready && !recording && (
+          <button
+            onClick={() => {
+              stopStream();
+              setReady(false);
+            }}
+            style={styles.secondaryBtn}
+          >
+            Turn off
+          </button>
+        )}
+      </div>
+
+      {error && <p style={styles.resultText}>{error}</p>}
+
+      <div style={styles.outputLabel}>Notes / script (optional)</div>
+      <textarea
+        style={styles.modalTextarea}
+        value={script}
+        onChange={(e) => setScript(e.target.value)}
+        placeholder="Paste or jot your talking points — turn on the teleprompter to see them over the video while you record."
+        rows={3}
+      />
+      {script.trim() && (
+        <label style={styles.practiceToggle}>
+          <input
+            type="checkbox"
+            checked={showScript}
+            onChange={(e) => setShowScript(e.target.checked)}
+          />
+          Show notes as a teleprompter over the video
+        </label>
+      )}
+
+      {activeTake && (
+        <div style={styles.result}>
+          <div style={styles.qaHead}>
+            Your take · {fmtClock(activeTake.durationSec)}
+          </div>
+          {activeTake.audioOnly ? (
+            <audio src={activeTake.url} controls style={{ width: "100%" }} />
+          ) : (
+            <video
+              src={activeTake.url}
+              controls
+              playsInline
+              style={styles.practiceVideo}
+            />
+          )}
+          <div style={styles.practiceControls}>
+            <a
+              href={activeTake.url}
+              download={`practice-${activeTake.id}.webm`}
+              style={{ ...styles.secondaryBtn, textDecoration: "none" }}
+            >
+              ⬇ Download
+            </a>
+            <button
+              onClick={() => deleteTake(activeTake.id)}
+              style={styles.secondaryBtn}
+            >
+              Delete take
+            </button>
+          </div>
+        </div>
+      )}
+
+      {takes.length > 1 && (
+        <>
+          <div style={styles.outputLabel}>Your takes</div>
+          <div style={styles.practiceTakeRow}>
+            {takes.map((t, i) => (
+              <button
+                key={t.id}
+                onClick={() => setActiveTakeId(t.id)}
+                style={{
+                  ...styles.practiceTakeChip,
+                  ...(t.id === activeTakeId
+                    ? styles.practiceTakeChipActive
+                    : {}),
+                }}
+              >
+                {t.audioOnly ? "🎧" : "🎬"} Take {takes.length - i} ·{" "}
+                {fmtClock(t.durationSec)}
+              </button>
+            ))}
+          </div>
+        </>
+      )}
+
+      <div style={styles.result}>
+        <div style={styles.qaHead}>Delivery tips</div>
+        <ul style={{ margin: 0, paddingLeft: 18 }}>
+          {PRACTICE_TIPS.map((tip, i) => (
+            <li key={i} style={styles.resultText}>
+              {tip}
+            </li>
+          ))}
+        </ul>
+      </div>
+    </div>
+  );
+}
+
 function Summarizer({
   profile,
   onClose,
@@ -5375,6 +8773,16 @@ function Summarizer({
   const [cards, setCards] = useState<Flashcard[] | null>(null);
   const [quiz, setQuiz] = useState<QuizQuestion[] | null>(null);
   const [busy, setBusy] = useState(false);
+  // Follow-up Q&A about the generated notes (summary / study guide only).
+  const [qa, setQa] = useState<{ role: "user" | "assistant"; content: string }[]>(
+    [],
+  );
+  const [question, setQuestion] = useState("");
+  const [asking, setAsking] = useState(false);
+  // Practice questions generated from the notes Eliora just wrote (as opposed to
+  // the "Quiz" output, which is built from the raw source material).
+  const [noteQuiz, setNoteQuiz] = useState<QuizQuestion[] | null>(null);
+  const [makingQuiz, setMakingQuiz] = useState(false);
 
   function onPickFile(f: File) {
     const isText =
@@ -5405,6 +8813,9 @@ function Summarizer({
     setResult("");
     setCards(null);
     setQuiz(null);
+    setQa([]);
+    setQuestion("");
+    setNoteQuiz(null);
     // If someone pastes a bare YouTube link into the text box, treat it as a
     // video instead of trying to "summarize" the URL text (which can't work).
     const looksLikeBareYouTube =
@@ -5448,6 +8859,71 @@ function Summarizer({
       setResult("Sorry, something went wrong. Please try again.");
     } finally {
       setBusy(false);
+    }
+  }
+
+  async function ask() {
+    const q = question.trim();
+    if (!q || asking || !result) return;
+    setAsking(true);
+    setQuestion("");
+    // Show the question immediately, plus a placeholder that streams in.
+    const history = qa;
+    setQa([...history, { role: "user", content: q }, { role: "assistant", content: "" }]);
+    try {
+      const res = await fetch("/api/notes-qa", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ notes: result, question: q, history, profile }),
+      });
+      if (!res.body) throw new Error("no stream");
+      const reader = res.body.getReader();
+      const decoder = new TextDecoder();
+      let acc = "";
+      while (true) {
+        const { value, done } = await reader.read();
+        if (done) break;
+        acc += decoder.decode(value, { stream: true });
+        setQa([
+          ...history,
+          { role: "user", content: q },
+          { role: "assistant", content: acc },
+        ]);
+      }
+    } catch {
+      setQa([
+        ...history,
+        { role: "user", content: q },
+        { role: "assistant", content: "Sorry, I couldn't answer that. Please try again." },
+      ]);
+    } finally {
+      setAsking(false);
+    }
+  }
+
+  // Turn the notes Eliora just wrote into a practice quiz. Reuses the summarize
+  // endpoint's quiz path, feeding the generated notes back in as the material.
+  async function makeQuestions() {
+    if (!result || makingQuiz) return;
+    setMakingQuiz(true);
+    setNoteQuiz(null);
+    try {
+      const res = await fetch("/api/summarize", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          source: "text",
+          text: result,
+          output: "quiz",
+          profile,
+        }),
+      });
+      const data = await res.json();
+      setNoteQuiz(data.quiz ?? []);
+    } catch {
+      setNoteQuiz([]);
+    } finally {
+      setMakingQuiz(false);
     }
   }
 
@@ -5560,7 +9036,9 @@ function Summarizer({
                 <div style={styles.resultText}>No quiz — try more material.</div>
               )
             ) : (
-              <div style={styles.resultText}>{result}</div>
+              <div style={styles.resultMd}>
+                {renderMarkdown(result, "var(--accent)")}
+              </div>
             )}
             <div style={styles.formActions}>
               {!cards && !quiz && (
@@ -5569,6 +9047,26 @@ function Summarizer({
                   onClick={() => navigator.clipboard?.writeText(result)}
                 >
                   Copy
+                </button>
+              )}
+              {!cards && !quiz && result && (
+                <ShareButton
+                  payload={{
+                    v: 1,
+                    kind: "note",
+                    title: noteTitle(result),
+                    text: result,
+                  }}
+                  label="Share with a friend"
+                />
+              )}
+              {!cards && !quiz && result && !busy && (
+                <button
+                  style={styles.secondaryBtn}
+                  onClick={makeQuestions}
+                  disabled={makingQuiz}
+                >
+                  {makingQuiz ? "Writing questions…" : "📋 Make questions"}
                 </button>
               )}
               <button
@@ -5591,18 +9089,117 @@ function Summarizer({
                 Add to chat
               </button>
             </div>
+
+            {/* Practice questions written from the notes above. */}
+            {!cards && !quiz && noteQuiz && (
+              <div style={styles.qaBox}>
+                <div style={styles.qaHead}>📋 Questions from these notes</div>
+                {noteQuiz.length ? (
+                  <QuizView
+                    quiz={noteQuiz}
+                    onMissed={() => {}}
+                    onStudyGuide={onStudyGuide}
+                  />
+                ) : (
+                  <div style={styles.resultText}>
+                    I couldn&apos;t write questions from these notes — try a longer
+                    summary or study guide.
+                  </div>
+                )}
+              </div>
+            )}
+
+            {/* Follow-up Q&A grounded in the generated notes. */}
+            {!cards && !quiz && result && !busy && (
+              <div style={styles.qaBox}>
+                <div style={styles.qaHead}>💬 Ask about these notes</div>
+                {qa.map((m, i) => (
+                  <div
+                    key={i}
+                    style={m.role === "user" ? styles.qaUser : styles.qaBot}
+                  >
+                    {m.role === "user" ? (
+                      m.content
+                    ) : m.content ? (
+                      <div style={styles.resultMd}>
+                        {renderMarkdown(m.content, "var(--accent)")}
+                      </div>
+                    ) : (
+                      "Thinking…"
+                    )}
+                  </div>
+                ))}
+                <div style={styles.qaInputRow}>
+                  <input
+                    style={styles.formInput}
+                    value={question}
+                    onChange={(e) => setQuestion(e.target.value)}
+                    onKeyDown={(e) => {
+                      if (e.key === "Enter") ask();
+                    }}
+                    placeholder="e.g. Can you explain the second point more simply?"
+                  />
+                  <button
+                    style={styles.primaryBtn}
+                    onClick={ask}
+                    disabled={asking || !question.trim()}
+                  >
+                    {asking ? "…" : "Ask"}
+                  </button>
+                </div>
+              </div>
+            )}
           </div>
         )}
     </div>
   );
 }
 
+// A small "Share" button that hands a deck/note to the native share sheet (or
+// copies a link) so it can be sent to a friend. Shows brief confirmation text.
+function ShareButton({
+  payload,
+  label = "Share",
+  style,
+}: {
+  payload: SharePayload;
+  label?: string;
+  style?: React.CSSProperties;
+}) {
+  const [status, setStatus] = useState<"idle" | "shared" | "copied" | "error">(
+    "idle",
+  );
+  return (
+    <button
+      style={{ ...styles.secondaryBtn, ...style }}
+      title="Share with a friend"
+      onClick={async () => {
+        const r = await shareContent(payload);
+        setStatus(r);
+        window.setTimeout(() => setStatus("idle"), 2000);
+      }}
+    >
+      {status === "copied"
+        ? "Link copied ✓"
+        : status === "shared"
+          ? "Shared ✓"
+          : status === "error"
+            ? "Couldn’t share"
+            : `🔗 ${label}`}
+    </button>
+  );
+}
+
 function FlashcardDeck({
   cards,
   onMissed,
+  onMistake,
+  title,
 }: {
   cards: Flashcard[];
   onMissed: (topic: string) => void;
+  onMistake?: (card: Flashcard) => void;
+  title?: string;
 }) {
   const [i, setI] = useState(0);
   const [flipped, setFlipped] = useState(false);
@@ -5637,7 +9234,10 @@ function FlashcardDeck({
         </button>
         <button
           style={styles.linkBtn}
-          onClick={() => onMissed(card.front)}
+          onClick={() => {
+            onMissed(card.front);
+            onMistake?.(card);
+          }}
           title="Mark for revision"
         >
           Still learning
@@ -5650,6 +9250,12 @@ function FlashcardDeck({
           Next →
         </button>
       </div>
+      <div style={styles.flashShareRow}>
+        <ShareButton
+          payload={{ v: 1, kind: "flashcards", title, cards }}
+          label="Share deck with a friend"
+        />
+      </div>
     </div>
   );
 }
@@ -5657,10 +9263,12 @@ function FlashcardDeck({
 function QuizView({
   quiz,
   onMissed,
+  onMistake,
   onStudyGuide,
 }: {
   quiz: QuizQuestion[];
   onMissed: (topic: string) => void;
+  onMistake?: (m: { concept: string; why?: string; fix?: string }) => void;
   onStudyGuide?: (detail: string) => void;
 }) {
   const [answers, setAnswers] = useState<(number | null)[]>(
@@ -5680,7 +9288,20 @@ function QuizView({
   function check() {
     setChecked(true);
     quiz.forEach((q, i) => {
-      if (answers[i] !== q.answerIndex) onMissed(q.topic || q.question);
+      if (answers[i] !== q.answerIndex) {
+        onMissed(q.topic || q.question);
+        const picked = answers[i];
+        onMistake?.({
+          concept: q.topic || q.question,
+          why:
+            picked != null && q.options[picked]
+              ? `picked "${q.options[picked]}"`
+              : undefined,
+          fix: `Correct answer: "${q.options[q.answerIndex]}"${
+            q.explanation ? ` — ${q.explanation}` : ""
+          }`,
+        });
+      }
     });
   }
 
@@ -5874,10 +9495,12 @@ function AssignmentFeedback({
   subjects,
   profile,
   initialPrompt,
+  onTrack,
 }: {
   subjects: string[];
   profile: LearnerProfile | null;
   initialPrompt?: string;
+  onTrack?: (m: { concept: string; fix?: string; subject?: string }) => void;
 }) {
   const [work, setWork] = useState("");
   const [prompt, setPrompt] = useState("");
@@ -6056,9 +9679,26 @@ function AssignmentFeedback({
             <>
               <div style={styles.afbSecHead}>🔧 To improve</div>
               {fb.improve.map((it, i) => (
-                <div key={i} style={styles.afbLi}>
-                  • <b>{it.point}</b>
-                  {it.how ? ` — ${it.how}` : ""}
+                <div key={i} style={styles.afbImproveRow}>
+                  <div style={styles.afbLi}>
+                    • <b>{it.point}</b>
+                    {it.how ? ` — ${it.how}` : ""}
+                  </div>
+                  {onTrack && (
+                    <button
+                      style={styles.afbTrackBtn}
+                      title="Add to your mistake tracker"
+                      onClick={() =>
+                        onTrack({
+                          concept: it.point,
+                          fix: it.how,
+                          subject: subject.trim() || undefined,
+                        })
+                      }
+                    >
+                      ＋ Track
+                    </button>
+                  )}
                 </div>
               ))}
             </>
@@ -6499,11 +10139,524 @@ export default function Home() {
   return <ElioraApp />;
 }
 
+// ---- Landing-page feature demos (shown to signed-out visitors) ----
+// Small self-contained mock previews of each feature so new users can see
+// what Eliora does before creating an account. No real data or API calls.
+
+const demoStyles: Record<string, React.CSSProperties> = {
+  page: {
+    minHeight: "100vh",
+    display: "flex",
+    flexDirection: "column",
+    alignItems: "center",
+    gap: 48,
+    padding: "48px 24px 72px",
+  },
+  hero: {
+    display: "flex",
+    flexWrap: "wrap",
+    alignItems: "center",
+    justifyContent: "center",
+    gap: 40,
+    maxWidth: 960,
+    width: "100%",
+  },
+  heroCopy: {
+    flex: "1 1 340px",
+    minWidth: 300,
+    maxWidth: 480,
+    display: "flex",
+    flexDirection: "column",
+    gap: 14,
+  },
+  heroTitle: { margin: 0, fontSize: 40, lineHeight: 1.1 },
+  heroTagline: {
+    margin: 0,
+    fontSize: 17,
+    lineHeight: 1.55,
+    color: "var(--muted)",
+  },
+  heroChips: { display: "flex", flexWrap: "wrap", gap: 8, marginTop: 4 },
+  heroChip: {
+    fontSize: 13,
+    fontWeight: 600,
+    padding: "6px 12px",
+    borderRadius: 999,
+    background: "var(--accent-soft)",
+    color: "var(--accent)",
+  },
+  heroScrollHint: {
+    marginTop: 6,
+    fontSize: 14,
+    fontWeight: 600,
+    color: "var(--accent)",
+    textDecoration: "none",
+  },
+  demosSection: {
+    width: "100%",
+    maxWidth: 1100,
+    display: "flex",
+    flexDirection: "column",
+    gap: 20,
+  },
+  demosHeading: { margin: 0, fontSize: 26, textAlign: "center" },
+  demosSub: {
+    margin: 0,
+    textAlign: "center",
+    color: "var(--muted)",
+    fontSize: 15,
+  },
+  grid: {
+    display: "grid",
+    gridTemplateColumns: "repeat(auto-fit, minmax(280px, 1fr))",
+    gap: 18,
+    marginTop: 8,
+  },
+  card: {
+    display: "flex",
+    flexDirection: "column",
+    gap: 12,
+    padding: 18,
+    borderRadius: 16,
+    border: "1px solid var(--border)",
+    background: "var(--surface)",
+  },
+  cardHead: { display: "flex", alignItems: "flex-start", gap: 10 },
+  cardEmoji: { fontSize: 22, lineHeight: 1.2 },
+  cardTitle: { margin: 0, fontSize: 16, fontWeight: 700 },
+  cardCaption: {
+    margin: "2px 0 0",
+    fontSize: 13,
+    lineHeight: 1.45,
+    color: "var(--muted)",
+  },
+  cardBody: {
+    display: "flex",
+    flexDirection: "column",
+    gap: 8,
+    padding: 12,
+    borderRadius: 12,
+    border: "1px solid var(--border)",
+    background: "var(--bg)",
+    fontSize: 13.5,
+  },
+  bubbleUser: {
+    alignSelf: "flex-end",
+    maxWidth: "85%",
+    padding: "8px 12px",
+    borderRadius: "14px 14px 4px 14px",
+    background: "var(--accent)",
+    color: "#fff",
+    lineHeight: 1.45,
+  },
+  bubbleBot: {
+    alignSelf: "flex-start",
+    maxWidth: "90%",
+    padding: "8px 12px",
+    borderRadius: "14px 14px 14px 4px",
+    background: "var(--accent-soft)",
+    color: "var(--text)",
+    lineHeight: 1.45,
+  },
+  taskRow: {
+    display: "flex",
+    alignItems: "center",
+    gap: 8,
+    cursor: "pointer",
+    userSelect: "none",
+  },
+  barTrack: {
+    height: 8,
+    borderRadius: 999,
+    background: "var(--accent-soft)",
+    overflow: "hidden",
+  },
+  barFill: {
+    height: "100%",
+    borderRadius: 999,
+    background: "var(--accent)",
+  },
+  chipRow: { display: "flex", flexWrap: "wrap", gap: 6 },
+  miniChip: {
+    fontSize: 12,
+    fontWeight: 600,
+    padding: "4px 10px",
+    borderRadius: 999,
+    border: "1px solid var(--border)",
+    background: "var(--surface)",
+  },
+  tryHint: {
+    fontSize: 11.5,
+    color: "var(--muted)",
+    fontStyle: "italic",
+  },
+};
+
+function DemoCard({
+  emoji,
+  title,
+  caption,
+  children,
+}: {
+  emoji: string;
+  title: string;
+  caption: string;
+  children: React.ReactNode;
+}) {
+  return (
+    <div style={demoStyles.card}>
+      <div style={demoStyles.cardHead}>
+        <span style={demoStyles.cardEmoji} aria-hidden>
+          {emoji}
+        </span>
+        <div>
+          <h3 style={demoStyles.cardTitle}>{title}</h3>
+          <p style={demoStyles.cardCaption}>{caption}</p>
+        </div>
+      </div>
+      <div style={demoStyles.cardBody}>{children}</div>
+    </div>
+  );
+}
+
+function DemoChat() {
+  return (
+    <>
+      <span style={demoStyles.bubbleUser}>
+        I have a bio test Friday and I haven&apos;t started 😬
+      </span>
+      <span style={demoStyles.bubbleBot}>
+        No panic — that&apos;s 3 days. Let&apos;s do three 25-minute sessions:
+        cells today, genetics tomorrow, practice quiz Thursday. Want me to add
+        them to your plan?
+      </span>
+      <span style={demoStyles.bubbleUser}>Yes please!</span>
+    </>
+  );
+}
+
+function DemoDailyTasks() {
+  const [done, setDone] = useState([true, false, false]);
+  const tasks = [
+    "Review algebra notes (15 min)",
+    "Quiz yourself: cell organelles",
+    "Plan tomorrow in 2 minutes",
+  ];
+  const count = done.filter(Boolean).length;
+  return (
+    <>
+      {tasks.map((t, i) => (
+        <span
+          key={t}
+          style={demoStyles.taskRow}
+          onClick={() =>
+            setDone((d) => d.map((v, j) => (j === i ? !v : v)))
+          }
+        >
+          <span aria-hidden>{done[i] ? "✅" : "⬜"}</span>
+          <span
+            style={{
+              textDecoration: done[i] ? "line-through" : "none",
+              color: done[i] ? "var(--muted)" : "var(--text)",
+            }}
+          >
+            {t}
+          </span>
+        </span>
+      ))}
+      <div style={demoStyles.barTrack}>
+        <div
+          style={{ ...demoStyles.barFill, width: `${(count / 3) * 100}%` }}
+        />
+      </div>
+      <span style={demoStyles.tryHint}>Try it — tap a task to check it off</span>
+    </>
+  );
+}
+
+function DemoRewards() {
+  return (
+    <>
+      <span style={{ fontSize: 15, fontWeight: 700 }}>🔥 5-day streak</span>
+      <div style={demoStyles.chipRow}>
+        <span style={demoStyles.miniChip}>🥇 First Plan</span>
+        <span style={demoStyles.miniChip}>📚 Bookworm</span>
+        <span style={demoStyles.miniChip}>🌟 Week Streak</span>
+      </div>
+      <div style={demoStyles.barTrack}>
+        <div style={{ ...demoStyles.barFill, width: "70%" }} />
+      </div>
+      <span style={{ color: "var(--muted)", fontSize: 12.5 }}>
+        140 / 200 points to your next reward
+      </span>
+    </>
+  );
+}
+
+function DemoSchedule() {
+  const blocks: { time: string; label: string; bg: string }[] = [
+    { time: "4:00", label: "📖 Study — Bio ch. 4", bg: "var(--accent-soft)" },
+    { time: "4:30", label: "☕ Break", bg: "var(--bg)" },
+    { time: "5:00", label: "✍️ Essay outline", bg: "var(--accent-soft)" },
+  ];
+  return (
+    <>
+      {blocks.map((b) => (
+        <div
+          key={b.time}
+          style={{
+            display: "flex",
+            gap: 10,
+            alignItems: "center",
+            padding: "6px 10px",
+            borderRadius: 8,
+            border: "1px solid var(--border)",
+            background: b.bg,
+          }}
+        >
+          <span style={{ fontWeight: 700, fontSize: 12, minWidth: 34 }}>
+            {b.time}
+          </span>
+          <span>{b.label}</span>
+        </div>
+      ))}
+    </>
+  );
+}
+
+function DemoGoals() {
+  return (
+    <>
+      <span style={{ fontWeight: 700 }}>🎯 Raise chem grade to an A−</span>
+      <span style={{ color: "var(--muted)", fontSize: 12.5 }}>
+        Short-term · 2 of 4 steps done
+      </span>
+      <div style={demoStyles.barTrack}>
+        <div style={{ ...demoStyles.barFill, width: "50%" }} />
+      </div>
+      <div style={demoStyles.chipRow}>
+        <span style={demoStyles.miniChip}>✅ Redo missed problems</span>
+        <span style={demoStyles.miniChip}>⬜ Office hours Tues</span>
+      </div>
+    </>
+  );
+}
+
+function DemoCalendar() {
+  const events = [
+    { label: "🧪 Bio quiz", when: "in 2 days" },
+    { label: "📄 Essay draft", when: "in 5 days" },
+    { label: "📅 Math final", when: "in 3 weeks" },
+  ];
+  return (
+    <>
+      {events.map((e) => (
+        <div
+          key={e.label}
+          style={{
+            display: "flex",
+            justifyContent: "space-between",
+            alignItems: "center",
+            padding: "6px 10px",
+            borderRadius: 8,
+            border: "1px solid var(--border)",
+            background: "var(--surface)",
+          }}
+        >
+          <span>{e.label}</span>
+          <span style={{ color: "var(--accent)", fontWeight: 700, fontSize: 12 }}>
+            {e.when}
+          </span>
+        </div>
+      ))}
+    </>
+  );
+}
+
+function DemoFlashcards() {
+  const [flipped, setFlipped] = useState(false);
+  return (
+    <>
+      <div
+        onClick={() => setFlipped((f) => !f)}
+        style={{
+          cursor: "pointer",
+          userSelect: "none",
+          padding: "18px 14px",
+          borderRadius: 10,
+          border: "1px solid var(--border)",
+          background: flipped ? "var(--accent-soft)" : "var(--surface)",
+          textAlign: "center",
+          fontWeight: 600,
+          minHeight: 44,
+          display: "flex",
+          alignItems: "center",
+          justifyContent: "center",
+        }}
+      >
+        {flipped
+          ? "The mitochondria — it converts glucose into ATP."
+          : "What is the powerhouse of the cell?"}
+      </div>
+      <div style={demoStyles.chipRow}>
+        <span style={demoStyles.miniChip}>📇 12 flashcards</span>
+        <span style={demoStyles.miniChip}>❓ 5-question quiz</span>
+      </div>
+      <span style={demoStyles.tryHint}>Try it — tap the card to flip</span>
+    </>
+  );
+}
+
+function DemoFourYear() {
+  return (
+    <>
+      <div style={demoStyles.chipRow}>
+        {["Gr 9", "Gr 10", "Gr 11", "Gr 12"].map((g, i) => (
+          <span
+            key={g}
+            style={{
+              ...demoStyles.miniChip,
+              background: i < 2 ? "var(--accent-soft)" : "var(--surface)",
+            }}
+          >
+            {g}
+          </span>
+        ))}
+      </div>
+      <span>🎓 Destination: UC Berkeley — Biology</span>
+      <span style={{ color: "var(--muted)", fontSize: 12.5 }}>
+        Projected GPA <b style={{ color: "var(--accent)" }}>3.8</b> · 18 / 24
+        credits planned
+      </span>
+    </>
+  );
+}
+
+function DemoVideos() {
+  return (
+    <>
+      <div
+        style={{
+          display: "flex",
+          gap: 10,
+          alignItems: "center",
+          padding: 8,
+          borderRadius: 10,
+          border: "1px solid var(--border)",
+          background: "var(--surface)",
+        }}
+      >
+        <span
+          aria-hidden
+          style={{
+            width: 64,
+            height: 40,
+            borderRadius: 6,
+            background: "var(--accent-soft)",
+            display: "flex",
+            alignItems: "center",
+            justifyContent: "center",
+            fontSize: 18,
+          }}
+        >
+          ▶️
+        </span>
+        <div style={{ display: "flex", flexDirection: "column" }}>
+          <span style={{ fontWeight: 600 }}>Photosynthesis in 8 minutes</span>
+          <span style={{ color: "var(--muted)", fontSize: 12 }}>
+            Picked for your biology plan
+          </span>
+        </div>
+      </div>
+      <span style={{ color: "var(--muted)", fontSize: 12.5 }}>
+        A study-feed of videos matched to what you&apos;re learning this week.
+      </span>
+    </>
+  );
+}
+
+function LandingDemos() {
+  return (
+    <section id="demos" style={demoStyles.demosSection}>
+      <h2 style={demoStyles.demosHeading}>See what Eliora can do</h2>
+      <p style={demoStyles.demosSub}>
+        A quick peek at each feature — everything below is a live little demo.
+      </p>
+      <div style={demoStyles.grid}>
+        <DemoCard
+          emoji="💬"
+          title="AI study coach"
+          caption="Chat through what's stressing you and get a concrete plan back."
+        >
+          <DemoChat />
+        </DemoCard>
+        <DemoCard
+          emoji="✅"
+          title="Daily tasks"
+          caption="Three small wins a day, tuned to your plan and energy."
+        >
+          <DemoDailyTasks />
+        </DemoCard>
+        <DemoCard
+          emoji="🏆"
+          title="Rewards, badges & streaks"
+          caption="Points for showing up — spend them, earn badges, keep the flame."
+        >
+          <DemoRewards />
+        </DemoCard>
+        <DemoCard
+          emoji="🗓️"
+          title="Weekly schedule"
+          caption="Study blocks, breaks, and classes laid out hour by hour."
+        >
+          <DemoSchedule />
+        </DemoCard>
+        <DemoCard
+          emoji="🎯"
+          title="SMART goals"
+          caption="Big goals broken into steps you can actually check off."
+        >
+          <DemoGoals />
+        </DemoCard>
+        <DemoCard
+          emoji="⏳"
+          title="Exam countdowns"
+          caption="A calendar that keeps deadlines visible before they sneak up."
+        >
+          <DemoCalendar />
+        </DemoCard>
+        <DemoCard
+          emoji="📇"
+          title="Summaries, flashcards & quizzes"
+          caption="Paste notes or a YouTube link — get a summary you can study from."
+        >
+          <DemoFlashcards />
+        </DemoCard>
+        <DemoCard
+          emoji="🎓"
+          title="Four-year plan"
+          caption="Map courses to your dream school with a live GPA projection."
+        >
+          <DemoFourYear />
+        </DemoCard>
+        <DemoCard
+          emoji="📺"
+          title="Video study feed"
+          caption="Curated videos matched to the topics in your plan."
+        >
+          <DemoVideos />
+        </DemoCard>
+      </div>
+    </section>
+  );
+}
+
 function Login() {
   const [mode, setMode] = useState<"login" | "signup">("login");
   const [name, setName] = useState("");
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
+  const [confirm, setConfirm] = useState("");
   const [error, setError] = useState("");
   const [busy, setBusy] = useState(false);
 
@@ -6511,6 +10664,14 @@ function Login() {
     setError("");
     if (!email.trim() || !password) {
       setError("Enter your email and password.");
+      return;
+    }
+    if (mode === "signup" && password.length < 6) {
+      setError("Password must be at least 6 characters.");
+      return;
+    }
+    if (mode === "signup" && password !== confirm) {
+      setError("Passwords don't match — please retype them.");
       return;
     }
     setBusy(true);
@@ -6550,15 +10711,35 @@ function Login() {
   }
 
   return (
-    <main style={styles.loginPage}>
-      <div style={styles.loginCard}>
-        <h1 style={styles.title}>Eliora 🌱</h1>
-        <p style={styles.loginIntro}>
-          Your focus &amp; study coach.{" "}
-          {mode === "login"
-            ? "Log in to pick up where you left off."
-            : "Create an account to save your plan, chats, and progress."}
-        </p>
+    <main style={demoStyles.page}>
+      <section style={demoStyles.hero}>
+        <div style={demoStyles.heroCopy}>
+          <h1 style={demoStyles.heroTitle}>Eliora 🌱</h1>
+          <p style={demoStyles.heroTagline}>
+            Your focus &amp; study coach. Chat with an AI coach, build a plan
+            that fits your life, and turn big goals into small daily wins —
+            with streaks, badges, and rewards to keep you going.
+          </p>
+          <div style={demoStyles.heroChips}>
+            <span style={demoStyles.heroChip}>💬 AI coach</span>
+            <span style={demoStyles.heroChip}>✅ Daily tasks</span>
+            <span style={demoStyles.heroChip}>🔥 Streaks</span>
+            <span style={demoStyles.heroChip}>📇 Flashcards</span>
+            <span style={demoStyles.heroChip}>🎓 4-year plan</span>
+          </div>
+          <a href="#demos" style={demoStyles.heroScrollHint}>
+            See every feature in action ↓
+          </a>
+        </div>
+        <div style={styles.loginCard}>
+          <h2 style={{ margin: 0, fontSize: 22 }}>
+            {mode === "login" ? "Welcome back" : "Get started"}
+          </h2>
+          <p style={styles.loginIntro}>
+            {mode === "login"
+              ? "Log in to pick up where you left off."
+              : "Create an account to save your plan, chats, and progress."}
+          </p>
 
         {mode === "signup" && (
           <input
@@ -6590,6 +10771,19 @@ function Login() {
             if (e.key === "Enter") submit();
           }}
         />
+        {mode === "signup" && (
+          <input
+            style={styles.loginInput}
+            type="password"
+            placeholder="Confirm password"
+            value={confirm}
+            autoComplete="new-password"
+            onChange={(e) => setConfirm(e.target.value)}
+            onKeyDown={(e) => {
+              if (e.key === "Enter") submit();
+            }}
+          />
+        )}
 
         {error && <p style={styles.loginError}>{error}</p>}
 
@@ -6603,6 +10797,7 @@ function Login() {
             style={styles.loginToggleLink}
             onClick={() => {
               setMode(mode === "login" ? "signup" : "login");
+              setConfirm("");
               setError("");
             }}
           >
@@ -6623,7 +10818,10 @@ function Login() {
           </span>
           Continue with Google
         </button>
-      </div>
+        </div>
+      </section>
+
+      <LandingDemos />
     </main>
   );
 }
@@ -6641,19 +10839,27 @@ function ElioraApp() {
   const PLAN_KEY = `eliora-plan::${ns}`;
   const EVENTS_KEY = `eliora-events::${ns}`;
   const MISSED_KEY = `eliora-missed::${ns}`;
+  const MISTAKES_KEY = `eliora-mistakes::${ns}`;
   const SUBJECTS_KEY = `eliora-subjects::${ns}`;
   const ASSIGNMENTS_KEY = `eliora-assignments::${ns}`;
   const GOALS_KEY = `eliora-goals::${ns}`;
   const FOUR_YEAR_KEY = `eliora-four-year-plan::${ns}`;
   const REFLECTIONS_KEY = `eliora-reflections::${ns}`;
   const REFLECTION_SUMMARY_KEY = `eliora-reflection-summary::${ns}`;
+  const MONTHLY_REPORTS_KEY = `eliora-monthly-reports::${ns}`; // AI monthly recaps, keyed YYYY-MM
+  const WEEKLY_REPORTS_KEY = `eliora-weekly-reports::${ns}`; // AI weekly recaps, keyed by Monday's YYYY-MM-DD
   const TIME_MGMT_KEY = `eliora-timemgmt::${ns}`;
   const PROGRESS_KEY = `eliora-progress::${ns}`;
+  const STUDY_KEY = `eliora-study-minutes::${ns}`; // minutes studied per day
   const ROOM_KEY = `eliora-room::${ns}`;
+  const CUSTOM_REWARDS_KEY = `eliora-custom-rewards::${ns}`; // learner's own rewards
+  const SPENT_KEY = `eliora-spent-xp::${ns}`; // XP spent redeeming custom rewards
   const A11Y_KEY = `eliora-a11y::${ns}`;
   const CHAT_FOLDERS_KEY = `eliora-chat-folders::${ns}`;
   const DAILY_KEY = `eliora-daily::${ns}`; // today's auto-generated tasks
   const BADGES_KEY = `eliora-badges::${ns}`; // badge ids already rewarded
+  const SCHEDULE_KEY = `eliora-schedule::${ns}`; // today's 9am–9pm schedule
+  const HOMETIME_KEY = `eliora-hometime::${ns}`; // hour the learner gets home
   const [chats, setChats] = useState<Chat[]>([]);
   const [folders, setFolders] = useState<ChatFolder[]>([]);
   const [folderMenuFor, setFolderMenuFor] = useState<string | null>(null);
@@ -6699,6 +10905,7 @@ function ElioraApp() {
   const [plan, setPlan] = useState<Milestone[]>([]);
   const [events, setEvents] = useState<StudyEvent[]>([]);
   const [missed, setMissed] = useState<string[]>([]);
+  const [mistakes, setMistakes] = useState<Mistake[]>([]);
   const [subjects, setSubjects] = useState<string[]>([]);
   const [assignments, setAssignments] = useState<Assignment[]>([]);
   const [goals, setGoals] = useState<SmartGoal[]>([]);
@@ -6710,16 +10917,33 @@ function ElioraApp() {
   const [feedbackSeed, setFeedbackSeed] = useState("");
   // Duolingo-style progress: XP earned per day (drives streak + total XP).
   const [progress, setProgress] = useState<Record<string, number>>({});
+  // Real time on task: minutes studied per day (YYYY-MM-DD → minutes), logged
+  // when a focus timer runs down. Drives the "hours studied each week" chart.
+  const [studyLog, setStudyLog] = useState<Record<string, number>>({});
+  const logStudyMinutes = (mins: number) => {
+    if (!(mins > 0)) return;
+    const t = localISO();
+    setStudyLog((s) => ({ ...s, [t]: (s[t] || 0) + mins }));
+  };
   const [xpToast, setXpToast] = useState<string | null>(null);
   const [equippedRoom, setEquippedRoom] = useState("meadow"); // reward background
+  // Learner-created rewards + how much XP they've spent redeeming them.
+  const [customRewards, setCustomRewards] = useState<CustomReward[]>([]);
+  const [spentXp, setSpentXp] = useState(0);
   // Today's tasks: a fresh short list regenerated once per day (keyed on date).
   const [dailyTasks, setDailyTasks] = useState<DailyTasksState | null>(null);
   const [dailyLoading, setDailyLoading] = useState(false);
+  // Today's 9am–9pm time-block schedule (resets each new day, like daily tasks).
+  const [schedule, setSchedule] = useState<DaySchedule | null>(null);
+  const [homeHour, setHomeHour] = useState(16); // when they get home (24h)
+  const [generatingSchedule, setGeneratingSchedule] = useState(false);
   // Badge ids the learner has already been rewarded for (so we grant the bonus
   // XP only once, and never retroactively for badges earned before this shipped).
   const [claimedBadges, setClaimedBadges] = useState<string[]>([]);
   const [badgeCelebration, setBadgeCelebration] = useState<BadgeDef | null>(null);
   const totalXp = Object.values(progress).reduce((a, b) => a + b, 0);
+  // XP still available to spend on custom rewards (earned minus already spent).
+  const availableXp = Math.max(0, totalXp - spentXp);
   // Award XP; +20% consistency bonus if the learner was also active yesterday.
   const award = (baseXp: number, label = "") => {
     const y = new Date();
@@ -6738,6 +10962,30 @@ function ElioraApp() {
     const id = setTimeout(() => setXpToast(null), 2600);
     return () => clearTimeout(id);
   }, [xpToast]);
+  // Learner-created rewards: add, redeem (spend available XP), and remove.
+  const addCustomReward = (emoji: string, title: string, cost: number) => {
+    setCustomRewards((prev) => [
+      ...prev,
+      {
+        id: `r${Date.now().toString(36)}${Math.random().toString(36).slice(2, 8)}`,
+        emoji,
+        title,
+        cost,
+        redeemed: 0,
+      },
+    ]);
+  };
+  const redeemCustomReward = (id: string) => {
+    const r = customRewards.find((x) => x.id === id);
+    if (!r || totalXp - spentXp < r.cost) return; // can't afford it
+    setSpentXp((s) => s + r.cost);
+    setCustomRewards((prev) =>
+      prev.map((x) => (x.id === id ? { ...x, redeemed: x.redeemed + 1 } : x)),
+    );
+    setXpToast(`🎉 Redeemed ${r.emoji} ${r.title} · −${r.cost} XP`);
+  };
+  const removeCustomReward = (id: string) =>
+    setCustomRewards((prev) => prev.filter((x) => x.id !== id));
   const [fourYearPlan, setFourYearPlan] = useState<FourYearPlan | null>(null);
   const [generatingFyp, setGeneratingFyp] = useState(false);
   // End-of-semester reflections, keyed by year label.
@@ -6749,6 +10997,18 @@ function ElioraApp() {
     message: string;
     focus: string[];
   } | null>(null);
+  // AI monthly progress recaps, keyed by "YYYY-MM". Generated on demand and kept
+  // so a month's recap doesn't regenerate every time it's viewed.
+  const [monthlyReports, setMonthlyReports] = useState<
+    Record<string, { message: string; focus: string[]; generatedAt: string }>
+  >({});
+  const [monthlyReportBusy, setMonthlyReportBusy] = useState<string | null>(null);
+  // AI weekly "what you learned" recaps, keyed by the Monday's "YYYY-MM-DD".
+  // Generated on demand and kept so a week's recap doesn't regenerate on view.
+  const [weeklyReports, setWeeklyReports] = useState<
+    Record<string, { message: string; focus: string[]; generatedAt: string }>
+  >({});
+  const [weeklyReportBusy, setWeeklyReportBusy] = useState<string | null>(null);
   const [summarizingReflections, setSummarizingReflections] = useState(false);
   const [creatingReflGoals, setCreatingReflGoals] = useState(false);
   const [editing, setEditing] = useState(false);
@@ -6758,12 +11018,19 @@ function ElioraApp() {
     | "summarize"
     | "calendar"
     | "plan"
+    | "progress"
     | "study"
   >("home");
   // Sub-sections within the Plan tab, so it's not one overwhelming scroll.
   // "overview" is the main landing page that summarizes everything.
   const [planSection, setPlanSection] = useState<
-    "overview" | "progress" | "week" | "goals" | "tasks" | "steps" | "fyp"
+    | "overview"
+    | "monthly"
+    | "week"
+    | "goals"
+    | "tasks"
+    | "steps"
+    | "fyp"
   >("overview");
   const [sidebarOpen, setSidebarOpen] = useState(false);
   const [viewportW, setViewportW] = useState(1024);
@@ -6775,9 +11042,18 @@ function ElioraApp() {
   }, []);
   const [a11y, setA11y] = useState<A11y>(DEFAULT_A11Y);
   const [showA11y, setShowA11y] = useState(false);
+  const [showNotifs, setShowNotifs] = useState(false);
+  // Top-right notification bell has its own open state so it doesn't fight the
+  // sidebar-footer bell (both drive the same reminder list, different anchors).
+  const [showTopNotifs, setShowTopNotifs] = useState(false);
   const [input, setInput] = useState("");
   const [busy, setBusy] = useState(false);
+  // What Eliora is doing right now (streamed "status" events while tools run),
+  // shown in the pending assistant bubble instead of a bare "…".
+  const [chatStatus, setChatStatus] = useState<string | null>(null);
   const [loaded, setLoaded] = useState(false);
+  // A deck/note a friend shared via ?share=… — offered for import once loaded.
+  const [incomingShare, setIncomingShare] = useState<SharePayload | null>(null);
   const [autoBuild, setAutoBuild] = useState(false);
   // A kickoff message queued for a freshly-created topic chat, sent once that
   // chat is the active one (see the effect below) so it lands in the new chat.
@@ -6794,6 +11070,8 @@ function ElioraApp() {
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   const recognitionRef = useRef<any>(null);
   const scrollRef = useRef<HTMLDivElement>(null);
+  // Lets the Stop button cancel an in-flight chat reply.
+  const chatAbortRef = useRef<AbortController | null>(null);
 
   // Detect Web Speech API support (client-only, avoids hydration mismatch).
   useEffect(() => {
@@ -6838,7 +11116,7 @@ function ElioraApp() {
     id: string;
     icon: string;
     text: string;
-    kind: "plan" | "calendar" | "chat";
+    kind: "plan" | "calendar" | "chat" | "home" | "progress";
     chatMsg?: string;
   };
   const reminders: Reminder[] = [];
@@ -6854,6 +11132,15 @@ function ElioraApp() {
         }`,
         kind: "plan",
       });
+    // A day-ahead heads-up. Separate id from `asg-` so checking it off just
+    // dismisses the warning instead of marking the assignment done.
+    else if (n === 1)
+      reminders.push({
+        id: `asgsoon-${a.id}`,
+        icon: "⏰",
+        text: `${a.title}${a.subject ? ` · ${a.subject}` : ""} — due tomorrow`,
+        kind: "plan",
+      });
   }
   for (const e of events) {
     const n = daysUntil(e.date);
@@ -6866,7 +11153,7 @@ function ElioraApp() {
         }`,
         kind: "calendar",
       });
-    else if (n < 0 && n >= -4)
+    else if (n < 0 && n >= -3)
       reminders.push({
         id: `fu-${e.id}`,
         icon: "🔁",
@@ -6874,13 +11161,28 @@ function ElioraApp() {
         kind: "chat",
         chatMsg: `My ${e.kind ?? "exam"} "${e.title}" just happened. Help me reflect on how it went and plan what to do next.`,
       });
-    else if (n <= -5 && n >= -10)
+    else if (n <= -4 && n >= -6)
       reminders.push({
         id: `fix-${e.id}`,
         icon: "🔁",
         text: `Correct mistakes from ${e.title}`,
         kind: "chat",
         chatMsg: `It's about a week since my ${e.kind ?? "test"} "${e.title}". Let's go over the questions I got wrong and fix those mistakes — re-teach me and quiz me on just those.`,
+      });
+    // A week after every exam and test, follow up on the results — by now the
+    // grade is usually back, so nudge a review of how it went and what to focus
+    // on next. Only for exams/tests (not plain assignments or misc events).
+    else if (
+      n <= -7 &&
+      n >= -11 &&
+      (!e.kind || e.kind === "exam" || e.kind === "final" || e.kind === "quiz")
+    )
+      reminders.push({
+        id: `res-${e.id}`,
+        icon: "📊",
+        text: `Results back for ${e.title}? Let's review them`,
+        kind: "chat",
+        chatMsg: `It's been about a week since my ${e.kind ?? "exam"} "${e.title}", so the results should be back. Help me review how I did — talk through my grade, what went well, and the topics to focus on next.`,
       });
   }
   // Goal target dates: the day a goal is meant to finish by (and shortly after),
@@ -6896,6 +11198,35 @@ function ElioraApp() {
         kind: "chat",
         chatMsg: `Today is around the target date for my goal "${g.statement?.trim() || g.specific}". Check in with me: ask if I reached it, celebrate if I did, or help me adjust the goal or pick a new date if I didn't.`,
       });
+  }
+  // Today's daily tasks: nudge until they're all checked off. The id is
+  // date-scoped so a dismissal only silences it for the day.
+  if (dailyTasks?.date === localISO()) {
+    const left = dailyTasks.tasks.filter((t) => !t.done).length;
+    if (left > 0)
+      reminders.push({
+        id: `daily-${dailyTasks.date}`,
+        icon: "📋",
+        text: `${left} daily task${left === 1 ? "" : "s"} left today`,
+        kind: "home", // the 🌞 Today's tasks card lives on the Home tab
+      });
+  }
+  // Streak at risk: they earned XP yesterday but nothing yet today.
+  {
+    const yd = new Date();
+    yd.setDate(yd.getDate() - 1);
+    if (
+      (progress[localISO(yd)] || 0) > 0 &&
+      (progress[localISO()] || 0) === 0
+    ) {
+      const streak = computeStreak(progress);
+      reminders.push({
+        id: `streak-${localISO()}`,
+        icon: "🔥",
+        text: `Keep your ${streak}-day streak alive — earn some XP today`,
+        kind: "progress",
+      });
+    }
   }
   const shownReminders = reminders.filter((r) => !dismissed.includes(r.id));
   const reminderSig = shownReminders.map((r) => r.id).join("|");
@@ -6973,10 +11304,14 @@ function ElioraApp() {
 
   function handleReminder(r: Reminder) {
     if (r.kind === "calendar") setTab("calendar");
+    else if (r.kind === "home") setTab("home");
+    else if (r.kind === "progress") setTab("progress");
     else if (r.kind === "chat") {
       setTab("chat");
       if (r.chatMsg) send(r.chatMsg);
-    } else setTab("plan");
+    } else {
+      setTab("plan");
+    }
   }
 
   // Restore saved profile + plan + conversation.
@@ -6997,6 +11332,12 @@ function ElioraApp() {
       const rawMissed = localStorage.getItem(MISSED_KEY);
       const savedMissed = rawMissed ? (JSON.parse(rawMissed) as string[]) : null;
       if (Array.isArray(savedMissed)) setMissed(savedMissed);
+
+      const rawMistakes = localStorage.getItem(MISTAKES_KEY);
+      const savedMistakes = rawMistakes
+        ? (JSON.parse(rawMistakes) as Mistake[])
+        : null;
+      if (Array.isArray(savedMistakes)) setMistakes(savedMistakes);
 
       const rawSubjects = localStorage.getItem(SUBJECTS_KEY);
       const savedSubjects = rawSubjects
@@ -7029,6 +11370,16 @@ function ElioraApp() {
       if (savedReflSum && savedReflSum.message)
         setReflectionSummary(savedReflSum);
 
+      const rawMonthly = localStorage.getItem(MONTHLY_REPORTS_KEY);
+      const savedMonthly = rawMonthly ? JSON.parse(rawMonthly) : null;
+      if (savedMonthly && typeof savedMonthly === "object")
+        setMonthlyReports(savedMonthly);
+
+      const rawWeekly = localStorage.getItem(WEEKLY_REPORTS_KEY);
+      const savedWeekly = rawWeekly ? JSON.parse(rawWeekly) : null;
+      if (savedWeekly && typeof savedWeekly === "object")
+        setWeeklyReports(savedWeekly);
+
       const rawDaily = localStorage.getItem(DAILY_KEY);
       const savedDaily = rawDaily ? JSON.parse(rawDaily) : null;
       if (
@@ -7038,11 +11389,30 @@ function ElioraApp() {
       )
         setDailyTasks(savedDaily as DailyTasksState);
 
+      const rawSched = localStorage.getItem(SCHEDULE_KEY);
+      const savedSched = rawSched ? JSON.parse(rawSched) : null;
+      if (
+        savedSched &&
+        typeof savedSched.date === "string" &&
+        savedSched.blocks &&
+        typeof savedSched.blocks === "object"
+      )
+        setSchedule(savedSched as DaySchedule);
+
+      const rawHome = localStorage.getItem(HOMETIME_KEY);
+      const savedHome = rawHome ? parseInt(rawHome, 10) : NaN;
+      if (Number.isInteger(savedHome) && savedHome >= 9 && savedHome <= 20)
+        setHomeHour(savedHome);
+
       if (localStorage.getItem(TIME_MGMT_KEY) === "1") setTimeMgmt(true);
 
       const rawProg = localStorage.getItem(PROGRESS_KEY);
       const savedProg = rawProg ? JSON.parse(rawProg) : null;
       if (savedProg && typeof savedProg === "object") setProgress(savedProg);
+
+      const rawStudy = localStorage.getItem(STUDY_KEY);
+      const savedStudy = rawStudy ? JSON.parse(rawStudy) : null;
+      if (savedStudy && typeof savedStudy === "object") setStudyLog(savedStudy);
 
       // Claimed badges: if we've stored them before, restore. Otherwise this is
       // the first run since badge rewards shipped — backfill every ALREADY-earned
@@ -7054,7 +11424,7 @@ function ElioraApp() {
       } else {
         const already =
           savedProg && typeof savedProg === "object"
-            ? earnedBadgeIds(savedProg)
+            ? earnedBadgeIds(savedProg, savedGoals ?? [])
             : [];
         setClaimedBadges(already);
         localStorage.setItem(BADGES_KEY, JSON.stringify(already));
@@ -7062,6 +11432,15 @@ function ElioraApp() {
 
       const savedRoom = localStorage.getItem(ROOM_KEY);
       if (savedRoom) setEquippedRoom(savedRoom);
+
+      const rawRewards = localStorage.getItem(CUSTOM_REWARDS_KEY);
+      if (rawRewards) {
+        const parsed = JSON.parse(rawRewards);
+        if (Array.isArray(parsed)) setCustomRewards(parsed as CustomReward[]);
+      }
+      const rawSpent = localStorage.getItem(SPENT_KEY);
+      const savedSpent = rawSpent ? parseInt(rawSpent, 10) : 0;
+      if (Number.isFinite(savedSpent) && savedSpent > 0) setSpentXp(savedSpent);
 
       const rawA11y = localStorage.getItem(A11Y_KEY);
       if (rawA11y) {
@@ -7099,6 +11478,47 @@ function ElioraApp() {
     }
     setLoaded(true);
   }, []);
+
+  // If the app was opened from a share link (?share=…), pick up the shared deck
+  // or note and offer to import it. Clear the param so a refresh doesn't re-ask.
+  useEffect(() => {
+    if (!loaded) return;
+    const shared = readShareFromUrl();
+    if (shared) {
+      setIncomingShare(shared);
+      window.history.replaceState({}, "", window.location.pathname);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [loaded]);
+
+  // Bring an imported deck/note into the current chat as a message, so the
+  // friend can study it right away (and it's saved with the conversation).
+  function importShare(shared: SharePayload) {
+    if (shared.kind === "flashcards") {
+      setMessages((prev) => [
+        ...prev,
+        {
+          role: "assistant",
+          content: shared.title
+            ? `A friend shared these flashcards with you: **${shared.title}**`
+            : "A friend shared these flashcards with you:",
+          flashcards: shared.cards,
+        },
+      ]);
+    } else {
+      setMessages((prev) => [
+        ...prev,
+        {
+          role: "assistant",
+          content:
+            (shared.title ? `**${shared.title}** — shared by a friend\n\n` : "") +
+            shared.text,
+        },
+      ]);
+    }
+    setIncomingShare(null);
+    setTab("chat");
+  }
 
   // Persist chat folders.
   useEffect(() => {
@@ -7436,6 +11856,13 @@ function ElioraApp() {
       ),
     );
   }
+  function setAssignmentConcern(id: string, concern: string) {
+    setAssignments((prev) =>
+      prev.map((a) =>
+        a.id === id ? { ...a, concern: concern.trim() || undefined } : a,
+      ),
+    );
+  }
   function removeAssignment(id: string) {
     setAssignments((prev) => prev.filter((a) => a.id !== id));
   }
@@ -7582,6 +12009,26 @@ function ElioraApp() {
     }
   }, [reflections, loaded]);
 
+  // Persist the AI monthly progress recaps.
+  useEffect(() => {
+    if (!loaded) return;
+    try {
+      localStorage.setItem(MONTHLY_REPORTS_KEY, JSON.stringify(monthlyReports));
+    } catch {
+      /* ignore */
+    }
+  }, [monthlyReports, loaded]);
+
+  // Persist the AI weekly progress recaps.
+  useEffect(() => {
+    if (!loaded) return;
+    try {
+      localStorage.setItem(WEEKLY_REPORTS_KEY, JSON.stringify(weeklyReports));
+    } catch {
+      /* ignore */
+    }
+  }, [weeklyReports, loaded]);
+
   // Persist the cross-semester reflection summary.
   useEffect(() => {
     if (!loaded) return;
@@ -7618,8 +12065,120 @@ function ElioraApp() {
     }
   }, [dailyTasks, loaded]);
 
+  // Persist today's schedule.
+  useEffect(() => {
+    if (!loaded) return;
+    try {
+      if (schedule) localStorage.setItem(SCHEDULE_KEY, JSON.stringify(schedule));
+      else localStorage.removeItem(SCHEDULE_KEY);
+    } catch {
+      /* ignore */
+    }
+  }, [schedule, loaded]);
+
+  // Persist the learner's home / free-to-study hour.
+  useEffect(() => {
+    if (!loaded) return;
+    try {
+      localStorage.setItem(HOMETIME_KEY, String(homeHour));
+    } catch {
+      /* ignore */
+    }
+  }, [homeHour, loaded]);
+
+  // Build today's after-school study schedule from when they get home + how they
+  // study (profile) + their real work (plan steps, tasks, assignments).
+  const generateStudySchedule = async () => {
+    if (generatingSchedule) return;
+    setGeneratingSchedule(true);
+    try {
+      const today = localISO();
+      const planSteps = plan.filter((m) => !m.done).map((m) => m.title);
+      // Pass each open task with its time estimate so the schedule can budget
+      // the evening by minutes (e.g. "Review Bio notes (~20 min)").
+      const taskTitles =
+        dailyTasks?.date === today
+          ? dailyTasks.tasks
+              .filter((t) => !t.done)
+              .map((t) =>
+                t.estMin ? `${t.title} (~${t.estMin} min)` : t.title,
+              )
+          : [];
+      const res = await fetch("/api/suggest", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          kind: "schedule",
+          homeHour,
+          profile: profile ?? undefined,
+          plan: planSteps,
+          tasks: taskTitles,
+          assignments: assignments
+            .filter((a) => !a.done)
+            .map((a) => ({ title: a.title, subject: a.subject, due: a.due })),
+          goals: goals.length ? goals : undefined,
+        }),
+      });
+      const data = (await res.json()) as {
+        blocks?: { hour?: number; kind?: string; text?: string }[];
+      };
+      const blocks = Array.isArray(data.blocks) ? data.blocks : [];
+      if (blocks.length) {
+        const map: Record<number, ScheduleBlock> = {};
+        for (const b of blocks) {
+          if (
+            typeof b.hour === "number" &&
+            b.hour >= 9 &&
+            b.hour <= 20 &&
+            (b.text ?? "").trim()
+          ) {
+            const kind = (
+              ["study", "break", "class", "other"] as ScheduleKind[]
+            ).includes(b.kind as ScheduleKind)
+              ? (b.kind as ScheduleKind)
+              : "study";
+            map[b.hour] = { text: String(b.text).trim(), kind };
+          }
+        }
+        if (Object.keys(map).length) setSchedule({ date: today, blocks: map });
+      }
+    } catch {
+      /* ignore — the button can be tapped again */
+    } finally {
+      setGeneratingSchedule(false);
+    }
+  };
+
+  // Update one hour block of today's schedule (starting a fresh day if needed).
+  const setScheduleBlock = (hour: number, patch: Partial<ScheduleBlock>) => {
+    const today = localISO();
+    setSchedule((prev) => {
+      const base =
+        prev && prev.date === today ? prev : { date: today, blocks: {} };
+      const existing: ScheduleBlock = base.blocks[hour] ?? {
+        text: "",
+        kind: "study",
+      };
+      return {
+        date: today,
+        blocks: { ...base.blocks, [hour]: { ...existing, ...patch } },
+      };
+    });
+  };
+  // Wipe today's schedule clean.
+  const clearSchedule = () => setSchedule({ date: localISO(), blocks: {} });
+
+  // The day's task time budget, taken from today's schedule: each hour block
+  // marked "study" contributes 60 minutes. 0 when there's no schedule yet.
+  const scheduledStudyMin =
+    schedule && schedule.date === localISO()
+      ? Object.values(schedule.blocks).filter((b) => b.kind === "study")
+          .length * 60
+      : 0;
+
   // Generate a fresh set of tasks for today, grounded in the learner's plan,
-  // goals, calendar, assignments, and weak spots.
+  // goals, calendar, assignments, and weak spots. If today's schedule exists,
+  // its study time becomes the budget the tasks' estimates must fit.
   const generateDailyTasks = async () => {
     if (dailyLoading) return;
     setDailyLoading(true);
@@ -7629,6 +12188,7 @@ function ElioraApp() {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           kind: "daily",
+          budgetMin: scheduledStudyMin || undefined,
           plan: plan.filter((m) => !m.done).map((m) => m.title),
           goals: goals.length ? goals : undefined,
           events: events.length ? events : undefined,
@@ -7636,22 +12196,32 @@ function ElioraApp() {
             .filter((a) => !a.done)
             .map((a) => ({ title: a.title, subject: a.subject, due: a.due })),
           missed: missed.length ? missed : undefined,
+          mistakes: mistakes.length ? mistakes : undefined,
           profile: profile ?? undefined,
         }),
       });
-      const data = (await res.json()) as { items?: SugItem[] };
+      const data = (await res.json()) as {
+        items?: Array<SugItem & { estMin?: number; priority?: string }>;
+      };
       const items = Array.isArray(data.items) ? data.items : [];
       if (items.length) {
         setDailyTasks({
           date: localISO(),
           tasks: items
             .filter((it) => it.title)
-            .map((it) => ({
-              title: String(it.title).trim(),
-              why: it.why || undefined,
-              subject: it.subject || undefined,
-              done: false,
-            })),
+            .map((it) => {
+              const m = Number(it.estMin);
+              const p = it.priority;
+              return {
+                title: String(it.title).trim(),
+                why: it.why || undefined,
+                subject: it.subject || undefined,
+                priority:
+                  p === "high" || p === "med" || p === "low" ? p : "med",
+                estMin: Number.isFinite(m) && m > 0 ? Math.round(m) : undefined,
+                done: false,
+              };
+            }),
         });
       }
     } catch {
@@ -7691,6 +12261,40 @@ function ElioraApp() {
     });
   };
 
+  // Adjust a task's time budget (minutes). 0/blank clears the estimate.
+  const setDailyTaskMin = (i: number, min: number) => {
+    setDailyTasks((prev) => {
+      if (!prev) return prev;
+      const estMin = Number.isFinite(min) && min > 0 ? Math.round(min) : undefined;
+      const tasks = prev.tasks.map((t, x) => (x === i ? { ...t, estMin } : t));
+      return { ...prev, tasks };
+    });
+  };
+
+  // Re-rank a task's priority (High/Med/Low). Ordering + time budget follow it.
+  const setDailyTaskPriority = (i: number, priority: Priority) => {
+    setDailyTasks((prev) => {
+      if (!prev) return prev;
+      const tasks = prev.tasks.map((t, x) =>
+        x === i ? { ...t, priority } : t,
+      );
+      return { ...prev, tasks };
+    });
+  };
+
+  // Divide a fixed block of study minutes across today's open tasks, weighted by
+  // priority (High tasks get the biggest slice), writing each task's estMin.
+  const budgetDailyTime = (blockMin: number) => {
+    setDailyTasks((prev) => {
+      if (!prev) return prev;
+      const slices = budgetByPriority(prev.tasks, blockMin);
+      const tasks = prev.tasks.map((t, x) =>
+        slices[x] != null ? { ...t, estMin: slices[x] } : t,
+      );
+      return { ...prev, tasks };
+    });
+  };
+
   // Persist progress XP log.
   useEffect(() => {
     if (!loaded) return;
@@ -7700,6 +12304,16 @@ function ElioraApp() {
       /* ignore */
     }
   }, [progress, loaded]);
+
+  // Persist minutes-studied log.
+  useEffect(() => {
+    if (!loaded) return;
+    try {
+      localStorage.setItem(STUDY_KEY, JSON.stringify(studyLog));
+    } catch {
+      /* ignore */
+    }
+  }, [studyLog, loaded]);
 
   // Persist which badges have been rewarded.
   useEffect(() => {
@@ -7716,7 +12330,7 @@ function ElioraApp() {
   // next badge's threshold — the effect re-runs and rewards that one too.
   useEffect(() => {
     if (!loaded) return;
-    const fresh = earnedBadgeIds(progress).filter(
+    const fresh = earnedBadgeIds(progress, goals).filter(
       (id) => !claimedBadges.includes(id),
     );
     if (!fresh.length) return;
@@ -7734,7 +12348,7 @@ function ElioraApp() {
         : `🎖️ ${defs.length} badges earned · +${totalReward} XP`,
     );
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [progress, claimedBadges, loaded]);
+  }, [progress, goals, claimedBadges, loaded]);
 
   // Persist the equipped study-room reward.
   useEffect(() => {
@@ -7745,6 +12359,17 @@ function ElioraApp() {
       /* ignore */
     }
   }, [equippedRoom, loaded]);
+
+  // Persist the learner's custom rewards + spent-XP balance.
+  useEffect(() => {
+    if (!loaded) return;
+    try {
+      localStorage.setItem(CUSTOM_REWARDS_KEY, JSON.stringify(customRewards));
+      localStorage.setItem(SPENT_KEY, String(spentXp));
+    } catch {
+      /* ignore */
+    }
+  }, [customRewards, spentXp, loaded]);
 
   // Build (or rebuild) the roadmap. With `blank`, start an empty 4-year skeleton
   // the learner fills in; otherwise ask Eliora to draft it toward the destination.
@@ -7897,6 +12522,79 @@ function ElioraApp() {
       window.confirm("Clear your whole 4-year plan? This can't be undone.")
     ) {
       setFourYearPlan(null);
+    }
+  }
+  // Generate (or regenerate) the AI monthly recap for a month. The MonthlyReport
+  // component has already tallied the month's stats from the local logs; this just
+  // sends them to Eliora and stores the returned recap (keyed by "YYYY-MM").
+  async function generateMonthlyReport(
+    monthKey: string,
+    payload: Record<string, unknown>,
+  ) {
+    if (monthlyReportBusy) return;
+    setMonthlyReportBusy(monthKey);
+    try {
+      const res = await fetch("/api/monthly-report", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ ...payload, profile: profile ?? undefined }),
+      });
+      const data = (await res.json()) as {
+        message?: string;
+        focus?: string[];
+        error?: string;
+      };
+      if (data.message) {
+        setMonthlyReports((prev) => ({
+          ...prev,
+          [monthKey]: {
+            message: data.message!,
+            focus: data.focus ?? [],
+            generatedAt: new Date().toISOString(),
+          },
+        }));
+      }
+    } catch {
+      /* ignore — the button can be tapped again */
+    } finally {
+      setMonthlyReportBusy(null);
+    }
+  }
+  // Generate (or regenerate) the AI weekly "what you learned" recap for a week.
+  // The WeeklyRecap component has already tallied the week's stats from the local
+  // logs; this just sends them to Eliora and stores the returned recap (keyed by
+  // the Monday's "YYYY-MM-DD").
+  async function generateWeeklyReport(
+    weekKey: string,
+    payload: Record<string, unknown>,
+  ) {
+    if (weeklyReportBusy) return;
+    setWeeklyReportBusy(weekKey);
+    try {
+      const res = await fetch("/api/weekly-report", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ ...payload, profile: profile ?? undefined }),
+      });
+      const data = (await res.json()) as {
+        message?: string;
+        focus?: string[];
+        error?: string;
+      };
+      if (data.message) {
+        setWeeklyReports((prev) => ({
+          ...prev,
+          [weekKey]: {
+            message: data.message!,
+            focus: data.focus ?? [],
+            generatedAt: new Date().toISOString(),
+          },
+        }));
+      }
+    } catch {
+      /* ignore — the button can be tapped again */
+    } finally {
+      setWeeklyReportBusy(null);
     }
   }
   // Post-semester reflection: send the finished year's grades + survey answers to
@@ -8091,6 +12789,117 @@ function ElioraApp() {
       p ? { ...p, totalRequired: n != null ? Math.max(0, n) : undefined } : p,
     );
   }
+  // One-tap typical US high-school requirements, for learners who don't have
+  // their school's numbers in hand — editable afterwards like any other entry.
+  // Only offered when no requirements exist yet, so nothing is overwritten.
+  function useTypicalFypRequirements() {
+    setFourYearPlan((p) =>
+      p
+        ? {
+            ...p,
+            requirements: p.requirements?.length
+              ? p.requirements
+              : [
+                  { subject: "English", required: 4 },
+                  { subject: "Math", required: 3 },
+                  { subject: "Science", required: 3 },
+                  { subject: "Social Studies", required: 3 },
+                  { subject: "World Language", required: 2 },
+                  { subject: "PE / Health", required: 2 },
+                  { subject: "Arts", required: 1 },
+                  { subject: "Electives", required: 6 },
+                ],
+            totalRequired: p.totalRequired ?? 24,
+          }
+        : p,
+    );
+  }
+  function setFypGpaGoal(n: number | undefined) {
+    setFourYearPlan((p) =>
+      p
+        ? { ...p, gpaGoal: n != null ? Math.min(5, Math.max(0, n)) : undefined }
+        : p,
+    );
+  }
+  function setFypProjectedGrade(grade: string) {
+    setFourYearPlan((p) => (p ? { ...p, projectedGrade: grade } : p));
+  }
+  // Fold grades pulled from an uploaded transcript into the plan: match each one
+  // to an existing course by title (so it counts toward the GPA calculator), and
+  // append the leftovers as completed courses to Year 1. Returns a tally so the
+  // panel can tell the learner what happened.
+  function applyFypGrades(
+    entries: {
+      title: string;
+      grade: string;
+      credits?: number;
+      level?: CourseLevel;
+    }[],
+  ): { matched: number; added: number } {
+    const cur = fourYearPlan;
+    if (!cur || !entries.length) return { matched: 0, added: 0 };
+    const norm = (s: string) =>
+      s.toLowerCase().replace(/[^a-z0-9]+/g, " ").trim();
+    const years = cur.years.map((y) => ({
+      ...y,
+      courses: y.courses.map((c) => ({ ...c })),
+    }));
+    const claimed = new Set<string>();
+    let matched = 0;
+    const unmatched: typeof entries = [];
+    for (const e of entries) {
+      const en = norm(e.title);
+      if (!en) continue;
+      let best: { yi: number; ci: number; score: number } | null = null;
+      years.forEach((y, yi) =>
+        y.courses.forEach((c, ci) => {
+          const key = `${yi}:${ci}`;
+          if (claimed.has(key)) return;
+          const cn = norm(c.title);
+          if (!cn) return;
+          let score = 0;
+          if (cn === en) score = 3;
+          else if (cn.includes(en) || en.includes(cn)) score = 2;
+          else {
+            const ew = new Set(en.split(" "));
+            const overlap = cn.split(" ").filter((w) => ew.has(w)).length;
+            if (overlap >= 2) score = 1;
+          }
+          if (score && (!best || score > best.score))
+            best = { yi, ci, score };
+        }),
+      );
+      if (best) {
+        const b: { yi: number; ci: number; score: number } = best;
+        const c = years[b.yi].courses[b.ci];
+        c.grade = e.grade;
+        c.done = true;
+        if (c.credits == null && e.credits != null) c.credits = e.credits;
+        if (!c.level && e.level) c.level = e.level;
+        claimed.add(`${b.yi}:${b.ci}`);
+        matched++;
+      } else {
+        unmatched.push(e);
+      }
+    }
+    if (unmatched.length) {
+      years[0] = {
+        ...years[0],
+        courses: [
+          ...years[0].courses,
+          ...unmatched.map((e) => ({
+            title: e.title,
+            grade: e.grade,
+            done: true,
+            credits: e.credits,
+            level: e.level,
+          })),
+        ],
+      };
+    }
+    setFourYearPlan({ ...cur, years });
+    return { matched, added: unmatched.length };
+  }
   // Jump to chat and have Eliora surface REAL resources + a tiny first step for
   // completing a specific roadmap milestone, tied to the learner's career goal.
   function milestoneResources(title: string) {
@@ -8122,6 +12931,93 @@ function ElioraApp() {
     const t = topic.trim();
     if (!t) return;
     setMissed((prev) => (prev.includes(t) ? prev : [...prev, t]));
+  }
+
+  // Persist the mistake tracker.
+  useEffect(() => {
+    if (!loaded) return;
+    try {
+      localStorage.setItem(MISTAKES_KEY, JSON.stringify(mistakes));
+    } catch {
+      /* ignore */
+    }
+  }, [mistakes, loaded]);
+
+  // Add a concept to the mistake tracker — or, if it's already there, bump its
+  // count + lastSeen and reopen it (it came up again). Deduped case-insensitively
+  // by concept; a fresh why/fix backfills fields the existing entry was missing.
+  function logMistake(m: {
+    concept: string;
+    subject?: string;
+    why?: string;
+    fix?: string;
+    source: MistakeSource;
+  }) {
+    const concept = m.concept.trim();
+    if (!concept) return;
+    const now = new Date().toISOString();
+    const clean = (v?: string) => (v && v.trim() ? v.trim() : undefined);
+    setMistakes((prev) => {
+      const i = prev.findIndex(
+        (x) => x.concept.toLowerCase() === concept.toLowerCase(),
+      );
+      if (i >= 0) {
+        const copy = [...prev];
+        const cur = copy[i];
+        copy[i] = {
+          ...cur,
+          count: cur.count + 1,
+          lastSeen: now,
+          resolved: false,
+          subject: cur.subject || clean(m.subject),
+          why: cur.why || clean(m.why),
+          fix: cur.fix || clean(m.fix),
+        };
+        return copy;
+      }
+      return [
+        ...prev,
+        {
+          id: `m${Date.now().toString(36)}${Math.random()
+            .toString(36)
+            .slice(2, 8)}`,
+          concept,
+          subject: clean(m.subject),
+          why: clean(m.why),
+          fix: clean(m.fix),
+          source: m.source,
+          count: 1,
+          createdAt: now,
+          lastSeen: now,
+          resolved: false,
+        },
+      ];
+    });
+  }
+
+  function setMistakeResolved(id: string, resolved: boolean) {
+    setMistakes((prev) =>
+      prev.map((m) => (m.id === id ? { ...m, resolved } : m)),
+    );
+  }
+
+  function removeMistake(id: string) {
+    setMistakes((prev) => prev.filter((m) => m.id !== id));
+  }
+
+  // Jump to chat and have Eliora re-teach a tracked mistake from scratch.
+  function reviewMistake(m: Mistake) {
+    if (busy) return;
+    setTab("chat");
+    send(
+      `Help me finally get "${m.concept}"${
+        m.subject ? ` (${m.subject})` : ""
+      } — it's on my mistake tracker` +
+        (m.count > 1 ? ` and I've gotten it wrong ${m.count} times` : "") +
+        `.${m.why ? ` I keep messing up: ${m.why}.` : ""} Re-teach it in a ` +
+        `fresh, simple way tied to my interests, give me one worked example, ` +
+        `then quiz me on just this to check it stuck.`,
+    );
   }
 
   // Persist subject folders.
@@ -8250,8 +13146,67 @@ function ElioraApp() {
     setSidebarOpen(false);
     setPendingKickoff(
       `I want to work on ${topic}. Can you help me get started — a quick, ` +
-        `beginner-friendly intro and the first small step to take?`,
+        `beginner-friendly intro and the first small step to take? Walk me ` +
+        `through ${topic} step by step, checking in as we go. Then, once I've ` +
+        `got the basics down, switch into a teach-back on the same topic (the ` +
+        `Feynman technique) — ` +
+        teachBackChallenge(),
     );
+  }
+
+  // The teach-back (Feynman) challenge tail — identical whether the teach-back
+  // stands alone or caps off a lesson, so both flows stay in sync. It's the
+  // part after "…and": frame the challenge, wait, then surface gaps + coach.
+  function teachBackChallenge(): string {
+    return (
+      `give me a short teaching challenge: ask me to explain it in my own ` +
+      `words, and list two or three key angles I should be sure to cover. Then ` +
+      `wait for my explanation. Once I've explained, tell me what I got right, ` +
+      `what's missing, and any misconceptions — then coach me on the gaps so ` +
+      `it sticks.`
+    );
+  }
+
+  // The message that kicks off a teach-back (Feynman) exercise in chat. If a
+  // concept is given it's baked in; otherwise Eliora picks one from the
+  // conversation so far (or asks). Eliora frames the challenge, waits for the
+  // learner's explanation, then surfaces gaps + misconceptions and coaches.
+  function teachBackKickoff(concept: string): string {
+    const c = concept.trim();
+    const about = c
+      ? `the concept "${c}"`
+      : "a concept from what we've been working on (or ask me what I want to teach)";
+    return (
+      `Let's do a teach-back so I can find the holes in what I know (the ` +
+      `Feynman technique). Pick ${about} and ` +
+      teachBackChallenge()
+    );
+  }
+
+  // Open a brand-new chat that runs a teach-back on a concept (Home card path).
+  function startTeachBack(rawConcept: string) {
+    const concept = rawConcept.trim();
+    if (!concept || busy || pendingKickoff) return;
+    const id = newChatId();
+    // Keep the greeting first so send()'s history slicing stays correct.
+    const msgs = profile ? [greetingFor(profile)] : [];
+    const label = `Teach back: ${concept}`;
+    const title = label.length > 28 ? label.slice(0, 28) + "…" : label;
+    setChats((prev) => [...prev, { id, title, messages: msgs, named: true }]);
+    setActiveChatId(id);
+    setInput("");
+    setTab("chat");
+    setSidebarOpen(false);
+    setPendingKickoff(teachBackKickoff(concept));
+  }
+
+  // Start a teach-back inside the CURRENT chat (composer quick-action). Uses
+  // whatever's in the composer as the concept, or lets Eliora pick from context.
+  function teachBackInChat() {
+    if (busy || pendingKickoff) return;
+    const concept = input.trim();
+    setInput("");
+    void send(teachBackKickoff(concept));
   }
 
   // Send the queued kickoff once the new topic chat has become the active chat,
@@ -8305,6 +13260,30 @@ function ElioraApp() {
   }
   function removeMilestone(i: number) {
     setPlan((prev) => prev.filter((_, idx) => idx !== i));
+  }
+  // The learner edits a plan step in place: rename it, change its detail, or
+  // toggle whether it's a checkpoint. Only the provided fields are changed.
+  function editMilestone(
+    i: number,
+    patch: { title?: string; detail?: string; checkpoint?: boolean },
+  ) {
+    setPlan((prev) =>
+      prev.map((m, idx) => {
+        if (idx !== i) return m;
+        const next = { ...m };
+        if (patch.title !== undefined) {
+          const t = patch.title.trim();
+          if (t) next.title = t;
+        }
+        if (patch.detail !== undefined) {
+          const d = patch.detail.trim();
+          next.detail = d || undefined;
+        }
+        if (patch.checkpoint !== undefined)
+          next.checkpoint = patch.checkpoint || undefined;
+        return next;
+      }),
+    );
   }
   // Ask Eliora to (re)build the plan from the whole conversation so far.
   function buildPlanFromChat() {
@@ -8419,11 +13398,15 @@ function ElioraApp() {
     setMessages([...visible, { role: "assistant", content: "" }]);
     if (typeof override !== "string") setInput("");
     setBusy(true);
+    setChatStatus(null);
+    const aborter = new AbortController();
+    chatAbortRef.current = aborter;
 
     try {
       const res = await fetch("/api/chat", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
+        signal: aborter.signal,
         // Send role+text history plus the profile and current plan for context.
         body: JSON.stringify({
           messages: apiMessages
@@ -8433,6 +13416,7 @@ function ElioraApp() {
           plan: plan.length ? plan : undefined,
           events: events.length ? events : undefined,
           missed: missed.length ? missed : undefined,
+          mistakes: mistakes.length ? mistakes : undefined,
           subjects: subjects.length ? subjects : undefined,
           assignments: assignments.length ? assignments : undefined,
           goals: goals.length ? goals : undefined,
@@ -8440,6 +13424,9 @@ function ElioraApp() {
         }),
       });
 
+      // A non-200 (e.g. a dev-server hiccup) must surface as an error, not a
+      // silent empty reply.
+      if (!res.ok) throw new Error(`Chat request failed (${res.status})`);
       if (!res.body) throw new Error("No response stream");
       const reader = res.body.getReader();
       const decoder = new TextDecoder();
@@ -8493,12 +13480,37 @@ function ElioraApp() {
           if (g.specific) addGoal(g);
           return;
         }
+        if (evt.type === "mistake" && evt.item) {
+          const mk = evt.item as unknown as {
+            concept?: string;
+            subject?: string;
+            why?: string;
+            fix?: string;
+          };
+          if (mk.concept) {
+            logMistake({
+              concept: mk.concept,
+              subject: mk.subject,
+              why: mk.why,
+              fix: mk.fix,
+              source: "chat",
+            });
+          }
+          return;
+        }
         if (evt.type === "fourYearPlan") {
           const item = (evt as { item?: unknown }).item;
           if (item) setFourYearPlan(normalizeFourYearPlan(item));
           return;
         }
-        if (evt.type === "text" && evt.value) acc += evt.value;
+        if (evt.type === "status") {
+          setChatStatus(evt.value || null);
+          return;
+        }
+        if (evt.type === "text" && evt.value) {
+          acc += evt.value;
+          setChatStatus(null);
+        }
         else if (evt.type === "videos" && evt.items)
           videos.push(...(evt.items as Video[]));
         else if (evt.type === "flashcards")
@@ -8526,18 +13538,37 @@ function ElioraApp() {
         for (const line of lines) applyEvent(line);
       }
       applyEvent(buffer);
-    } catch {
+    } catch (err) {
+      const stopped = err instanceof DOMException && err.name === "AbortError";
       setMessages((prev) => {
         const copy = [...prev];
-        copy[copy.length - 1] = {
-          role: "assistant",
-          content: "Sorry, I couldn't reach the server. Please try again.",
-        };
+        const last = copy[copy.length - 1];
+        if (stopped) {
+          // Keep whatever streamed before Stop; only fill a truly empty bubble.
+          if (!last?.content) {
+            copy[copy.length - 1] = {
+              role: "assistant",
+              content: "Okay, stopped. Ask me anything when you're ready. 🌱",
+            };
+          }
+        } else {
+          copy[copy.length - 1] = {
+            role: "assistant",
+            content: "Sorry, I couldn't reach the server. Please try again.",
+          };
+        }
         return copy;
       });
     } finally {
+      chatAbortRef.current = null;
       setBusy(false);
+      setChatStatus(null);
     }
+  }
+
+  // Cancels the in-flight reply (the Send button becomes Stop while busy).
+  function stopReply() {
+    chatAbortRef.current?.abort();
   }
 
   if (!loaded) return null;
@@ -8589,6 +13620,7 @@ function ElioraApp() {
               ["summarize", "📝 Notes"],
               ["calendar", "📅 Calendar"],
               ["plan", "🎯 Plan"],
+              ["progress", "📊 Progress"],
               ["study", "📋 Study"],
             ] as const
           ).map(([key, label]) => (
@@ -8606,15 +13638,6 @@ function ElioraApp() {
               {label}
             </button>
           ))}
-          <button
-            style={styles.sideNavItem}
-            onClick={() => {
-              setShowA11y(true);
-              setSidebarOpen(false);
-            }}
-          >
-            ⚙️ Settings
-          </button>
         </nav>
         <div style={styles.sideChatsLabel}>
           <span>Chats</span>
@@ -8666,6 +13689,71 @@ function ElioraApp() {
             .map(renderChat)}
         </div>
         <div style={styles.sideFooter}>
+          <div style={{ position: "relative" }}>
+            <button
+              style={{ ...styles.sideFootBtn, position: "relative" }}
+              onClick={() => setShowNotifs((v) => !v)}
+              aria-label={
+                shownReminders.length
+                  ? `Notifications (${shownReminders.length} new)`
+                  : "Notifications"
+              }
+              title="Notifications"
+            >
+              🔔
+              {shownReminders.length > 0 && (
+                <span style={styles.notifBadge}>
+                  {shownReminders.length > 9 ? "9+" : shownReminders.length}
+                </span>
+              )}
+            </button>
+            {showNotifs && (
+              <div style={styles.notifPanel} role="dialog" aria-label="Notifications">
+                <div style={styles.notifHead}>
+                  <span style={{ fontWeight: 700 }}>🔔 Notifications</span>
+                  {notifSupported && !remindersOn && (
+                    <button style={styles.linkBtn} onClick={enableNotifications}>
+                      Turn on
+                    </button>
+                  )}
+                  <button
+                    style={styles.notifClose}
+                    onClick={() => setShowNotifs(false)}
+                    aria-label="Close notifications"
+                  >
+                    ×
+                  </button>
+                </div>
+                {shownReminders.length === 0 ? (
+                  <p style={styles.notifEmpty}>You&apos;re all caught up 🎉</p>
+                ) : (
+                  shownReminders.map((r) => (
+                    <div key={r.id} style={styles.reminderRow}>
+                      <button
+                        style={styles.reminderCheck}
+                        onClick={() => checkReminder(r)}
+                        aria-label="Mark done"
+                        title="Mark done"
+                      />
+                      <button
+                        style={styles.reminderText}
+                        onClick={() => {
+                          setShowNotifs(false);
+                          handleReminder(r);
+                        }}
+                      >
+                        <span style={{ flexShrink: 0 }}>{r.icon}</span>
+                        <span style={{ flex: 1, textAlign: "left" }}>
+                          {r.text}
+                        </span>
+                        <span style={{ color: "var(--muted)" }}>›</span>
+                      </button>
+                    </div>
+                  ))
+                )}
+              </div>
+            )}
+          </div>
           <button
             style={styles.sideFootBtn}
             onClick={() =>
@@ -8711,6 +13799,75 @@ function ElioraApp() {
       </aside>
 
       <main style={styles.mainCol}>
+        <div style={styles.topNotifWrap}>
+          <button
+            style={styles.topNotifBtn}
+            onClick={() => setShowTopNotifs((v) => !v)}
+            aria-label={
+              shownReminders.length
+                ? `Notifications (${shownReminders.length} new)`
+                : "Notifications"
+            }
+            title="Notifications"
+          >
+            🔔
+            {shownReminders.length > 0 && (
+              <span style={styles.notifBadge}>
+                {shownReminders.length > 9 ? "9+" : shownReminders.length}
+              </span>
+            )}
+          </button>
+          {showTopNotifs && (
+            <div
+              style={styles.topNotifPanel}
+              role="dialog"
+              aria-label="Notifications"
+            >
+              <div style={styles.notifHead}>
+                <span style={{ fontWeight: 700 }}>🔔 Notifications</span>
+                {notifSupported && !remindersOn && (
+                  <button style={styles.linkBtn} onClick={enableNotifications}>
+                    Turn on
+                  </button>
+                )}
+                <button
+                  style={styles.notifClose}
+                  onClick={() => setShowTopNotifs(false)}
+                  aria-label="Close notifications"
+                >
+                  ×
+                </button>
+              </div>
+              {shownReminders.length === 0 ? (
+                <p style={styles.notifEmpty}>You&apos;re all caught up 🎉</p>
+              ) : (
+                shownReminders.map((r) => (
+                  <div key={r.id} style={styles.reminderRow}>
+                    <button
+                      style={styles.reminderCheck}
+                      onClick={() => checkReminder(r)}
+                      aria-label="Mark done"
+                      title="Mark done"
+                    />
+                    <button
+                      style={styles.reminderText}
+                      onClick={() => {
+                        setShowTopNotifs(false);
+                        handleReminder(r);
+                      }}
+                    >
+                      <span style={{ flexShrink: 0 }}>{r.icon}</span>
+                      <span style={{ flex: 1, textAlign: "left" }}>
+                        {r.text}
+                      </span>
+                      <span style={{ color: "var(--muted)" }}>›</span>
+                    </button>
+                  </div>
+                ))
+              )}
+            </div>
+          )}
+        </div>
         {showA11y && (
           <AccessibilityPanel
             value={a11y}
@@ -8765,6 +13922,47 @@ function ElioraApp() {
           </div>
         )}
 
+        {incomingShare && (
+          <div style={styles.overlay} onClick={() => setIncomingShare(null)}>
+            <div
+              style={styles.badgeModal}
+              className="fade-in"
+              onClick={(e) => e.stopPropagation()}
+            >
+              <div style={styles.badgeCelebrateKicker}>
+                {incomingShare.kind === "flashcards" ? "🃏 Shared deck" : "📝 Shared notes"}
+              </div>
+              <div style={styles.badgeModalTitle}>
+                {incomingShare.title ||
+                  (incomingShare.kind === "flashcards"
+                    ? "Flashcards from a friend"
+                    : "Notes from a friend")}
+              </div>
+              <p style={styles.badgeModalBlurb}>
+                {incomingShare.kind === "flashcards"
+                  ? `A friend shared ${incomingShare.cards.length} flashcard${
+                      incomingShare.cards.length === 1 ? "" : "s"
+                    } with you. Add them to your chat to study?`
+                  : "A friend shared study notes with you. Add them to your chat?"}
+              </p>
+              <div style={styles.shareModalActions}>
+                <button
+                  style={styles.secondaryBtn}
+                  onClick={() => setIncomingShare(null)}
+                >
+                  Not now
+                </button>
+                <button
+                  style={styles.goalSuggestBtn}
+                  onClick={() => importShare(incomingShare)}
+                >
+                  Add to my chat
+                </button>
+              </div>
+            </div>
+          </div>
+        )}
+
         {reviewFor && (
           <div style={styles.reviewBanner}>
             <span style={{ flex: 1 }}>
@@ -8810,11 +14008,28 @@ function ElioraApp() {
               <h1 style={styles.homeHi}>Hi{heroName} 🌱</h1>
               <p style={styles.homeSub}>What do you want to work on today?</p>
             </div>
+            <VideoFeed
+              topics={Array.from(
+                new Set(
+                  [
+                    ...subjects,
+                    profile?.klass ?? "",
+                    ...(profile?.subjectsStudying?.split(/[,;]+/) ?? []),
+                  ]
+                    .map((s) => s.trim())
+                    .filter(Boolean),
+                ),
+              ).slice(0, 5)}
+            />
             <DailyTasksCard
               state={dailyTasks}
               loading={dailyLoading}
+              budgetMin={scheduledStudyMin}
               onGenerate={generateDailyTasks}
               onToggle={toggleDailyTask}
+              onSetMin={setDailyTaskMin}
+              onSetPriority={setDailyTaskPriority}
+              onBudget={budgetDailyTime}
             />
             <TopicStarter
               profile={profile}
@@ -8823,11 +14038,33 @@ function ElioraApp() {
               busy={busy || !!pendingKickoff}
               onStart={startTopicChat}
             />
-            <ProgressCard log={progress} />
+            <TeachBackStarter
+              profile={profile}
+              subjects={subjects}
+              missed={missed}
+              busy={busy || !!pendingKickoff}
+              onStart={startTeachBack}
+            />
+            <StudyNextCard
+              profile={profile}
+              missed={missed}
+              events={events}
+              career={fourYearPlan?.destination}
+              busy={busy || !!pendingKickoff}
+              onStart={startTopicChat}
+            />
+            <ProgressCard log={progress} study={studyLog} goals={goals} />
             <RewardsCard
               totalXp={totalXp}
               equipped={equippedRoom}
               onEquip={setEquippedRoom}
+            />
+            <MyRewardsCard
+              availableXp={availableXp}
+              rewards={customRewards}
+              onAdd={addCustomReward}
+              onRedeem={redeemCustomReward}
+              onRemove={removeCustomReward}
             />
             <div className="eliora-home-actions" style={styles.homeActions}>
               {(
@@ -8877,6 +14114,13 @@ function ElioraApp() {
               />
             )}
             <GoalStrip goals={goals} onOpen={() => setTab("plan")} />
+            <MistakeCenter
+              mistakes={mistakes}
+              onAdd={logMistake}
+              onReview={reviewMistake}
+              onResolve={setMistakeResolved}
+              onRemove={removeMistake}
+            />
             <FourYearStrip
               plan={fourYearPlan}
               onOpen={() => setTab("plan")}
@@ -8943,11 +14187,23 @@ function ElioraApp() {
         />
       )}
 
+
       {tab === "calendar" && (
         <div style={styles.studyScroll}>
+          <ScheduleGrid
+            schedule={schedule}
+            onSet={setScheduleBlock}
+            onClear={clearSchedule}
+            homeHour={homeHour}
+            onSetHomeHour={setHomeHour}
+            onGenerate={generateStudySchedule}
+            generating={generatingSchedule}
+            onStudyMinutes={logStudyMinutes}
+          />
           <CalendarPanel
             events={events}
             assignments={assignments}
+            dailyTasks={dailyTasks}
             profile={profile}
             career={fourYearPlan?.destination}
             onAdd={addEvent}
@@ -8965,7 +14221,7 @@ function ElioraApp() {
             {(
               [
                 ["overview", "📋 Overview"],
-                ["progress", "📊 Progress"],
+                ["monthly", "📈 Monthly"],
                 ["week", "📆 This week"],
                 ["goals", "🌟 Goals"],
                 ["tasks", "📌 Tasks"],
@@ -8988,7 +14244,7 @@ function ElioraApp() {
 
           {planSection === "overview" && (
             <>
-              <ProgressCard log={progress} />
+              <ProgressCard log={progress} study={studyLog} goals={goals} />
               <PlanStrip
                 plan={plan}
                 onToggleNext={toggleNextStep}
@@ -9053,109 +14309,33 @@ function ElioraApp() {
             </>
           )}
 
-          {planSection === "progress" && (
-            <>
-              <DailyRecap
-                log={progress}
-                assignments={assignments}
-                events={events}
-              />
-              <WeeklyRecap
-                log={progress}
-                plan={plan}
-                goals={goals}
-                assignments={assignments}
-                fourYearPlan={fourYearPlan}
-              />
-              <ProgressCard log={progress} />
-              {(() => {
-                const fyCourses = fourYearPlan
-                  ? fourYearPlan.years.flatMap((y) => y.courses)
-                  : [];
-                const areas = [
-                  {
-                    label: "🎯 Study plan",
-                    done: plan.filter((m) => m.done).length,
-                    total: plan.length,
-                  },
-                  {
-                    label: "🌟 Goals",
-                    done: goals.filter((g) => g.done).length,
-                    total: goals.length,
-                  },
-                  {
-                    label: "📌 Assignments",
-                    done: assignments.filter((a) => a.done).length,
-                    total: assignments.length,
-                  },
-                  {
-                    label: "🗺️ 4-Year courses",
-                    done: fyCourses.filter((c) => c.done).length,
-                    total: fyCourses.length,
-                  },
-                ].filter((a) => a.total > 0);
-                const done = areas.reduce((n, a) => n + a.done, 0);
-                const totalItems = areas.reduce((n, a) => n + a.total, 0);
-                const pct = totalItems
-                  ? Math.round((done / totalItems) * 100)
-                  : 0;
-                return (
-                  <div style={styles.card}>
-                    <div style={styles.cardHead}>
-                      <span style={styles.cardClass}>🎯 Plan progress</span>
-                      <span style={styles.subjectsCount}>
-                        {done}/{totalItems} done
-                      </span>
-                    </div>
-                    {totalItems === 0 ? (
-                      <p style={styles.assignEmpty}>
-                        Nothing to track yet — add goals, assignments, or a study
-                        plan and your progress shows up here.
-                      </p>
-                    ) : (
-                      <>
-                        <div style={styles.planProgTrack}>
-                          <div
-                            style={{ ...styles.planProgFill, width: `${pct}%` }}
-                          />
-                        </div>
-                        <div style={styles.planProgMeta}>
-                          {pct}% complete
-                          {pct === 100
-                            ? " — 🎉 all done!"
-                            : ` · ${totalItems - done} to go`}
-                        </div>
-                        <div style={{ marginTop: 14 }}>
-                          {areas.map((a) => {
-                            const p = Math.round((a.done / a.total) * 100);
-                            return (
-                              <div key={a.label} style={styles.areaRow}>
-                                <span style={styles.areaLabel}>{a.label}</span>
-                                <div style={styles.areaTrack}>
-                                  <div
-                                    style={{
-                                      ...styles.areaFill,
-                                      width: `${p}%`,
-                                    }}
-                                  />
-                                </div>
-                                <span style={styles.areaCount}>
-                                  {a.done}/{a.total}
-                                </span>
-                              </div>
-                            );
-                          })}
-                        </div>
-                      </>
-                    )}
-                  </div>
-                );
-              })()}
-            </>
+          {planSection === "monthly" && (
+            <MonthlyReport
+              log={progress}
+              study={studyLog}
+              goals={goals}
+              assignments={assignments}
+              mistakes={mistakes}
+              fourYearPlan={fourYearPlan}
+              reports={monthlyReports}
+              busyKey={monthlyReportBusy}
+              onGenerate={generateMonthlyReport}
+            />
           )}
 
           {planSection === "week" && (
             <>
+              <WeeklyLearnedRecap
+                log={progress}
+                study={studyLog}
+                goals={goals}
+                assignments={assignments}
+                mistakes={mistakes}
+                fourYearPlan={fourYearPlan}
+                reports={weeklyReports}
+                busyKey={weeklyReportBusy}
+                onGenerate={generateWeeklyReport}
+              />
               {shownReminders.length > 0 && (
                 <div style={styles.card}>
                   <div style={styles.cardHead}>
@@ -9274,6 +14454,7 @@ function ElioraApp() {
                 timeMgmt={timeMgmt}
                 onToggleTimeMgmt={() => setTimeMgmt((v) => !v)}
                 onSetTime={setAssignmentTime}
+                onSetConcern={setAssignmentConcern}
                 onAdd={addAssignment}
                 onToggle={toggleAssignment}
                 onRemove={removeAssignment}
@@ -9291,6 +14472,7 @@ function ElioraApp() {
                 <MonthGrid
                   events={events}
                   assignments={assignments}
+                  dailyTasks={dailyTasks}
                   onPickDate={() => setTab("calendar")}
                 />
               </div>
@@ -9361,6 +14543,7 @@ function ElioraApp() {
                     onToggle={togglePlan}
                     onAdd={addMilestone}
                     onRemove={removeMilestone}
+                    onEdit={editMilestone}
                   />
                 </>
               ) : (
@@ -9397,6 +14580,7 @@ function ElioraApp() {
                     onToggle={togglePlan}
                     onAdd={addMilestone}
                     onRemove={removeMilestone}
+                    onEdit={editMilestone}
                   />
                 </div>
               )}
@@ -9449,6 +14633,10 @@ function ElioraApp() {
               onAddRequirement={addFypRequirement}
               onRemoveRequirement={removeFypRequirement}
               onSetTotalRequired={setFypTotalRequired}
+              onUseDefaultRequirements={useTypicalFypRequirements}
+              onSetGpaGoal={setFypGpaGoal}
+              onSetProjectedGrade={setFypProjectedGrade}
+              onApplyGrades={applyFypGrades}
               planTitles={new Set(plan.map((m) => m.title))}
               reflections={reflections}
               onReflect={reflectOnYear}
@@ -9460,6 +14648,98 @@ function ElioraApp() {
               onClear={clearFourYearPlan}
             />
           )}
+        </div>
+      )}
+
+      {tab === "progress" && (
+        <div style={styles.studyScroll}>
+          <DailyRecap log={progress} assignments={assignments} events={events} />
+          <WeeklyRecap
+            log={progress}
+            plan={plan}
+            goals={goals}
+            assignments={assignments}
+            fourYearPlan={fourYearPlan}
+          />
+          <ProgressCard log={progress} study={studyLog} goals={goals} />
+          {(() => {
+            const fyCourses = fourYearPlan
+              ? fourYearPlan.years.flatMap((y) => y.courses)
+              : [];
+            const areas = [
+              {
+                label: "🎯 Study plan",
+                done: plan.filter((m) => m.done).length,
+                total: plan.length,
+              },
+              {
+                label: "🌟 Goals",
+                done: goals.filter((g) => g.done).length,
+                total: goals.length,
+              },
+              {
+                label: "📌 Assignments",
+                done: assignments.filter((a) => a.done).length,
+                total: assignments.length,
+              },
+              {
+                label: "🗺️ 4-Year courses",
+                done: fyCourses.filter((c) => c.done).length,
+                total: fyCourses.length,
+              },
+            ].filter((a) => a.total > 0);
+            const done = areas.reduce((n, a) => n + a.done, 0);
+            const totalItems = areas.reduce((n, a) => n + a.total, 0);
+            const pct = totalItems ? Math.round((done / totalItems) * 100) : 0;
+            return (
+              <div style={styles.card}>
+                <div style={styles.cardHead}>
+                  <span style={styles.cardClass}>🎯 Plan progress</span>
+                  <span style={styles.subjectsCount}>
+                    {done}/{totalItems} done
+                  </span>
+                </div>
+                {totalItems === 0 ? (
+                  <p style={styles.assignEmpty}>
+                    Nothing to track yet — add goals, assignments, or a study
+                    plan and your progress shows up here.
+                  </p>
+                ) : (
+                  <>
+                    <div style={styles.planProgTrack}>
+                      <div
+                        style={{ ...styles.planProgFill, width: `${pct}%` }}
+                      />
+                    </div>
+                    <div style={styles.planProgMeta}>
+                      {pct}% complete
+                      {pct === 100
+                        ? " — 🎉 all done!"
+                        : ` · ${totalItems - done} to go`}
+                    </div>
+                    <div style={{ marginTop: 14 }}>
+                      {areas.map((a) => {
+                        const p = Math.round((a.done / a.total) * 100);
+                        return (
+                          <div key={a.label} style={styles.areaRow}>
+                            <span style={styles.areaLabel}>{a.label}</span>
+                            <div style={styles.areaTrack}>
+                              <div
+                                style={{ ...styles.areaFill, width: `${p}%` }}
+                              />
+                            </div>
+                            <span style={styles.areaCount}>
+                              {a.done}/{a.total}
+                            </span>
+                          </div>
+                        );
+                      })}
+                    </div>
+                  </>
+                )}
+              </div>
+            );
+          })()}
         </div>
       )}
 
@@ -9507,6 +14787,7 @@ function ElioraApp() {
                   profile: profile ?? undefined,
                   events: events.length ? events : undefined,
                   missed: missed.length ? missed : undefined,
+                  mistakes: mistakes.length ? mistakes : undefined,
                 }}
                 renderItem={(s, i, drop) => (
                   <div key={i} style={styles.sugItem}>
@@ -9537,10 +14818,13 @@ function ElioraApp() {
               />
             </div>
           </div>
+          <PresentationPractice />
+          <ProjectGrader profile={profile} />
           <AssignmentFeedback
             subjects={subjects}
             profile={profile}
             initialPrompt={feedbackSeed}
+            onTrack={(m) => logMistake({ ...m, source: "feedback" })}
           />
         </div>
       )}
@@ -9582,9 +14866,22 @@ function ElioraApp() {
                     m.content,
                     m.role === "user" ? "#dff0e6" : "var(--accent)",
                   )
-                : busy
+                : busy && !(i === messages.length - 1 && chatStatus)
                   ? "…"
                   : ""}
+              {/* Live status while tools run — shown even under partial text,
+                  since the model often writes a preamble before its tools. */}
+              {busy && i === messages.length - 1 && chatStatus && (
+                <div
+                  style={{
+                    fontStyle: "italic",
+                    opacity: 0.75,
+                    marginTop: m.content ? 6 : 0,
+                  }}
+                >
+                  {chatStatus}
+                </div>
+              )}
             </div>
             {m.role === "assistant" && a11y.readAloud && m.content && (
               <button
@@ -9597,17 +14894,44 @@ function ElioraApp() {
             )}
             {m.videos && m.videos.length > 0 && <VideoCards videos={m.videos} />}
             {m.flashcards && m.flashcards.length > 0 && (
-              <FlashcardDeck cards={m.flashcards} onMissed={addMissed} />
+              <FlashcardDeck
+                cards={m.flashcards}
+                onMissed={addMissed}
+                onMistake={(c) =>
+                  logMistake({
+                    concept: c.front,
+                    fix: c.back,
+                    source: "quiz",
+                  })
+                }
+              />
             )}
             {m.quiz && m.quiz.length > 0 && (
               <QuizView
                 quiz={m.quiz}
                 onMissed={addMissed}
+                onMistake={(mk) => logMistake({ ...mk, source: "quiz" })}
                 onStudyGuide={studyGuideFromQuiz}
               />
             )}
           </div>
         ))}
+      </div>
+
+      <div style={styles.composerActions}>
+        <button
+          type="button"
+          style={styles.quickChip}
+          disabled={busy || !!pendingKickoff}
+          onClick={teachBackInChat}
+          title={
+            input.trim()
+              ? `Teach back “${input.trim()}”`
+              : "Teach a concept back to check your understanding"
+          }
+        >
+          🧑‍🏫 Teach it back
+        </button>
       </div>
 
       <div style={styles.composer}>
@@ -9642,8 +14966,12 @@ function ElioraApp() {
             {listening ? "⏹" : "🗣️"}
           </button>
         )}
-        <button onClick={() => send()} disabled={busy} style={styles.sendBtn}>
-          {busy ? "…" : "Send"}
+        <button
+          onClick={() => (busy ? stopReply() : send())}
+          style={styles.sendBtn}
+          aria-label={busy ? "Stop the reply" : "Send your message"}
+        >
+          {busy ? "⏹ Stop" : "Send"}
         </button>
       </div>
         </>
@@ -9918,6 +15246,108 @@ const styles: Record<string, React.CSSProperties> = {
     gridTemplateColumns: "repeat(4, 1fr)",
     gap: 8,
     marginTop: 8,
+  },
+  rewardItem: {
+    display: "flex",
+    alignItems: "center",
+    gap: 10,
+    padding: "9px 0",
+    borderTop: "1px solid var(--border)",
+  },
+  rewardEmoji: { fontSize: 22, flexShrink: 0, width: 26, textAlign: "center" },
+  rewardTitle: {
+    fontSize: 14,
+    fontWeight: 600,
+    color: "var(--assistant-text)",
+    whiteSpace: "nowrap",
+    overflow: "hidden",
+    textOverflow: "ellipsis",
+  },
+  rewardRedeemed: { fontSize: 12, fontWeight: 600, color: "var(--accent)" },
+  rewardTrack: {
+    marginTop: 5,
+    height: 6,
+    borderRadius: 6,
+    background: "var(--assistant-bubble)",
+    overflow: "hidden",
+  },
+  rewardFill: {
+    height: "100%",
+    background: "var(--accent)",
+    transition: "width 200ms ease",
+  },
+  rewardCost: {
+    flexShrink: 0,
+    fontSize: 12.5,
+    fontWeight: 700,
+    color: "var(--muted)",
+    minWidth: 46,
+    textAlign: "right",
+  },
+  rewardRedeemBtn: {
+    flexShrink: 0,
+    padding: "6px 12px",
+    borderRadius: 9,
+    border: "none",
+    background: "var(--accent)",
+    color: "#fff",
+    fontSize: 13,
+    fontWeight: 700,
+    cursor: "pointer",
+  },
+  rewardRedeemOff: {
+    background: "var(--assistant-bubble)",
+    color: "var(--muted)",
+    cursor: "not-allowed",
+  },
+  rewardAddBox: {
+    marginTop: 12,
+    paddingTop: 12,
+    borderTop: "1px solid var(--border)",
+  },
+  rewardEmojiRow: {
+    display: "flex",
+    flexWrap: "wrap",
+    gap: 4,
+    marginBottom: 8,
+  },
+  rewardEmojiPick: {
+    width: 32,
+    height: 32,
+    borderRadius: 8,
+    borderWidth: 1,
+    borderStyle: "solid",
+    borderColor: "var(--border)",
+    background: "var(--surface)",
+    fontSize: 17,
+    cursor: "pointer",
+    lineHeight: 1,
+  },
+  rewardEmojiPickOn: {
+    borderColor: "var(--accent)",
+    background: "var(--accent-soft)",
+  },
+  rewardAddRow: { display: "flex", gap: 8 },
+  rewardCostInput: {
+    width: 66,
+    flexShrink: 0,
+    padding: "9px 10px",
+    borderRadius: 10,
+    border: "1px solid var(--border)",
+    background: "var(--surface)",
+    color: "var(--assistant-text)",
+    fontSize: 14,
+  },
+  rewardAddBtn: {
+    flexShrink: 0,
+    padding: "9px 14px",
+    borderRadius: 10,
+    border: "none",
+    background: "var(--accent-soft)",
+    color: "var(--accent)",
+    fontSize: 14,
+    fontWeight: 700,
+    cursor: "pointer",
   },
   roomChip: {
     position: "relative",
@@ -10219,11 +15649,120 @@ const styles: Record<string, React.CSSProperties> = {
     background:
       "repeating-linear-gradient(45deg,var(--accent),var(--accent) 4px,var(--accent-hover) 4px,var(--accent-hover) 8px)",
   },
+  studyEmpty: {
+    fontSize: 12.5,
+    color: "var(--muted)",
+    background: "var(--assistant-bubble)",
+    borderRadius: 10,
+    padding: "12px 14px",
+    textAlign: "center" as const,
+  },
+  studyWeeks: {
+    display: "flex",
+    alignItems: "flex-end",
+    justifyContent: "space-between",
+    gap: 6,
+    height: 96,
+  },
+  studyWeekCol: {
+    flex: 1,
+    height: "100%",
+    display: "flex",
+    flexDirection: "column" as const,
+    alignItems: "center",
+    justifyContent: "flex-end",
+    gap: 3,
+  },
+  studyWeekVal: {
+    fontSize: 10.5,
+    fontWeight: 700,
+    color: "var(--accent)",
+    minHeight: 13,
+  },
+  studyWeekTrack: {
+    width: "100%",
+    flex: 1,
+    display: "flex",
+    alignItems: "flex-end",
+    borderRadius: 5,
+    background: "var(--assistant-bubble)",
+    overflow: "hidden",
+  },
+  studyWeekFill: {
+    width: "100%",
+    background: "var(--accent-soft)",
+    borderRadius: 5,
+    transition: "height 300ms ease",
+  },
+  studyWeekFillNow: {
+    background: "var(--accent)",
+  },
+  studyWeekLbl: {
+    fontSize: 10,
+    fontWeight: 600,
+    color: "var(--muted)",
+    whiteSpace: "nowrap" as const,
+  },
+  studyWeekLblNow: {
+    color: "var(--accent)",
+    fontWeight: 800,
+  },
   progGraph: {
     width: "100%",
     height: 70,
     display: "block",
     borderRadius: 8,
+  },
+  growthGain: {
+    marginLeft: 8,
+    fontSize: 11.5,
+    fontWeight: 700,
+    color: "var(--accent)",
+    background: "var(--accent-soft)",
+    borderRadius: 999,
+    padding: "2px 8px",
+  },
+  growthWrap: { display: "flex", alignItems: "stretch", gap: 6 },
+  growthYAxis: {
+    display: "flex",
+    flexDirection: "column",
+    justifyContent: "space-between",
+    height: 70,
+    fontSize: 10,
+    fontWeight: 600,
+    color: "var(--muted)",
+    textAlign: "right",
+    minWidth: 26,
+  },
+  growthPlot: { position: "relative", flex: 1, height: 70 },
+  growthDot: {
+    position: "absolute",
+    right: -4,
+    width: 9,
+    height: 9,
+    borderRadius: "50%",
+    background: "var(--accent)",
+    border: "2px solid var(--surface)",
+    transform: "translateY(-50%)",
+    boxShadow: "0 0 0 1px var(--accent)",
+  },
+  growthEmpty: {
+    position: "absolute",
+    top: "50%",
+    left: "50%",
+    transform: "translate(-50%,-50%)",
+    fontSize: 12,
+    color: "var(--muted)",
+    whiteSpace: "nowrap",
+  },
+  growthXAxis: {
+    display: "flex",
+    justifyContent: "space-between",
+    fontSize: 10,
+    fontWeight: 600,
+    color: "var(--muted)",
+    marginTop: 3,
+    marginLeft: 32,
   },
   stepsBtnRow: {
     display: "flex",
@@ -10805,6 +16344,144 @@ const styles: Record<string, React.CSSProperties> = {
     padding: 0,
     textDecoration: "underline",
   },
+  schedBuildRow: {
+    display: "flex",
+    alignItems: "center",
+    gap: 10,
+    flexWrap: "wrap",
+    marginBottom: 12,
+    paddingBottom: 12,
+    borderBottom: "1px solid var(--border)",
+  },
+  schedBuildLabel: {
+    display: "inline-flex",
+    alignItems: "center",
+    gap: 6,
+    fontSize: 13.5,
+    color: "var(--assistant-text)",
+  },
+  schedHomeSelect: {
+    fontSize: 14,
+    padding: "6px 8px",
+    borderRadius: 8,
+    border: "1px solid var(--border)",
+    background: "var(--surface)",
+    color: "var(--text)",
+    fontFamily: "inherit",
+  },
+  schedBuildBtn: {
+    background: "var(--accent)",
+    color: "#fff",
+    border: "none",
+    borderRadius: 10,
+    padding: "8px 14px",
+    fontSize: 14,
+    fontWeight: 700,
+    cursor: "pointer",
+  },
+  schedList: { display: "flex", flexDirection: "column", gap: 6 },
+  schedRow: {
+    display: "flex",
+    alignItems: "center",
+    gap: 10,
+    background: "var(--surface)",
+    borderRadius: 10,
+    padding: "6px 10px 6px 8px",
+  },
+  schedRowNow: {
+    background: "var(--accent-soft)",
+    boxShadow: "0 0 0 1px var(--accent)",
+  },
+  schedTime: {
+    flexShrink: 0,
+    width: 74,
+    fontSize: 12.5,
+    fontWeight: 700,
+    color: "var(--muted)",
+    display: "flex",
+    flexDirection: "column",
+    lineHeight: 1.15,
+  },
+  schedNowDot: {
+    fontSize: 10,
+    fontWeight: 800,
+    color: "var(--accent)",
+    textTransform: "uppercase",
+    letterSpacing: 0.4,
+  },
+  schedKind: {
+    flexShrink: 0,
+    background: "transparent",
+    border: "none",
+    fontSize: 18,
+    lineHeight: 1,
+    cursor: "pointer",
+    padding: 2,
+    borderRadius: 6,
+  },
+  schedInput: {
+    flex: 1,
+    minWidth: 0,
+    fontSize: 14.5,
+    padding: "7px 8px",
+    borderRadius: 8,
+    border: "1px solid transparent",
+    background: "transparent",
+    color: "var(--text)",
+    fontFamily: "inherit",
+  },
+  schedTimerStart: {
+    flexShrink: 0,
+    background: "transparent",
+    border: "none",
+    fontSize: 16,
+    lineHeight: 1,
+    cursor: "pointer",
+    padding: 4,
+    borderRadius: 6,
+    opacity: 0.55,
+    color: "var(--muted)",
+  },
+  schedTimer: {
+    flexShrink: 0,
+    display: "flex",
+    alignItems: "center",
+    gap: 4,
+    background: "var(--accent-soft)",
+    borderRadius: 999,
+    padding: "2px 4px 2px 6px",
+  },
+  schedTimerBtn: {
+    background: "transparent",
+    border: "none",
+    fontSize: 13,
+    lineHeight: 1,
+    cursor: "pointer",
+    padding: "2px 3px",
+    borderRadius: 6,
+    color: "var(--accent)",
+  },
+  schedTimerTime: {
+    fontSize: 13,
+    fontWeight: 700,
+    fontVariantNumeric: "tabular-nums",
+    color: "var(--accent)",
+    minWidth: 38,
+    textAlign: "center" as const,
+  },
+  schedTimerDone: {
+    color: "#2f6f4f",
+  },
+  schedTimerClear: {
+    background: "transparent",
+    border: "none",
+    fontSize: 11,
+    lineHeight: 1,
+    cursor: "pointer",
+    padding: "2px 3px",
+    borderRadius: 6,
+    color: "var(--muted)",
+  },
   topicRow: { display: "flex", gap: 8 },
   topicInput: {
     flex: 1,
@@ -10893,6 +16570,72 @@ const styles: Record<string, React.CSSProperties> = {
   },
   planList: { display: "flex", flexDirection: "column", gap: 4 },
   planRow: { display: "flex", alignItems: "flex-start", gap: 2 },
+  planRowAction: {
+    flexShrink: 0,
+    background: "transparent",
+    border: "none",
+    color: "var(--muted)",
+    fontSize: 15,
+    lineHeight: 1,
+    cursor: "pointer",
+    padding: "6px 6px",
+    borderRadius: 6,
+  },
+  planEditRow: {
+    display: "flex",
+    flexDirection: "column",
+    gap: 8,
+    background: "var(--surface)",
+    border: "1px solid var(--border)",
+    borderRadius: 10,
+    padding: "10px 12px",
+    margin: "2px 0",
+  },
+  planEditInput: {
+    fontSize: 15,
+    padding: "8px 10px",
+    borderRadius: 8,
+    border: "1px solid var(--border)",
+    background: "var(--bg)",
+    color: "var(--text)",
+    fontFamily: "inherit",
+    width: "100%",
+    boxSizing: "border-box",
+  },
+  planEditControls: {
+    display: "flex",
+    alignItems: "center",
+    gap: 8,
+    flexWrap: "wrap",
+  },
+  planEditCheckpoint: {
+    display: "inline-flex",
+    alignItems: "center",
+    gap: 6,
+    fontSize: 13,
+    color: "var(--assistant-text)",
+    cursor: "pointer",
+  },
+  planEditCancel: {
+    background: "transparent",
+    border: "1px solid var(--border)",
+    color: "var(--muted)",
+    borderRadius: 8,
+    padding: "6px 14px",
+    fontSize: 14,
+    fontWeight: 600,
+    cursor: "pointer",
+  },
+  planEditSave: {
+    background: "var(--accent)",
+    border: "none",
+    color: "#fff",
+    borderRadius: 8,
+    padding: "6px 16px",
+    fontSize: 14,
+    fontWeight: 700,
+    cursor: "pointer",
+  },
   checkpointBadge: {
     display: "inline-block",
     fontSize: 11,
@@ -11000,6 +16743,70 @@ const styles: Record<string, React.CSSProperties> = {
     fontSize: 16,
     lineHeight: 1.6,
     color: "var(--assistant-text)",
+  },
+  resultMd: { fontSize: 16, lineHeight: 1.6, color: "var(--assistant-text)" },
+  qaBox: {
+    borderTop: "1px solid var(--border)",
+    paddingTop: 12,
+    display: "flex",
+    flexDirection: "column",
+    gap: 10,
+  },
+  qaHead: { fontSize: 14, fontWeight: 700, color: "var(--accent)" },
+  qaUser: {
+    alignSelf: "flex-end",
+    maxWidth: "85%",
+    background: "var(--user-bubble)",
+    color: "var(--user-text)",
+    padding: "8px 12px",
+    borderRadius: 12,
+    fontSize: 15,
+  },
+  qaBot: {
+    alignSelf: "flex-start",
+    maxWidth: "95%",
+    background: "var(--assistant-bubble)",
+    color: "var(--assistant-text)",
+    padding: "8px 12px",
+    borderRadius: 12,
+    fontSize: 15,
+  },
+  qaInputRow: { display: "flex", gap: 8, alignItems: "center" },
+  mdH2: {
+    fontSize: 18,
+    fontWeight: 800,
+    color: "var(--accent)",
+    margin: "14px 0 4px",
+  },
+  mdH3: {
+    fontSize: 15.5,
+    fontWeight: 700,
+    color: "var(--assistant-text)",
+    margin: "10px 0 2px",
+  },
+  mdP: { margin: "4px 0" },
+  // Highlighted key idea (==like this== in the AI notes) — a soft marker-pen
+  // wash so the most important takeaways pop when scanning.
+  mdMark: {
+    background: "var(--highlight, rgba(255, 213, 79, 0.38))",
+    color: "inherit",
+    padding: "0 3px",
+    borderRadius: 4,
+    fontWeight: 600,
+    boxDecorationBreak: "clone",
+    WebkitBoxDecorationBreak: "clone",
+  },
+  mdBullet: {
+    display: "flex",
+    gap: 8,
+    margin: "3px 0",
+    alignItems: "flex-start",
+  },
+  mdBulletMark: {
+    flexShrink: 0,
+    color: "var(--accent)",
+    fontWeight: 700,
+    minWidth: 14,
   },
   outputLabel: { fontSize: 14, color: "var(--muted)", marginTop: 4 },
   outputRow: { display: "flex", flexWrap: "wrap", gap: 6 },
@@ -11583,6 +17390,108 @@ const styles: Record<string, React.CSSProperties> = {
     gap: 12,
     paddingBottom: 16,
   },
+  practiceStage: {
+    position: "relative",
+    width: "100%",
+    aspectRatio: "16 / 9",
+    background: "#000",
+    borderRadius: 16,
+    overflow: "hidden",
+    border: "1px solid var(--border)",
+  },
+  practiceVideo: {
+    width: "100%",
+    height: "100%",
+    objectFit: "cover",
+    borderRadius: 16,
+    background: "#000",
+    transform: "scaleX(-1)",
+  },
+  practiceAudioBox: {
+    width: "100%",
+    height: "100%",
+    display: "flex",
+    flexDirection: "column",
+    alignItems: "center",
+    justifyContent: "center",
+    gap: 10,
+    background: "var(--surface)",
+  },
+  practiceAudioIcon: { fontSize: 52 },
+  practiceRecDot: {
+    position: "absolute",
+    top: 12,
+    left: 12,
+    display: "flex",
+    alignItems: "center",
+    gap: 8,
+    background: "rgba(0,0,0,0.55)",
+    color: "#fff",
+    fontSize: 14,
+    fontWeight: 700,
+    padding: "6px 12px",
+    borderRadius: 999,
+  },
+  practiceRecPulse: {
+    width: 10,
+    height: 10,
+    borderRadius: "50%",
+    background: "#ff4d4f",
+    animation: "pulse 1s ease-in-out infinite",
+  },
+  practiceTeleprompter: {
+    position: "absolute",
+    left: 0,
+    right: 0,
+    bottom: 0,
+    maxHeight: "45%",
+    overflowY: "auto",
+    padding: "14px 18px",
+    background: "linear-gradient(transparent, rgba(0,0,0,0.75))",
+    color: "#fff",
+    fontSize: 18,
+    lineHeight: 1.5,
+    whiteSpace: "pre-wrap",
+  },
+  practiceToggle: {
+    display: "flex",
+    alignItems: "center",
+    gap: 8,
+    fontSize: 15,
+    color: "var(--muted)",
+    cursor: "pointer",
+  },
+  practiceControls: {
+    display: "flex",
+    flexWrap: "wrap",
+    gap: 10,
+    alignItems: "center",
+  },
+  practiceStopBtn: {
+    background: "#ff4d4f",
+    color: "#fff",
+    border: "none",
+    borderRadius: 14,
+    padding: "14px 22px",
+    fontSize: 17,
+    fontWeight: 600,
+    cursor: "pointer",
+  },
+  practiceTakeRow: { display: "flex", flexWrap: "wrap", gap: 8 },
+  practiceTakeChip: {
+    background: "var(--surface)",
+    border: "1px solid var(--border)",
+    borderRadius: 999,
+    padding: "8px 14px",
+    fontSize: 14,
+    cursor: "pointer",
+    color: "var(--text)",
+  },
+  practiceTakeChipActive: {
+    background: "var(--accent)",
+    color: "#fff",
+    border: "1px solid var(--accent)",
+  },
   planStrip: {
     background: "var(--surface)",
     border: "1px solid var(--accent)",
@@ -11622,6 +17531,175 @@ const styles: Record<string, React.CSSProperties> = {
     display: "inline-block",
   },
   planStripDone: { fontSize: 15, color: "var(--assistant-text)" },
+  // ----- Mistake tracker (Home dashboard strip) -----
+  mtStrip: {
+    background: "var(--surface)",
+    border: "1px solid var(--accent)",
+    borderRadius: 14,
+    padding: "10px 14px",
+    marginBottom: 8,
+  },
+  mtEmptyBtn: {
+    width: "100%",
+    textAlign: "left",
+    background: "transparent",
+    border: "none",
+    cursor: "pointer",
+    fontSize: 14,
+    fontWeight: 600,
+    color: "var(--accent)",
+    padding: 0,
+  },
+  mtHead: {
+    display: "flex",
+    alignItems: "center",
+    justifyContent: "space-between",
+    marginBottom: 6,
+  },
+  mtLabel: { fontSize: 14, fontWeight: 700, color: "var(--accent)" },
+  mtTop: {
+    display: "flex",
+    alignItems: "center",
+    gap: 10,
+    width: "100%",
+    textAlign: "left",
+    background: "transparent",
+    border: "none",
+    cursor: "pointer",
+    fontSize: 16,
+    color: "var(--assistant-text)",
+    padding: 0,
+  },
+  mtCount: {
+    flexShrink: 0,
+    fontSize: 12,
+    fontWeight: 700,
+    color: "#c0392b",
+    background: "#fbeae8",
+    borderRadius: 8,
+    padding: "2px 8px",
+    whiteSpace: "nowrap",
+  },
+  mtList: { marginTop: 4 },
+  mtItem: {
+    padding: "10px 12px",
+    borderRadius: 12,
+    border: "1px solid var(--border)",
+    background: "var(--bg)",
+    marginBottom: 8,
+  },
+  mtItemTop: {
+    display: "flex",
+    alignItems: "center",
+    justifyContent: "space-between",
+    gap: 8,
+  },
+  mtItemTitle: {
+    fontSize: 14.5,
+    fontWeight: 600,
+    color: "var(--assistant-text)",
+  },
+  mtItemMeta: {
+    marginTop: 4,
+    fontSize: 13,
+    color: "var(--muted)",
+    lineHeight: 1.5,
+  },
+  mtChip: {
+    display: "inline-block",
+    padding: "1px 8px",
+    borderRadius: 999,
+    background: "var(--assistant-bubble)",
+    color: "var(--assistant-text)",
+    fontSize: 11.5,
+    fontWeight: 600,
+    marginRight: 6,
+  },
+  mtWhy: { fontStyle: "italic" },
+  mtFix: { marginTop: 3, color: "var(--accent)", fontWeight: 600 },
+  mtBtnRow: { display: "flex", gap: 6, marginTop: 8 },
+  mtReviewBtn: {
+    flex: 1,
+    padding: "6px 10px",
+    borderRadius: 8,
+    border: "none",
+    background: "var(--accent)",
+    color: "#fff",
+    fontSize: 13,
+    fontWeight: 600,
+    cursor: "pointer",
+  },
+  mtGotBtn: {
+    flexShrink: 0,
+    padding: "6px 10px",
+    borderRadius: 8,
+    border: "1px solid var(--accent)",
+    background: "transparent",
+    color: "var(--accent)",
+    fontSize: 13,
+    fontWeight: 600,
+    cursor: "pointer",
+  },
+  mtRemoveBtn: {
+    flexShrink: 0,
+    width: 28,
+    borderRadius: 8,
+    border: "1px solid var(--border)",
+    background: "transparent",
+    color: "var(--muted)",
+    fontSize: 13,
+    cursor: "pointer",
+  },
+  mtAddRow: { display: "flex", gap: 6, marginTop: 4 },
+  mtInput: {
+    flex: 1,
+    minWidth: 0,
+    padding: "8px 10px",
+    borderRadius: 8,
+    border: "1px solid var(--border)",
+    background: "var(--surface)",
+    color: "var(--assistant-text)",
+    fontSize: 13.5,
+  },
+  mtInputSm: {
+    width: 92,
+    flexShrink: 0,
+    padding: "8px 10px",
+    borderRadius: 8,
+    border: "1px solid var(--border)",
+    background: "var(--surface)",
+    color: "var(--assistant-text)",
+    fontSize: 13.5,
+  },
+  mtAddBtn: {
+    flexShrink: 0,
+    padding: "8px 14px",
+    borderRadius: 8,
+    border: "none",
+    background: "var(--accent)",
+    color: "#fff",
+    fontSize: 13.5,
+    fontWeight: 600,
+    cursor: "pointer",
+  },
+  mtResolvedBox: { marginTop: 4 },
+  mtResolvedToggle: {
+    background: "transparent",
+    border: "none",
+    cursor: "pointer",
+    fontSize: 13,
+    fontWeight: 600,
+    color: "var(--muted)",
+    padding: "4px 0",
+  },
+  mtResolvedItem: {
+    display: "flex",
+    alignItems: "center",
+    gap: 8,
+    fontSize: 13.5,
+    color: "var(--muted)",
+    padding: "4px 0",
+  },
   chatTabs: {
     display: "flex",
     gap: 6,
@@ -11727,6 +17805,128 @@ const styles: Record<string, React.CSSProperties> = {
     WebkitBoxOrient: "vertical",
   } as React.CSSProperties,
   videoChannel: { display: "block", fontSize: 12, color: "var(--muted)", marginTop: 4 },
+  // Video feed tab
+  feedGrid: {
+    display: "grid",
+    gridTemplateColumns: "repeat(auto-fill, minmax(240px, 1fr))",
+    gap: 14,
+    marginTop: 12,
+  },
+  feedCard: {
+    background: "var(--surface)",
+    border: "1px solid var(--border)",
+    borderRadius: 14,
+    overflow: "hidden",
+    display: "flex",
+    flexDirection: "column",
+  },
+  feedThumbBtn: {
+    position: "relative",
+    display: "block",
+    width: "100%",
+    padding: 0,
+    border: "none",
+    background: "none",
+    cursor: "pointer",
+  },
+  feedPlayBadge: {
+    position: "absolute",
+    inset: 0,
+    display: "flex",
+    alignItems: "center",
+    justifyContent: "center",
+    fontSize: 34,
+    color: "#fff",
+    textShadow: "0 2px 10px rgba(0,0,0,0.6)",
+  },
+  feedPlayer: {
+    width: "100%",
+    aspectRatio: "16 / 9",
+    border: "none",
+    display: "block",
+  },
+  feedCardFoot: {
+    display: "flex",
+    alignItems: "center",
+    justifyContent: "space-between",
+    gap: 8,
+    marginTop: 6,
+  },
+  feedTopicTag: {
+    fontSize: 11,
+    fontWeight: 600,
+    color: "var(--muted)",
+    background: "var(--chip, rgba(0,0,0,0.06))",
+    border: "1px solid var(--border)",
+    borderRadius: 999,
+    padding: "2px 8px",
+    overflow: "hidden",
+    textOverflow: "ellipsis",
+    whiteSpace: "nowrap",
+  },
+  feedYtLink: {
+    fontSize: 12,
+    color: "var(--muted)",
+    textDecoration: "none",
+    whiteSpace: "nowrap",
+  },
+  feedSearchRow: { display: "flex", gap: 8, marginTop: 10 },
+  feedSearchInput: {
+    flex: 1,
+    minWidth: 0,
+    padding: "8px 12px",
+    borderRadius: 10,
+    border: "1px solid var(--border)",
+    background: "var(--surface)",
+    color: "inherit",
+    fontSize: 14,
+  },
+  feedSearchBtn: {
+    padding: "8px 14px",
+    borderRadius: 10,
+    border: "1px solid var(--border)",
+    background: "var(--accent, #6c5ce7)",
+    color: "#fff",
+    fontWeight: 600,
+    fontSize: 14,
+    cursor: "pointer",
+  },
+  feedRefresh: {
+    padding: "6px 12px",
+    borderRadius: 10,
+    border: "1px solid var(--border)",
+    background: "var(--surface)",
+    color: "inherit",
+    fontSize: 13,
+    cursor: "pointer",
+    whiteSpace: "nowrap",
+  },
+  feedChips: {
+    display: "flex",
+    flexWrap: "wrap",
+    gap: 6,
+    marginTop: 10,
+  },
+  feedChip: {
+    padding: "5px 12px",
+    borderRadius: 999,
+    border: "1px solid var(--border)",
+    background: "var(--surface)",
+    color: "inherit",
+    fontSize: 13,
+    cursor: "pointer",
+  },
+  feedChipActive: {
+    background: "var(--accent, #6c5ce7)",
+    border: "1px solid var(--accent, #6c5ce7)",
+    color: "#fff",
+    fontWeight: 600,
+  },
+  feedEmpty: {
+    marginTop: 12,
+    fontSize: 14,
+    color: "var(--muted)",
+  },
   bubble: {
     maxWidth: "min(86%, 680px)",
     padding: "14px 18px",
@@ -11787,6 +17987,18 @@ const styles: Record<string, React.CSSProperties> = {
     justifyContent: "space-between",
     gap: 8,
     marginTop: 10,
+  },
+  flashShareRow: {
+    display: "flex",
+    justifyContent: "center",
+    marginTop: 10,
+  },
+  shareModalActions: {
+    display: "flex",
+    gap: 10,
+    justifyContent: "center",
+    marginTop: 6,
+    flexWrap: "wrap",
   },
   quizQ: { fontWeight: 600, fontSize: 16, marginBottom: 6, color: "var(--assistant-text)" },
   quizOpt: {
@@ -11854,6 +18066,24 @@ const styles: Record<string, React.CSSProperties> = {
   },
   assignEmpty: { color: "var(--muted)", fontSize: 14, margin: "10px 0 2px" },
   subjectsCount: { fontSize: 14, color: "var(--muted)" },
+  monthNavBtn: {
+    width: 30,
+    height: 30,
+    borderRadius: 8,
+    border: "1px solid var(--border)",
+    background: "var(--bg)",
+    color: "var(--text)",
+    fontSize: 18,
+    lineHeight: 1,
+    cursor: "pointer",
+    display: "flex",
+    alignItems: "center",
+    justifyContent: "center",
+  },
+  monthNavBtnOff: {
+    opacity: 0.4,
+    cursor: "default",
+  },
   assignItem: {
     display: "flex",
     alignItems: "center",
@@ -11887,6 +18117,14 @@ const styles: Record<string, React.CSSProperties> = {
     textDecoration: "line-through",
   },
   assignMeta: { fontSize: 12.5, color: "var(--muted)", marginTop: 2 },
+  assignDeadline: {
+    fontSize: 12.5,
+    fontWeight: 600,
+    color: "var(--muted)",
+    marginTop: 3,
+  },
+  assignDeadlineUrgent: { color: "var(--accent)" },
+  assignDeadlineOverdue: { color: "var(--danger, #e05252)" },
   assignRemove: {
     flexShrink: 0,
     background: "transparent",
@@ -11895,6 +18133,34 @@ const styles: Record<string, React.CSSProperties> = {
     fontSize: 20,
     lineHeight: 1,
     cursor: "pointer",
+  },
+  concernAdd: {
+    marginTop: 5,
+    background: "transparent",
+    border: "none",
+    padding: 0,
+    color: "var(--muted)",
+    fontSize: 12.5,
+    cursor: "pointer",
+  },
+  concernRow: {
+    display: "flex",
+    alignItems: "center",
+    gap: 6,
+    marginTop: 5,
+  },
+  concernIcon: { fontSize: 13, flexShrink: 0 },
+  concernInput: {
+    flex: 1,
+    minWidth: 0,
+    borderWidth: 1,
+    borderStyle: "solid",
+    borderColor: "var(--border)",
+    borderRadius: 8,
+    padding: "3px 8px",
+    fontSize: 12.5,
+    background: "var(--surface)",
+    color: "var(--assistant-text)",
   },
   // SMART goals
   goalField: { display: "block", marginTop: 10 },
@@ -11922,10 +18188,12 @@ const styles: Record<string, React.CSSProperties> = {
   },
   goalHint: { display: "block", fontSize: 12, color: "var(--muted)", marginTop: 3 },
   goalItem: {
-    padding: "7px 0",
-    borderTopWidth: 1,
-    borderTopStyle: "solid",
-    borderTopColor: "var(--border)",
+    padding: "11px 13px",
+    borderRadius: 12,
+    border: "1px solid var(--border)",
+    background: "var(--surface)",
+    boxShadow: "var(--shadow-e1)",
+    marginBottom: 8,
   },
   goalTop: { display: "flex", alignItems: "flex-start", gap: 8 },
   goalTitle: { fontSize: 14, fontWeight: 600, color: "var(--assistant-text)" },
@@ -12048,7 +18316,75 @@ const styles: Record<string, React.CSSProperties> = {
     cursor: "pointer",
     whiteSpace: "nowrap",
   },
-  goalGroup: { marginTop: 4 },
+  goalAchStrip: {
+    marginTop: 10,
+    marginBottom: 4,
+    padding: "12px 12px 10px",
+    borderRadius: 12,
+    background: "var(--accent-soft)",
+    border: "1px solid var(--border)",
+  },
+  goalAchHead: {
+    display: "flex",
+    alignItems: "center",
+    justifyContent: "space-between",
+    gap: 8,
+    marginBottom: 10,
+  },
+  goalAchTitle: { fontSize: 13, fontWeight: 800, color: "var(--accent)" },
+  goalAchRow: {
+    display: "flex",
+    gap: 10,
+    overflowX: "auto",
+    paddingBottom: 2,
+  },
+  goalAchItem: {
+    display: "flex",
+    flexDirection: "column",
+    alignItems: "center",
+    gap: 4,
+    width: 62,
+    flexShrink: 0,
+  },
+  goalAchMedal: {
+    width: 40,
+    height: 40,
+    borderRadius: 999,
+    display: "flex",
+    alignItems: "center",
+    justifyContent: "center",
+    fontSize: 20,
+    color: "#fff",
+    border: "2px solid rgba(255,255,255,0.55)",
+    boxShadow: "0 2px 6px rgba(0,0,0,0.18)",
+  },
+  goalAchLabel: {
+    fontSize: 10,
+    fontWeight: 700,
+    lineHeight: 1.15,
+    textAlign: "center",
+    color: "var(--assistant-text)",
+  },
+  goalGroup: { marginTop: 16 },
+  goalGroupHeadRow: {
+    display: "flex",
+    alignItems: "center",
+    justifyContent: "space-between",
+    gap: 8,
+    marginBottom: 8,
+  },
+  goalGroupCount: {
+    flexShrink: 0,
+    fontSize: 12,
+    fontWeight: 700,
+    color: "var(--muted)",
+    background: "var(--assistant-bubble)",
+    borderRadius: 999,
+    padding: "2px 9px",
+    minWidth: 22,
+    textAlign: "center",
+  },
+  goalGroupCountOn: { color: "#fff", background: "var(--accent)" },
   goalAchievedToggle: {
     width: "100%",
     textAlign: "left",
@@ -12065,13 +18401,15 @@ const styles: Record<string, React.CSSProperties> = {
     cursor: "pointer",
   },
   goalGroupHead: {
-    fontSize: 11.5,
+    display: "inline-block",
+    fontSize: 12,
     fontWeight: 800,
     color: "var(--accent)",
     textTransform: "uppercase",
     letterSpacing: 0.4,
-    marginTop: 8,
-    marginBottom: 1,
+    background: "var(--assistant-bubble)",
+    padding: "4px 11px",
+    borderRadius: 999,
   },
   // Short-term group: a big highlighted card so the "do now" goals stand out.
   goalGroupHighlight: {
@@ -12086,15 +18424,14 @@ const styles: Record<string, React.CSSProperties> = {
   },
   goalGroupHeadHighlight: {
     display: "inline-block",
-    fontSize: 13,
+    fontSize: 12.5,
     fontWeight: 800,
     letterSpacing: 0.3,
+    textTransform: "uppercase",
     color: "#fff",
     background: "var(--accent)",
-    padding: "4px 10px",
+    padding: "4px 11px",
     borderRadius: 999,
-    marginTop: 2,
-    marginBottom: 4,
   },
   horizonRow: { display: "flex", gap: 6 },
   horizonBtn: {
@@ -12200,6 +18537,94 @@ const styles: Record<string, React.CSSProperties> = {
     fontWeight: 600,
     cursor: "pointer",
   },
+  notifBadge: {
+    position: "absolute",
+    top: -5,
+    right: -5,
+    minWidth: 17,
+    height: 17,
+    padding: "0 4px",
+    borderRadius: 9,
+    background: "#d9534f",
+    color: "#fff",
+    fontSize: 11,
+    fontWeight: 700,
+    lineHeight: "17px",
+    textAlign: "center",
+    pointerEvents: "none",
+  },
+  topNotifWrap: {
+    position: "fixed",
+    top: 14,
+    right: 18,
+    zIndex: 45,
+  },
+  topNotifBtn: {
+    position: "relative",
+    width: 40,
+    height: 40,
+    borderRadius: 12,
+    borderWidth: 1,
+    borderStyle: "solid",
+    borderColor: "var(--border)",
+    background: "var(--bg)",
+    boxShadow: "0 2px 8px rgba(0,0,0,0.10)",
+    fontSize: 18,
+    lineHeight: "38px",
+    cursor: "pointer",
+  },
+  topNotifPanel: {
+    position: "absolute",
+    top: 48,
+    right: 0,
+    width: 300,
+    maxHeight: 360,
+    overflowY: "auto",
+    padding: "10px 12px",
+    borderRadius: 12,
+    borderWidth: 1,
+    borderStyle: "solid",
+    borderColor: "var(--border)",
+    background: "var(--bg)",
+    boxShadow: "0 8px 24px rgba(0,0,0,0.18)",
+    zIndex: 46,
+  },
+  notifPanel: {
+    position: "absolute",
+    bottom: 44,
+    left: 0,
+    width: 300,
+    maxHeight: 360,
+    overflowY: "auto",
+    padding: "10px 12px",
+    borderRadius: 12,
+    borderWidth: 1,
+    borderStyle: "solid",
+    borderColor: "var(--border)",
+    background: "var(--bg)",
+    boxShadow: "0 8px 24px rgba(0,0,0,0.18)",
+    zIndex: 40,
+  },
+  notifHead: {
+    display: "flex",
+    alignItems: "center",
+    gap: 8,
+    justifyContent: "space-between",
+    paddingBottom: 6,
+  },
+  notifClose: {
+    border: "none",
+    background: "transparent",
+    color: "var(--muted)",
+    fontSize: 18,
+    lineHeight: 1,
+    cursor: "pointer",
+  },
+  notifEmpty: {
+    margin: "8px 0 4px",
+    color: "var(--muted)",
+    fontSize: 14,
+  },
   reminderRow: {
     display: "flex",
     alignItems: "center",
@@ -12290,6 +18715,24 @@ const styles: Record<string, React.CSSProperties> = {
     borderRadius: 10,
     padding: "0 16px",
     fontSize: 15,
+    fontWeight: 600,
+    cursor: "pointer",
+  },
+  composerActions: {
+    display: "flex",
+    flexWrap: "wrap",
+    gap: 6,
+    padding: "8px 0 0",
+  },
+  quickChip: {
+    padding: "5px 12px",
+    borderRadius: 999,
+    borderWidth: 1,
+    borderStyle: "solid",
+    borderColor: "var(--border)",
+    background: "var(--surface)",
+    color: "var(--assistant-text)",
+    fontSize: 13,
     fontWeight: 600,
     cursor: "pointer",
   },
@@ -12731,6 +19174,26 @@ const styles: Record<string, React.CSSProperties> = {
     fontSize: 13.5,
     fontWeight: 600,
   },
+  taskBudget: {
+    margin: "2px 0 10px",
+    padding: "8px 12px",
+    borderRadius: 10,
+    background: "var(--accent-soft)",
+    color: "var(--accent)",
+    fontSize: 13.5,
+    fontWeight: 600,
+  },
+  // Motivational nudge shown above the day's task list; copy shifts with progress.
+  taskCheer: {
+    margin: "2px 0 10px",
+    padding: "9px 12px",
+    borderRadius: 10,
+    background: "var(--accent-soft)",
+    color: "var(--accent)",
+    fontSize: 13.5,
+    fontWeight: 600,
+    lineHeight: 1.35,
+  },
   timeRow: {
     display: "flex",
     alignItems: "center",
@@ -12760,6 +19223,44 @@ const styles: Record<string, React.CSSProperties> = {
     color: "var(--assistant-text)",
   },
   timeLabel: { fontSize: 12, color: "var(--muted)" },
+  // Split-by-priority control row above the task list.
+  budgetSplit: {
+    display: "flex",
+    alignItems: "center",
+    gap: 6,
+    flexWrap: "wrap",
+    margin: "0 0 10px",
+  },
+  budgetSplitLabel: { fontSize: 12.5, color: "var(--muted)" },
+  budgetSplitBtn: {
+    borderWidth: 1,
+    borderStyle: "solid",
+    borderColor: "var(--accent)",
+    borderRadius: 999,
+    padding: "4px 12px",
+    fontSize: 12.5,
+    fontWeight: 700,
+    cursor: "pointer",
+    background: "var(--accent-soft)",
+    color: "var(--accent)",
+  },
+  // Priority badge + title on one line; badge is a tap-to-cycle button.
+  taskTitleRow: { display: "flex", alignItems: "center", gap: 8 },
+  prioBadge: {
+    flex: "0 0 auto",
+    borderWidth: 0,
+    borderRadius: 999,
+    padding: "2px 9px",
+    fontSize: 11,
+    fontWeight: 800,
+    letterSpacing: 0.3,
+    textTransform: "uppercase",
+    cursor: "pointer",
+    lineHeight: 1.4,
+  },
+  prio_high: { background: "#fde2e1", color: "#c0392b" },
+  prio_med: { background: "#fdeecb", color: "#b8860b" },
+  prio_low: { background: "#e2eef3", color: "#3a6d86" },
   // "Review your work?" banner
   reviewBanner: {
     display: "flex",
@@ -12832,6 +19333,25 @@ const styles: Record<string, React.CSSProperties> = {
     color: "var(--assistant-text)",
     lineHeight: 1.5,
     marginBottom: 3,
+  },
+  afbImproveRow: {
+    display: "flex",
+    alignItems: "flex-start",
+    gap: 8,
+    marginBottom: 3,
+  },
+  afbTrackBtn: {
+    flexShrink: 0,
+    marginTop: 1,
+    padding: "3px 10px",
+    borderRadius: 999,
+    border: "1px solid var(--accent)",
+    background: "transparent",
+    color: "var(--accent)",
+    fontSize: 12,
+    fontWeight: 600,
+    cursor: "pointer",
+    whiteSpace: "nowrap",
   },
   afbStats: {
     display: "flex",
@@ -12968,6 +19488,21 @@ const styles: Record<string, React.CSSProperties> = {
     fontSize: 13,
     color: "var(--assistant-text)",
   },
+  fypGradeUpload: {
+    display: "block",
+    marginTop: 12,
+    paddingTop: 12,
+    borderTop: "1px solid var(--border)",
+  },
+  fypGradeUploadHead: {
+    fontSize: 13.5,
+    fontWeight: 700,
+    color: "var(--accent)",
+  },
+  fypGradeUploadHint: {
+    fontWeight: 400,
+    color: "var(--muted)",
+  },
   fypDocList: { display: "flex", flexWrap: "wrap", gap: 8, marginTop: 8 },
   fypDocChip: {
     display: "inline-flex",
@@ -13042,6 +19577,54 @@ const styles: Record<string, React.CSSProperties> = {
     marginRight: 4,
   },
   fypGpaSub: { color: "var(--muted)", fontWeight: 500 },
+  fypProjBox: {
+    marginTop: 12,
+    paddingTop: 12,
+    borderTop: "1px solid var(--border)",
+  },
+  fypProjHead: {
+    display: "flex",
+    alignItems: "center",
+    justifyContent: "space-between",
+    gap: 8,
+    flexWrap: "wrap",
+  },
+  fypProjTitle: { fontSize: 13.5, fontWeight: 700, color: "var(--text)" },
+  fypProjAssume: {
+    display: "inline-flex",
+    alignItems: "center",
+    gap: 5,
+    fontSize: 12.5,
+    color: "var(--muted)",
+  },
+  fypProjSelect: {
+    fontSize: 12.5,
+    padding: "3px 6px",
+    borderRadius: 7,
+    border: "1px solid var(--border)",
+    background: "var(--surface)",
+    color: "var(--text)",
+    fontFamily: "inherit",
+  },
+  fypProjGoalRow: {
+    display: "flex",
+    alignItems: "center",
+    justifyContent: "space-between",
+    gap: 8,
+    marginTop: 10,
+    fontSize: 13,
+    color: "var(--assistant-text)",
+  },
+  fypProjGoalInput: {
+    width: 84,
+    fontSize: 14,
+    padding: "6px 8px",
+    borderRadius: 8,
+    border: "1px solid var(--border)",
+    background: "var(--surface)",
+    color: "var(--text)",
+    fontFamily: "inherit",
+  },
   fypReqLegend: {
     fontSize: 11,
     color: "var(--muted)",

@@ -10,5 +10,9 @@
   "scripts": {
     "web": "npm --workspace @eliora/web run dev",
     "mobile": "npm --workspace @eliora/mobile run start"
+  },
+  "//": "styled-jsx is pinned at the root to a version that conflicts with Next.js's (5.1.6), forcing npm to nest Next's copy under apps/web/node_modules where it resolves the web app's React 19 instead of the root React 18 hoisted from the Expo app. Without this, `next build` fails prerendering /404 with a useContext-of-null error.",
+  "devDependencies": {
+    "styled-jsx": "5.0.7"
   }
 }

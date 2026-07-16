@@ -328,6 +328,7 @@ type SmartGoal = {
   current?: number;
   statement?: string; // AI-composed one-sentence version of the answers
   tasks?: GoalTask[]; // checklist of steps to achieve the goal
+  rewardId?: string; // a custom reward unlocked free when this goal is achieved
   done: boolean;
 };
 
@@ -2071,6 +2072,8 @@ function GoalsPanel({
   onToggleTask,
   onHelpTask,
   breakingGoalId,
+  rewards,
+  onLinkReward,
 }: {
   goals: SmartGoal[];
   subjects: string[];
@@ -2085,6 +2088,8 @@ function GoalsPanel({
   onToggleTask: (goalId: string, index: number) => void;
   onHelpTask: (goal: SmartGoal, taskTitle: string) => void;
   breakingGoalId: string | null;
+  rewards: CustomReward[];
+  onLinkReward: (goalId: string, rewardId: string | undefined) => void;
 }) {
   const [building, setBuilding] = useState(false);
   const [showDone, setShowDone] = useState(false);
@@ -2284,6 +2289,46 @@ function GoalsPanel({
             ))}
           </div>
         )}
+        {(() => {
+          const prize = g.rewardId
+            ? rewards.find((r) => r.id === g.rewardId)
+            : undefined;
+          // Achieved goals show the treat they won; active goals let you pick or
+          // change the reward you're working toward.
+          if (g.done) {
+            return prize ? (
+              <div style={styles.goalPrizeEarned}>
+                🎁 Reward earned: {prize.emoji} {prize.title}
+              </div>
+            ) : null;
+          }
+          return (
+            <div style={styles.goalPrizeRow}>
+              <span style={styles.goalPrizeLabel}>🎁 Prize</span>
+              {rewards.length === 0 ? (
+                <span style={styles.goalPrizeHint}>
+                  Add a reward in “My rewards” to work toward one
+                </span>
+              ) : (
+                <select
+                  style={styles.goalPrizeSelect}
+                  value={g.rewardId ?? ""}
+                  onChange={(e) =>
+                    onLinkReward(g.id, e.target.value || undefined)
+                  }
+                  aria-label="Reward for achieving this goal"
+                >
+                  <option value="">No reward</option>
+                  {rewards.map((r) => (
+                    <option key={r.id} value={r.id}>
+                      {r.emoji} {r.title}
+                    </option>
+                  ))}
+                </select>
+              )}
+            </div>
+          );
+        })()}
         {!g.done && (
           <button
             style={styles.goalBreakBtn}
@@ -3157,12 +3202,14 @@ const REWARD_EMOJIS = [
 function MyRewardsCard({
   availableXp,
   rewards,
+  goals,
   onAdd,
   onRedeem,
   onRemove,
 }: {
   availableXp: number;
   rewards: CustomReward[];
+  goals: SmartGoal[];
   onAdd: (emoji: string, title: string, cost: number) => void;
   onRedeem: (id: string) => void;
   onRemove: (id: string) => void;
@@ -3201,6 +3248,9 @@ function MyRewardsCard({
             100,
             Math.round((availableXp / Math.max(1, r.cost)) * 100),
           );
+          // A reward can be the prize for an active goal — surface that tie so
+          // the learner sees which goal unlocks this treat for free.
+          const prizeGoal = goals.find((g) => g.rewardId === r.id && !g.done);
           return (
             <div key={r.id} style={styles.rewardItem}>
               <span style={styles.rewardEmoji}>{r.emoji}</span>
@@ -3214,6 +3264,11 @@ function MyRewardsCard({
                     </span>
                   )}
                 </div>
+                {prizeGoal && (
+                  <div style={styles.rewardGoalTag} title="Achieve this goal to unlock this reward free">
+                    🎯 Prize for: {prizeGoal.statement?.trim() || prizeGoal.specific}
+                  </div>
+                )}
                 <div style={styles.rewardTrack}>
                   <div style={{ ...styles.rewardFill, width: `${pct}%` }} />
                 </div>
@@ -11837,25 +11892,60 @@ function ElioraApp() {
       },
     ]);
   }
+  // Grant the reward "prize" a learner tied to a goal — claimed FOR FREE the
+  // moment the goal is achieved (hitting the goal IS the price, no XP spent). It
+  // still counts toward the reward's claim tally so it shows up as a treat won.
+  const grantGoalReward = (g: SmartGoal) => {
+    if (!g.rewardId) return;
+    const r = customRewards.find((x) => x.id === g.rewardId);
+    if (!r) return;
+    setCustomRewards((prev) =>
+      prev.map((x) =>
+        x.id === r.id ? { ...x, redeemed: x.redeemed + 1 } : x,
+      ),
+    );
+    setXpToast(`🎁 Reward unlocked: ${r.emoji} ${r.title}!`);
+  };
   // Nudge numeric progress up or down (clamped to 0..target). Auto-completes
   // the goal when it reaches the target, and reopens it if backed off.
   function stepGoal(id: string, delta: number) {
+    const g = goals.find((x) => x.id === id);
+    // Decide "just achieved" from the current closure (the setGoals updater runs
+    // later during reconciliation, so a flag set inside it isn't visible here).
+    let justAchieved = false;
+    if (g && typeof g.target === "number") {
+      const next = Math.max(0, Math.min(g.target, (g.current ?? 0) + delta));
+      justAchieved = next >= g.target && !g.done;
+    }
     setGoals((prev) =>
-      prev.map((g) => {
-        if (g.id !== id || typeof g.target !== "number") return g;
+      prev.map((x) => {
+        if (x.id !== id || typeof x.target !== "number") return x;
         const current = Math.max(
           0,
-          Math.min(g.target, (g.current ?? 0) + delta),
+          Math.min(x.target, (x.current ?? 0) + delta),
         );
-        return { ...g, current, done: current >= g.target };
+        return { ...x, current, done: current >= x.target };
       }),
     );
+    if (justAchieved && g) {
+      award(80, "goal achieved!"); // hitting the target is a big win too
+      grantGoalReward(g);
+    }
   }
   function toggleGoalDone(id: string) {
     const g = goals.find((x) => x.id === id);
-    if (g && !g.done) award(80, "goal achieved!"); // achieving a goal is a big win
+    if (g && !g.done) {
+      award(80, "goal achieved!"); // achieving a goal is a big win
+      grantGoalReward(g); // and hand over the prize they tied to it
+    }
     setGoals((prev) =>
       prev.map((x) => (x.id === id ? { ...x, done: !x.done } : x)),
+    );
+  }
+  // Tie a custom reward to a goal (or clear it) — the prize for achieving it.
+  function linkGoalReward(goalId: string, rewardId: string | undefined) {
+    setGoals((prev) =>
+      prev.map((g) => (g.id === goalId ? { ...g, rewardId } : g)),
     );
   }
   function removeGoal(id: string) {
@@ -13990,6 +14080,7 @@ function ElioraApp() {
             <MyRewardsCard
               availableXp={availableXp}
               rewards={customRewards}
+              goals={goals}
               onAdd={addCustomReward}
               onRedeem={redeemCustomReward}
               onRemove={removeCustomReward}
@@ -14368,6 +14459,8 @@ function ElioraApp() {
               onToggleTask={toggleGoalTask}
               onHelpTask={helpWithTask}
               breakingGoalId={breakingGoalId}
+              rewards={customRewards}
+              onLinkReward={linkGoalReward}
             />
           )}
 
@@ -18411,6 +18504,45 @@ const styles: Record<string, React.CSSProperties> = {
     fontSize: 12,
     fontWeight: 600,
     cursor: "pointer",
+  },
+  // The reward "prize" tied to a goal — a small picker on active goals and a
+  // won-treat line on achieved ones.
+  goalPrizeRow: {
+    marginTop: 6,
+    marginLeft: 32,
+    display: "flex",
+    alignItems: "center",
+    gap: 8,
+    flexWrap: "wrap",
+  },
+  goalPrizeLabel: { fontSize: 12.5, fontWeight: 700, color: "var(--muted)" },
+  goalPrizeSelect: {
+    padding: "3px 8px",
+    borderRadius: 8,
+    border: "1px solid var(--border)",
+    background: "var(--surface)",
+    color: "var(--text)",
+    fontSize: 12.5,
+    fontFamily: "inherit",
+    cursor: "pointer",
+    maxWidth: 220,
+  },
+  goalPrizeHint: { fontSize: 12, color: "var(--muted)", fontStyle: "italic" },
+  goalPrizeEarned: {
+    marginTop: 6,
+    marginLeft: 32,
+    fontSize: 12.5,
+    fontWeight: 700,
+    color: "var(--accent)",
+  },
+  rewardGoalTag: {
+    marginTop: 2,
+    fontSize: 12,
+    fontWeight: 600,
+    color: "var(--accent)",
+    whiteSpace: "nowrap",
+    overflow: "hidden",
+    textOverflow: "ellipsis",
   },
   goalTasks: { marginTop: 8, marginLeft: 32, display: "flex", flexDirection: "column", gap: 2 },
   goalTasksHead: {

@@ -86,6 +86,7 @@ export interface SmartGoal {
   current?: number; // progress toward target
   statement?: string; // AI-composed one-sentence version of the SMART answers
   tasks?: GoalTask[]; // the checklist of steps to achieve this goal
+  rewardId?: string; // a custom reward "prize" unlocked when this goal is achieved
   done: boolean;
 }
 

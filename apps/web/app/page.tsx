@@ -119,6 +119,130 @@ function noteTitle(text: string): string {
   return line.length > 60 ? line.slice(0, 60) + "…" : line;
 }
 
+// --- Focus music: connect a playlist without leaving the app ----------------
+// Rather than register a developer app + OAuth with every service (Spotify app +
+// secret, Apple MusicKit key + paid membership, Google/YouTube OAuth), the
+// learner pastes a link to THEIR playlist and it plays inline via the service's
+// own official embed. Public content plays previews for everyone and full tracks
+// when they're signed into that service in the same browser — no keys, no server.
+type MusicProvider = "spotify" | "apple" | "youtube";
+
+type MusicSource = {
+  id: string;
+  provider: MusicProvider;
+  embedUrl: string; // the service's inline player URL
+  kind: string; // "Playlist" | "Album" | "Video" | … (for the little label)
+  url: string; // the original pasted link, for "open in <service>"
+  title?: string; // optional learner-given name
+};
+
+const MUSIC_PROVIDERS: Record<
+  MusicProvider,
+  { label: string; icon: string; color: string; example: string }
+> = {
+  spotify: {
+    label: "Spotify",
+    icon: "🟢",
+    color: "#1DB954",
+    example: "https://open.spotify.com/playlist/…",
+  },
+  apple: {
+    label: "Apple Music",
+    icon: "🍎",
+    color: "#FA243C",
+    example: "https://music.apple.com/…/playlist/…",
+  },
+  youtube: {
+    label: "YouTube Music",
+    icon: "▶️",
+    color: "#FF0000",
+    example: "https://music.youtube.com/playlist?list=…",
+  },
+};
+
+// Turn a pasted Spotify / Apple Music / YouTube (Music) link into an official
+// inline embed. Returns null for anything we can't play (bad URL, other host).
+function parseMusicUrl(raw: string): Omit<MusicSource, "id" | "title"> | null {
+  const s = (raw || "").trim();
+  if (!s) return null;
+  let u: URL;
+  try {
+    u = new URL(s);
+  } catch {
+    return null;
+  }
+  const host = u.hostname.replace(/^www\./, "").toLowerCase();
+
+  // Spotify: open.spotify.com/{type}/{id} → open.spotify.com/embed/{type}/{id}
+  if (host === "open.spotify.com") {
+    const m = u.pathname.match(
+      /\/(playlist|album|track|artist|show|episode)\/([A-Za-z0-9]+)/,
+    );
+    if (!m) return null;
+    const [, type, spId] = m;
+    return {
+      provider: "spotify",
+      embedUrl: `https://open.spotify.com/embed/${type}/${spId}?utm_source=eliora`,
+      kind: type.charAt(0).toUpperCase() + type.slice(1),
+      url: s,
+    };
+  }
+
+  // Apple Music: music.apple.com/… → embed.music.apple.com/… (same path).
+  if (host === "music.apple.com" || host === "embed.music.apple.com") {
+    const kind = /\/playlist\//.test(u.pathname)
+      ? "Playlist"
+      : /\/album\//.test(u.pathname)
+        ? "Album"
+        : "Music";
+    return {
+      provider: "apple",
+      embedUrl: `https://embed.music.apple.com${u.pathname}${u.search}`,
+      kind,
+      url: s,
+    };
+  }
+
+  // YouTube / YouTube Music: prefer a playlist (list=…), else a single video.
+  if (
+    host === "music.youtube.com" ||
+    host === "youtube.com" ||
+    host === "m.youtube.com" ||
+    host === "youtu.be"
+  ) {
+    const list = u.searchParams.get("list");
+    if (list) {
+      const listId = list.replace(/^VL/, ""); // strip the library-view prefix
+      return {
+        provider: "youtube",
+        embedUrl: `https://www.youtube.com/embed/videoseries?list=${encodeURIComponent(listId)}`,
+        kind: "Playlist",
+        url: s,
+      };
+    }
+    const vid =
+      host === "youtu.be" ? u.pathname.slice(1) : u.searchParams.get("v") || "";
+    if (vid) {
+      return {
+        provider: "youtube",
+        embedUrl: `https://www.youtube.com/embed/${encodeURIComponent(vid)}`,
+        kind: "Video",
+        url: s,
+      };
+    }
+    return null;
+  }
+
+  return null;
+}
+
+// Height of the inline player per provider (Apple/Spotify give compact players).
+function musicEmbedHeight(provider: MusicProvider, kind: string): number {
+  if (provider === "youtube") return 200; // 16:9-ish video
+  if (provider === "apple") return kind === "Playlist" || kind === "Album" ? 450 : 175;
+  return kind === "Track" || kind === "Episode" ? 152 : 352; // spotify
+}
+
 let chatCounter = 0;
 function newChatId(): string {
   chatCounter += 1;
@@ -1282,6 +1406,324 @@ function VideoCards({ videos }: { videos: Video[] }) {
           </div>
         </a>
       ))}
+    </div>
+  );
+}
+
+// Record yourself teaching a concept to camera (the Feynman technique works
+// even better out loud). We capture video for the learner to watch back AND —
+// where the browser supports speech recognition — transcribe what they say so
+// their spoken explanation can be sent to Eliora for feedback. The video stays
+// local to this modal (never uploaded); only the transcript is handed back.
+function TeachBackRecorder({
+  concept,
+  onSubmit,
+  onClose,
+}: {
+  concept: string;
+  onSubmit: (transcript: string) => void;
+  onClose: () => void;
+}) {
+  const liveRef = useRef<HTMLVideoElement>(null);
+  const streamRef = useRef<MediaStream | null>(null);
+  const recorderRef = useRef<MediaRecorder | null>(null);
+  const chunksRef = useRef<Blob[]>([]);
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const recognitionRef = useRef<any>(null);
+  // Committed (final) transcript, kept in a ref so recognition restarts don't
+  // lose earlier speech. Interim words are appended on top for the live view.
+  const finalRef = useRef("");
+  const urlRef = useRef<string | null>(null);
+
+  const [ready, setReady] = useState(false);
+  const [phase, setPhase] = useState<"idle" | "recording" | "review">("idle");
+  const [error, setError] = useState<string | null>(null);
+  const [seconds, setSeconds] = useState(0);
+  const [videoUrl, setVideoUrl] = useState<string | null>(null);
+  const [transcript, setTranscript] = useState("");
+
+  const speechSupported =
+    typeof window !== "undefined" &&
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    ("SpeechRecognition" in window || "webkitSpeechRecognition" in (window as any));
+
+  // Acquire the camera + mic once, on open.
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      try {
+        const stream = await navigator.mediaDevices.getUserMedia({
+          video: true,
+          audio: true,
+        });
+        if (cancelled) {
+          stream.getTracks().forEach((t) => t.stop());
+          return;
+        }
+        streamRef.current = stream;
+        setReady(true);
+      } catch {
+        setError(
+          "Couldn't reach your camera and microphone. Check your browser's permissions and try again.",
+        );
+      }
+    })();
+    return () => {
+      cancelled = true;
+      teardown();
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  // Show the live camera feed whenever we're not reviewing a finished take.
+  useEffect(() => {
+    if (ready && phase !== "review" && liveRef.current && streamRef.current) {
+      liveRef.current.srcObject = streamRef.current;
+      liveRef.current.play().catch(() => {});
+    }
+  }, [ready, phase]);
+
+  // Tick a duration counter while recording.
+  useEffect(() => {
+    if (phase !== "recording") return;
+    const t = setInterval(() => setSeconds((s) => s + 1), 1000);
+    return () => clearInterval(t);
+  }, [phase]);
+
+  function teardown() {
+    try {
+      recognitionRef.current?.stop();
+    } catch {
+      /* ignore */
+    }
+    recognitionRef.current = null;
+    try {
+      if (recorderRef.current && recorderRef.current.state !== "inactive")
+        recorderRef.current.stop();
+    } catch {
+      /* ignore */
+    }
+    recorderRef.current = null;
+    streamRef.current?.getTracks().forEach((t) => t.stop());
+    streamRef.current = null;
+    if (urlRef.current) URL.revokeObjectURL(urlRef.current);
+    urlRef.current = null;
+  }
+
+  // Live transcription that survives the API's silence timeout by restarting
+  // itself for as long as we're still recording.
+  function startTranscription() {
+    if (!speechSupported) return;
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const w = window as any;
+    const SR = w.SpeechRecognition || w.webkitSpeechRecognition;
+    const rec = new SR();
+    rec.lang = "en-US";
+    rec.interimResults = true;
+    rec.continuous = true;
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    rec.onresult = (e: any) => {
+      let interim = "";
+      for (let i = e.resultIndex; i < e.results.length; i++) {
+        const r = e.results[i];
+        if (r.isFinal) finalRef.current += r[0].transcript;
+        else interim += r[0].transcript;
+      }
+      setTranscript((finalRef.current + interim).replace(/\s+/g, " ").trim());
+    };
+    rec.onend = () => {
+      if (recorderRef.current && recorderRef.current.state === "recording") {
+        try {
+          rec.start();
+        } catch {
+          /* already restarting */
+        }
+      }
+    };
+    rec.onerror = () => {};
+    recognitionRef.current = rec;
+    try {
+      rec.start();
+    } catch {
+      /* ignore */
+    }
+  }
+
+  function startRecording() {
+    const stream = streamRef.current;
+    if (!stream) return;
+    if (urlRef.current) {
+      URL.revokeObjectURL(urlRef.current);
+      urlRef.current = null;
+    }
+    chunksRef.current = [];
+    finalRef.current = "";
+    setVideoUrl(null);
+    setTranscript("");
+    setSeconds(0);
+    let mr: MediaRecorder;
+    try {
+      mr = new MediaRecorder(stream);
+    } catch {
+      setError("Video recording isn't supported in this browser.");
+      return;
+    }
+    mr.ondataavailable = (e) => {
+      if (e.data && e.data.size) chunksRef.current.push(e.data);
+    };
+    mr.onstop = () => {
+      const blob = new Blob(chunksRef.current, {
+        type: chunksRef.current[0]?.type || "video/webm",
+      });
+      const url = URL.createObjectURL(blob);
+      urlRef.current = url;
+      setVideoUrl(url);
+      setPhase("review");
+    };
+    recorderRef.current = mr;
+    mr.start();
+    startTranscription();
+    setPhase("recording");
+  }
+
+  function stopRecording() {
+    try {
+      recognitionRef.current?.stop();
+    } catch {
+      /* ignore */
+    }
+    recognitionRef.current = null;
+    if (recorderRef.current && recorderRef.current.state !== "inactive")
+      recorderRef.current.stop();
+  }
+
+  function done(text: string) {
+    teardown();
+    onSubmit(text);
+  }
+
+  const mmss = `${Math.floor(seconds / 60)}:${String(seconds % 60).padStart(2, "0")}`;
+
+  return (
+    <div style={styles.overlay} onClick={onClose}>
+      <div style={styles.modal} onClick={(e) => e.stopPropagation()}>
+        <div style={styles.modalHead}>
+          <h2 style={styles.modalTitle}>🎥 Teach it back on camera</h2>
+          <button
+            style={styles.recCloseBtn}
+            onClick={onClose}
+            aria-label="Close recorder"
+          >
+            ✕
+          </button>
+        </div>
+
+        <p style={styles.recSub}>
+          {concept
+            ? <>Explain <b>{concept}</b> out loud, as if teaching a friend.</>
+            : "Explain the concept out loud, as if teaching a friend."}{" "}
+          Watch it back to catch the spots where you hesitate — that&apos;s where
+          the gaps are.
+        </p>
+
+        {error ? (
+          <div style={styles.recError}>{error}</div>
+        ) : (
+          <>
+            <div style={styles.recStage}>
+              {phase === "review" && videoUrl ? (
+                <video
+                  key={videoUrl}
+                  src={videoUrl}
+                  controls
+                  playsInline
+                  style={{ ...styles.recVideo, transform: "none" }}
+                />
+              ) : (
+                <video
+                  ref={liveRef}
+                  muted
+                  playsInline
+                  autoPlay
+                  style={styles.recVideo}
+                />
+              )}
+              {phase === "recording" && (
+                <div style={styles.recBadge}>● REC {mmss}</div>
+              )}
+            </div>
+
+            {(phase === "recording" || (phase === "review" && transcript)) && (
+              <textarea
+                value={transcript}
+                onChange={(e) => setTranscript(e.target.value)}
+                readOnly={phase === "recording"}
+                placeholder={
+                  speechSupported
+                    ? "Your words will appear here as you speak…"
+                    : ""
+                }
+                rows={3}
+                style={styles.recTranscript}
+                aria-label="Transcript of your explanation"
+              />
+            )}
+
+            {phase === "review" && !transcript && speechSupported && (
+              <p style={styles.recHint}>
+                We didn&apos;t catch any speech. Re-record, or type what you
+                explained below.
+              </p>
+            )}
+            {phase === "review" && !speechSupported && (
+              <textarea
+                value={transcript}
+                onChange={(e) => setTranscript(e.target.value)}
+                placeholder="Type a quick summary of what you explained so Eliora can give feedback…"
+                rows={3}
+                style={styles.recTranscript}
+                aria-label="Summary of your explanation"
+              />
+            )}
+
+            <div style={styles.recControls}>
+              {phase === "idle" && (
+                <button
+                  style={styles.recPrimary}
+                  disabled={!ready}
+                  onClick={startRecording}
+                >
+                  {ready ? "● Start recording" : "Preparing camera…"}
+                </button>
+              )}
+              {phase === "recording" && (
+                <button style={styles.recStop} onClick={stopRecording}>
+                  ⏹ Stop
+                </button>
+              )}
+              {phase === "review" && (
+                <>
+                  <button style={styles.recSecondary} onClick={startRecording}>
+                    ↺ Re-record
+                  </button>
+                  <button
+                    style={styles.recPrimary}
+                    disabled={!transcript.trim()}
+                    onClick={() => done(transcript.trim())}
+                    title={
+                      transcript.trim()
+                        ? "Send your explanation to Eliora"
+                        : "Add what you explained first"
+                    }
+                  >
+                    Send to Eliora →
+                  </button>
+                </>
+              )}
+            </div>
+          </>
+        )}
+      </div>
     </div>
   );
 }
@@ -7899,10 +8341,10 @@ function CalendarPanel({
     .slice(0, 10);
   const schedule: Record<
     string,
-    { work: Assignment[]; events: StudyEvent[]; min: number }
+    { work: Assignment[]; events: StudyEvent[]; tasks: DailyTask[]; min: number }
   > = {};
   const bucket = (iso: string) =>
-    (schedule[iso] ||= { work: [], events: [], min: 0 });
+    (schedule[iso] ||= { work: [], events: [], tasks: [], min: 0 });
   for (const a of assignments)
     if (!a.done && a.planDate && a.planDate >= todayISO && a.planDate <= horizonISO) {
       const b = bucket(a.planDate);
@@ -7911,6 +8353,18 @@ function CalendarPanel({
     }
   for (const e of events)
     if (e.date >= todayISO && e.date <= horizonISO) bucket(e.date).events.push(e);
+  // Today's to-do list lands on its own day too, so the schedule shows the day's
+  // tasks alongside deadlines and planned work — not just as dots on the grid.
+  if (
+    dailyTasks?.date &&
+    dailyTasks.date >= todayISO &&
+    dailyTasks.date <= horizonISO
+  )
+    for (const t of dailyTasks.tasks) {
+      const b = bucket(dailyTasks.date);
+      b.tasks.push(t);
+      b.min += t.estMin ?? 0;
+    }
   const scheduleDays = Object.keys(schedule).sort();
   const weekday = (iso: string) =>
     new Date(`${iso}T00:00:00`).toLocaleDateString("en-US", {
@@ -8022,6 +8476,23 @@ function CalendarPanel({
                       ⏳ {a.title}
                       {a.estMin ? ` · ${fmtMin(a.estMin)}` : ""}
                       {a.due ? ` (due ${formatDate(a.due)})` : ""}
+                    </span>
+                  </div>
+                ))}
+                {day.tasks.map((t, i) => (
+                  <div key={`task-${i}`} style={styles.schedItem}>
+                    <span
+                      style={{ ...styles.schedTick, background: "#6b5bd6" }}
+                    />
+                    <span
+                      style={{
+                        textDecoration: t.done ? "line-through" : "none",
+                        color: t.done ? "var(--muted)" : undefined,
+                      }}
+                    >
+                      📝 {t.title}
+                      {t.estMin ? ` · ${fmtMin(t.estMin)}` : ""}
+                      {t.done ? " ✓" : ""}
                     </span>
                   </div>
                 ))}
@@ -8727,6 +9198,232 @@ function PresentationPractice() {
           ))}
         </ul>
       </div>
+    </div>
+  );
+}
+
+// A persistent focus-music mini-player. Lives at the app shell so it keeps
+// playing while the learner moves between tabs. They paste a Spotify / Apple
+// Music / YouTube Music playlist link (auto-detected) and it plays inline via
+// that service's official embed — no accounts, no API keys, never leaving the
+// app. Saved playlists persist in localStorage (namespaced by learner).
+function FocusMusicPlayer({ storageKey }: { storageKey: string }) {
+  const [sources, setSources] = useState<MusicSource[]>([]);
+  const [activeId, setActiveId] = useState<string | null>(null);
+  const [open, setOpen] = useState(false); // player panel expanded?
+  const [dismissed, setDismissed] = useState(false); // hidden to just the FAB?
+  const [input, setInput] = useState("");
+  const [error, setError] = useState<string | null>(null);
+  const [loaded, setLoaded] = useState(false);
+
+  // Load saved playlists once.
+  useEffect(() => {
+    try {
+      const raw = localStorage.getItem(storageKey);
+      if (raw) {
+        const saved = JSON.parse(raw) as {
+          sources?: MusicSource[];
+          activeId?: string | null;
+        };
+        if (Array.isArray(saved.sources)) {
+          setSources(saved.sources);
+          setActiveId(saved.activeId ?? saved.sources[0]?.id ?? null);
+        }
+      }
+    } catch {
+      /* ignore */
+    }
+    setLoaded(true);
+  }, [storageKey]);
+
+  // Persist on change.
+  useEffect(() => {
+    if (!loaded) return;
+    try {
+      localStorage.setItem(storageKey, JSON.stringify({ sources, activeId }));
+    } catch {
+      /* ignore */
+    }
+  }, [sources, activeId, loaded, storageKey]);
+
+  const active = sources.find((s) => s.id === activeId) ?? null;
+
+  function addSource() {
+    const parsed = parseMusicUrl(input);
+    if (!parsed) {
+      setError(
+        "That link didn't look like a Spotify, Apple Music, or YouTube Music playlist. Copy the playlist's share link and paste it here.",
+      );
+      return;
+    }
+    // Skip exact duplicates (same embed) — just make it the active one.
+    const dup = sources.find((s) => s.embedUrl === parsed.embedUrl);
+    if (dup) {
+      setActiveId(dup.id);
+      setInput("");
+      setError(null);
+      setOpen(true);
+      return;
+    }
+    const src: MusicSource = {
+      ...parsed,
+      id: `m${Date.now().toString(36)}`,
+    };
+    setSources((prev) => [src, ...prev]);
+    setActiveId(src.id);
+    setInput("");
+    setError(null);
+    setOpen(true);
+  }
+
+  function removeSource(id: string) {
+    setSources((prev) => {
+      const next = prev.filter((s) => s.id !== id);
+      if (id === activeId) setActiveId(next[0]?.id ?? null);
+      return next;
+    });
+  }
+
+  // Collapsed to a floating button once dismissed (or before first use, if the
+  // learner closes it) — one tap brings the player back.
+  if (dismissed) {
+    return (
+      <button
+        style={styles.musicFab}
+        onClick={() => setDismissed(false)}
+        aria-label="Open focus music"
+        title="Focus music"
+      >
+        🎧
+      </button>
+    );
+  }
+
+  const meta = active ? MUSIC_PROVIDERS[active.provider] : null;
+
+  return (
+    <div style={styles.musicPlayer} className="fade-in">
+      <div style={styles.musicHeader}>
+        <button
+          style={styles.musicTitleBtn}
+          onClick={() => setOpen((o) => !o)}
+          aria-expanded={open}
+          title={open ? "Collapse" : "Expand"}
+        >
+          <span style={{ fontSize: 16 }}>🎧</span>
+          <span style={styles.musicTitleText}>
+            {active
+              ? `${meta?.icon} ${active.title || active.kind}`
+              : "Focus music"}
+          </span>
+          <span style={{ color: "var(--muted)" }}>{open ? "▾" : "▸"}</span>
+        </button>
+        <button
+          style={styles.musicClose}
+          onClick={() => setDismissed(true)}
+          aria-label="Hide focus music"
+          title="Hide"
+        >
+          ×
+        </button>
+      </div>
+
+      {open && (
+        <div style={styles.musicBody}>
+          {/* Connect a playlist */}
+          <div style={styles.musicConnectRow}>
+            <input
+              style={styles.musicInput}
+              value={input}
+              onChange={(e) => {
+                setInput(e.target.value);
+                if (error) setError(null);
+              }}
+              onKeyDown={(e) => {
+                if (e.key === "Enter") addSource();
+              }}
+              placeholder="Paste a playlist link…"
+              aria-label="Paste a Spotify, Apple Music, or YouTube Music playlist link"
+            />
+            <button style={styles.musicAddBtn} onClick={addSource}>
+              Connect
+            </button>
+          </div>
+          <div style={styles.musicHint}>
+            {(Object.keys(MUSIC_PROVIDERS) as MusicProvider[]).map((p) => (
+              <span key={p} style={styles.musicHintChip}>
+                {MUSIC_PROVIDERS[p].icon} {MUSIC_PROVIDERS[p].label}
+              </span>
+            ))}
+          </div>
+          {error && <div style={styles.musicError}>{error}</div>}
+
+          {/* Saved playlists to switch between */}
+          {sources.length > 0 && (
+            <div style={styles.musicTabs}>
+              {sources.map((s) => {
+                const m = MUSIC_PROVIDERS[s.provider];
+                const on = s.id === activeId;
+                return (
+                  <span key={s.id} style={styles.musicTabWrap}>
+                    <button
+                      style={{
+                        ...styles.musicTab,
+                        ...(on ? styles.musicTabActive : {}),
+                      }}
+                      onClick={() => setActiveId(s.id)}
+                      title={s.url}
+                    >
+                      <span>{m.icon}</span>
+                      <span style={styles.musicTabLabel}>
+                        {s.title || s.kind}
+                      </span>
+                    </button>
+                    <button
+                      style={styles.musicTabDel}
+                      onClick={() => removeSource(s.id)}
+                      aria-label={`Remove ${s.title || s.kind}`}
+                      title="Remove"
+                    >
+                      ×
+                    </button>
+                  </span>
+                );
+              })}
+            </div>
+          )}
+
+          {/* The inline player */}
+          {active ? (
+            <div style={styles.musicEmbedWrap}>
+              <iframe
+                key={active.id}
+                title={`${meta?.label} player`}
+                src={active.embedUrl}
+                height={musicEmbedHeight(active.provider, active.kind)}
+                style={styles.musicEmbed}
+                frameBorder={0}
+                allow="autoplay; encrypted-media; fullscreen; clipboard-write; picture-in-picture"
+                allowFullScreen
+                loading="lazy"
+              />
+              <a
+                href={active.url}
+                target="_blank"
+                rel="noopener noreferrer"
+                style={styles.musicOpenLink}
+              >
+                Open in {meta?.label} ↗
+              </a>
+            </div>
+          ) : (
+            <p style={styles.musicEmpty}>
+              🎵 Paste a link to your favorite study playlist above — it plays
+              right here while you work.
+            </p>
+          )}
+        </div>
+      )}
     </div>
   );
 }
@@ -10849,6 +11546,7 @@ function ElioraApp() {
   const BADGES_KEY = `eliora-badges::${ns}`; // badge ids already rewarded
   const SCHEDULE_KEY = `eliora-schedule::${ns}`; // today's 9am–9pm schedule
   const HOMETIME_KEY = `eliora-hometime::${ns}`; // hour the learner gets home
+  const MUSIC_KEY = `eliora-music::${ns}`; // connected focus-music playlists
   const [chats, setChats] = useState<Chat[]>([]);
   const [folders, setFolders] = useState<ChatFolder[]>([]);
   const [folderMenuFor, setFolderMenuFor] = useState<string | null>(null);
@@ -11053,6 +11751,8 @@ function ElioraApp() {
   const [studyPlanSubject, setStudyPlanSubject] = useState("");
   const [listening, setListening] = useState(false);
   const [speechSupported, setSpeechSupported] = useState(false);
+  // When set, the teach-back video recorder is open (value = concept to teach).
+  const [recorderOpen, setRecorderOpen] = useState<string | null>(null);
   const [remindersOn, setRemindersOn] = useState(false);
   const [notifSupported, setNotifSupported] = useState(false);
   const [dismissed, setDismissed] = useState<string[]>([]);
@@ -13233,6 +13933,29 @@ function ElioraApp() {
     void send(teachBackKickoff(concept));
   }
 
+  // Open the camera recorder so the learner can teach the concept out loud.
+  // Their spoken explanation (transcribed) is what gets sent to Eliora.
+  function recordTeachBack() {
+    if (busy || pendingKickoff) return;
+    setRecorderOpen(input.trim());
+  }
+
+  // Called when a recording is finished: send the transcript as the learner's
+  // teach-back explanation and frame it so Eliora critiques it for gaps.
+  function submitRecordedTeachBack(transcript: string) {
+    setRecorderOpen(null);
+    const text = transcript.trim();
+    if (!text) return;
+    setInput("");
+    void send(
+      `I just recorded myself teaching this back out loud. Here's what I said:\n\n` +
+        `"${text}"\n\n` +
+        `Check my explanation the way a teacher would: point out anything I got ` +
+        `wrong or muddled, the gaps or missing steps, and one thing I explained ` +
+        `well. Then ask me one question to close the biggest gap.`,
+    );
+  }
+
   // Send the queued kickoff once the new topic chat has become the active chat,
   // so the message lands in the new conversation rather than the previous one.
   useEffect(() => {
@@ -14011,6 +14734,14 @@ function ElioraApp() {
               Not now
             </button>
           </div>
+        )}
+
+        {recorderOpen !== null && (
+          <TeachBackRecorder
+            concept={recorderOpen}
+            onSubmit={submitRecordedTeachBack}
+            onClose={() => setRecorderOpen(null)}
+          />
         )}
 
         {tab === "home" && (
@@ -14953,6 +15684,19 @@ function ElioraApp() {
         >
           🧑‍🏫 Teach it back
         </button>
+        <button
+          type="button"
+          style={styles.quickChip}
+          disabled={busy || !!pendingKickoff}
+          onClick={recordTeachBack}
+          title={
+            input.trim()
+              ? `Record yourself teaching “${input.trim()}”`
+              : "Record yourself teaching a concept back to camera"
+          }
+        >
+          🎥 Record it
+        </button>
       </div>
 
       <div style={styles.composer}>
@@ -14998,6 +15742,8 @@ function ElioraApp() {
         </>
       )}
       </main>
+      {/* Persistent focus-music player — keeps playing across every tab. */}
+      <FocusMusicPlayer storageKey={MUSIC_KEY} />
     </div>
   );
 }
@@ -18021,6 +18767,155 @@ const styles: Record<string, React.CSSProperties> = {
     marginTop: 6,
     flexWrap: "wrap",
   },
+  // --- Persistent focus-music mini-player (fixed, bottom-right) -------------
+  musicPlayer: {
+    position: "fixed",
+    right: 16,
+    bottom: 16,
+    zIndex: 60,
+    width: "min(360px, calc(100vw - 32px))",
+    background: "var(--surface)",
+    border: "1px solid var(--border)",
+    borderRadius: 16,
+    boxShadow: "0 8px 30px rgba(0,0,0,0.18)",
+    overflow: "hidden",
+  },
+  musicFab: {
+    position: "fixed",
+    right: 16,
+    bottom: 16,
+    zIndex: 60,
+    width: 48,
+    height: 48,
+    borderRadius: 999,
+    border: "1px solid var(--border)",
+    background: "var(--surface)",
+    boxShadow: "0 6px 20px rgba(0,0,0,0.18)",
+    fontSize: 22,
+    cursor: "pointer",
+    display: "flex",
+    alignItems: "center",
+    justifyContent: "center",
+  },
+  musicHeader: {
+    display: "flex",
+    alignItems: "center",
+    gap: 8,
+    padding: "8px 10px",
+    borderBottom: "1px solid var(--border)",
+  },
+  musicTitleBtn: {
+    flex: 1,
+    display: "flex",
+    alignItems: "center",
+    gap: 8,
+    background: "transparent",
+    border: "none",
+    cursor: "pointer",
+    color: "var(--text)",
+    fontSize: 14,
+    fontWeight: 700,
+    padding: 0,
+    minWidth: 0,
+  },
+  musicTitleText: {
+    flex: 1,
+    textAlign: "left",
+    whiteSpace: "nowrap",
+    overflow: "hidden",
+    textOverflow: "ellipsis",
+  },
+  musicClose: {
+    background: "transparent",
+    border: "none",
+    color: "var(--muted)",
+    fontSize: 20,
+    lineHeight: 1,
+    cursor: "pointer",
+    padding: "0 4px",
+  },
+  musicBody: { padding: 10, display: "flex", flexDirection: "column", gap: 8 },
+  musicConnectRow: { display: "flex", gap: 6 },
+  musicInput: {
+    flex: 1,
+    minWidth: 0,
+    border: "1px solid var(--border)",
+    borderRadius: 10,
+    padding: "8px 10px",
+    fontSize: 13,
+    background: "var(--bg)",
+    color: "var(--text)",
+  },
+  musicAddBtn: {
+    border: "none",
+    borderRadius: 10,
+    padding: "8px 12px",
+    background: "var(--accent)",
+    color: "#fff",
+    fontWeight: 700,
+    fontSize: 13,
+    cursor: "pointer",
+    flexShrink: 0,
+  },
+  musicHint: { display: "flex", gap: 6, flexWrap: "wrap" },
+  musicHintChip: { fontSize: 11, color: "var(--muted)" },
+  musicError: {
+    fontSize: 12,
+    color: "#b3261e",
+    background: "rgba(179,38,30,0.08)",
+    borderRadius: 8,
+    padding: "6px 8px",
+  },
+  musicTabs: { display: "flex", gap: 6, flexWrap: "wrap" },
+  musicTabWrap: { display: "inline-flex", alignItems: "center" },
+  musicTab: {
+    display: "inline-flex",
+    alignItems: "center",
+    gap: 4,
+    maxWidth: 150,
+    border: "1px solid var(--border)",
+    borderRadius: 999,
+    padding: "4px 8px",
+    background: "var(--bg)",
+    color: "var(--text)",
+    fontSize: 12,
+    cursor: "pointer",
+  },
+  musicTabActive: {
+    background: "var(--accent-soft)",
+    borderColor: "var(--accent)",
+    color: "var(--accent)",
+    fontWeight: 700,
+  },
+  musicTabLabel: {
+    whiteSpace: "nowrap",
+    overflow: "hidden",
+    textOverflow: "ellipsis",
+  },
+  musicTabDel: {
+    background: "transparent",
+    border: "none",
+    color: "var(--muted)",
+    cursor: "pointer",
+    fontSize: 14,
+    lineHeight: 1,
+    padding: "0 2px",
+    marginLeft: 2,
+  },
+  musicEmbedWrap: { display: "flex", flexDirection: "column", gap: 6 },
+  musicEmbed: {
+    width: "100%",
+    border: "none",
+    borderRadius: 12,
+    display: "block",
+  },
+  musicOpenLink: {
+    fontSize: 11,
+    color: "var(--muted)",
+    textDecoration: "none",
+    alignSelf: "flex-end",
+  },
+  musicEmpty: { fontSize: 13, color: "var(--muted)", margin: "4px 0" },
   quizQ: { fontWeight: 600, fontSize: 16, marginBottom: 6, color: "var(--assistant-text)" },
   quizOpt: {
     display: "block",
@@ -18844,6 +19739,113 @@ const styles: Record<string, React.CSSProperties> = {
     background: "#fdecea",
     borderColor: "#e5534b",
   },
+  // Teach-back video recorder
+  recCloseBtn: {
+    background: "transparent",
+    border: "none",
+    fontSize: 20,
+    lineHeight: 1,
+    cursor: "pointer",
+    color: "var(--muted)",
+    padding: 4,
+  },
+  recSub: {
+    margin: 0,
+    fontSize: 14,
+    lineHeight: 1.5,
+    color: "var(--muted)",
+  },
+  recStage: {
+    position: "relative",
+    width: "100%",
+    aspectRatio: "4 / 3",
+    background: "#000",
+    borderRadius: 14,
+    overflow: "hidden",
+  },
+  recVideo: {
+    width: "100%",
+    height: "100%",
+    objectFit: "cover",
+    // Mirror the live feed so it feels like a mirror; playback stays natural.
+    transform: "scaleX(-1)",
+  },
+  recBadge: {
+    position: "absolute",
+    top: 10,
+    left: 10,
+    background: "rgba(229,83,75,0.92)",
+    color: "#fff",
+    fontSize: 13,
+    fontWeight: 700,
+    padding: "4px 10px",
+    borderRadius: 999,
+    letterSpacing: 0.3,
+  },
+  recTranscript: {
+    width: "100%",
+    resize: "vertical",
+    fontSize: 15,
+    lineHeight: 1.5,
+    padding: "10px 12px",
+    borderRadius: "var(--radius-md)",
+    border: "1px solid var(--border-strong)",
+    background: "var(--surface)",
+    color: "var(--text)",
+    fontFamily: "inherit",
+  },
+  recHint: {
+    margin: 0,
+    fontSize: 13,
+    color: "var(--muted)",
+  },
+  recError: {
+    background: "#fdecea",
+    color: "#a3372f",
+    borderRadius: 12,
+    padding: "12px 14px",
+    fontSize: 14,
+    lineHeight: 1.5,
+  },
+  recControls: {
+    display: "flex",
+    gap: 8,
+    justifyContent: "flex-end",
+    flexWrap: "wrap",
+  },
+  recPrimary: {
+    background: "var(--accent)",
+    color: "var(--primary-foreground)",
+    border: "none",
+    borderRadius: "var(--radius-md)",
+    padding: "11px 20px",
+    fontSize: 15,
+    fontWeight: 700,
+    cursor: "pointer",
+    boxShadow: "var(--shadow-e1)",
+  },
+  recSecondary: {
+    background: "var(--surface)",
+    color: "var(--assistant-text)",
+    borderWidth: 1,
+    borderStyle: "solid",
+    borderColor: "var(--border-strong)",
+    borderRadius: "var(--radius-md)",
+    padding: "11px 18px",
+    fontSize: 15,
+    fontWeight: 600,
+    cursor: "pointer",
+  },
+  recStop: {
+    background: "#e5534b",
+    color: "#fff",
+    border: "none",
+    borderRadius: "var(--radius-md)",
+    padding: "11px 22px",
+    fontSize: 15,
+    fontWeight: 700,
+    cursor: "pointer",
+  },
   // 4-year roadmap
   fypDestRow: {
     display: "flex",
@@ -18919,36 +19921,41 @@ const styles: Record<string, React.CSSProperties> = {
   },
   fypGridScroll: {
     overflowX: "auto",
-    paddingBottom: 6,
+    paddingBottom: 8,
     margin: "0 -2px",
   },
   fypGrid: {
     display: "flex",
-    alignItems: "flex-start",
+    alignItems: "stretch",
     border: "1px solid var(--border)",
-    borderRadius: 12,
+    borderRadius: 16,
     overflow: "hidden",
     minWidth: "min-content",
+    boxShadow: "0 2px 10px rgba(0,0,0,0.05)",
   },
   fypGridCol: {
-    flex: "1 0 260px",
-    minWidth: 260,
+    flex: "1 0 340px",
+    minWidth: 340,
     borderLeft: "1px solid var(--border)",
+    display: "flex",
+    flexDirection: "column",
   },
   fypGridHead: {
     background: "var(--accent-soft)",
-    padding: "13px 16px",
-    borderBottom: "1px solid var(--border)",
+    padding: "18px 20px",
+    borderBottom: "2px solid var(--border)",
   },
   fypGridYear: {
-    fontSize: 18,
-    fontWeight: 700,
+    fontSize: 22,
+    fontWeight: 800,
     color: "var(--assistant-text)",
+    letterSpacing: -0.2,
   },
   fypGridSub: {
-    fontSize: 13,
+    fontSize: 14,
     color: "var(--muted)",
-    marginTop: 3,
+    marginTop: 5,
+    fontWeight: 500,
   },
   fypGridGpa: {
     color: "var(--accent)",
@@ -19031,30 +20038,31 @@ const styles: Record<string, React.CSSProperties> = {
     fontWeight: 500,
   },
   fypGridSection: {
-    fontSize: 12,
-    fontWeight: 700,
-    color: "var(--muted)",
+    fontSize: 13,
+    fontWeight: 800,
+    color: "var(--accent)",
     textTransform: "uppercase",
-    letterSpacing: 0.4,
-    padding: "9px 16px 4px",
+    letterSpacing: 0.8,
+    padding: "14px 20px 6px",
     background: "var(--assistant-bubble)",
+    borderTop: "1px solid var(--border)",
   },
   fypGridCell: {
-    padding: "12px 16px",
+    padding: "14px 20px",
     borderTop: "1px solid var(--border)",
   },
   fypGridCheck: {
     display: "flex",
     alignItems: "flex-start",
-    gap: 9,
+    gap: 11,
     width: "100%",
     background: "none",
     border: "none",
     padding: 0,
     textAlign: "left",
     cursor: "pointer",
-    fontSize: 16,
-    lineHeight: 1.35,
+    fontSize: 17,
+    lineHeight: 1.4,
   },
   fypGridMeta: {
     display: "flex",

@@ -2641,105 +2641,29 @@ function Suggestions({
   );
 }
 
-// Home-dashboard card: type (or tap) a topic to open a brand-new chat that
-// Eliora kicks off — a beginner-friendly intro plus the first step. Suggests
-// topics from the learner's class, subject folders, and weak spots.
-function TopicStarter({
+// Home-dashboard card: one topic input with two ways to work it — "Learn"
+// opens a lesson that flows into a teach-back on the same topic, and "Teach
+// back" jumps straight to the Feynman exercise on what you already know. Tapping
+// a suggestion chip fills the box so you can then pick which of the two to run.
+// Suggestions lead with weak spots, then class + subject folders.
+function LearnStarter({
   profile,
   subjects,
   missed,
   busy,
-  onStart,
+  onLearn,
+  onTeachBack,
 }: {
   profile: LearnerProfile | null;
   subjects: string[];
   missed: string[];
   busy: boolean;
-  onStart: (topic: string) => void;
+  onLearn: (topic: string) => void;
+  onTeachBack: (concept: string) => void;
 }) {
   const [topic, setTopic] = useState("");
-  const suggestions = Array.from(
-    new Set(
-      [
-        ...(profile?.klass ? [profile.klass] : []),
-        ...subjects,
-        ...missed.slice(0, 3),
-      ]
-        .map((s) => s.trim())
-        .filter(Boolean),
-    ),
-  ).slice(0, 5);
-  const start = (t: string) => {
-    const v = t.trim();
-    if (!v || busy) return;
-    onStart(v);
-    setTopic("");
-  };
-  return (
-    <div style={styles.card}>
-      <div style={styles.cardHead}>
-        <span style={styles.cardClass}>💬 Start a lesson</span>
-      </div>
-      <p style={{ color: "var(--muted)", margin: "2px 0 10px", fontSize: 13 }}>
-        Pick a topic and I&apos;ll open a new chat, walk you through it, then
-        have you teach it back to lock it in.
-      </p>
-      <div style={styles.topicRow}>
-        <input
-          style={styles.topicInput}
-          value={topic}
-          placeholder="e.g. photosynthesis, quadratic equations…"
-          onChange={(e) => setTopic(e.target.value)}
-          onKeyDown={(e) => {
-            if (e.key === "Enter") start(topic);
-          }}
-          disabled={busy}
-        />
-        <button
-          style={styles.topicBtn}
-          disabled={busy || !topic.trim()}
-          onClick={() => start(topic)}
-        >
-          Start →
-        </button>
-      </div>
-      {suggestions.length > 0 && (
-        <div style={styles.topicChips}>
-          {suggestions.map((s) => (
-            <button
-              key={s}
-              style={styles.topicChip}
-              disabled={busy}
-              onClick={() => start(s)}
-              title={`Start a lesson on ${s}`}
-            >
-              {s}
-            </button>
-          ))}
-        </div>
-      )}
-    </div>
-  );
-}
-
-// Home-dashboard card: teach a concept back to Eliora (the Feynman technique).
-// Picking one opens a new chat where Eliora runs the whole exercise
-// conversationally — frames a challenge, hears you out, then finds the gaps.
-function TeachBackStarter({
-  profile,
-  subjects,
-  missed,
-  busy,
-  onStart,
-}: {
-  profile: LearnerProfile | null;
-  subjects: string[];
-  missed: string[];
-  busy: boolean;
-  onStart: (concept: string) => void;
-}) {
-  const [concept, setConcept] = useState("");
-  // Weak spots first — teaching what you got wrong is where it pays off most.
+  // Weak spots first — the topics you got wrong are where both a lesson and a
+  // teach-back pay off most.
   const suggestions = Array.from(
     new Set(
       [...missed.slice(0, 3), ...(profile?.klass ? [profile.klass] : []), ...subjects]
@@ -2747,38 +2671,48 @@ function TeachBackStarter({
         .filter(Boolean),
     ),
   ).slice(0, 5);
-  const start = (c: string) => {
-    const v = c.trim();
+  const run = (action: (t: string) => void, t: string) => {
+    const v = t.trim();
     if (!v || busy) return;
-    onStart(v);
-    setConcept("");
+    action(v);
+    setTopic("");
   };
   return (
     <div style={styles.card}>
       <div style={styles.cardHead}>
-        <span style={styles.cardClass}>🧑‍🏫 Teach it back</span>
+        <span style={styles.cardClass}>💬 Learn a topic</span>
       </div>
       <p style={{ color: "var(--muted)", margin: "2px 0 10px", fontSize: 13 }}>
-        The fastest way to find the holes in what you know is to teach it. Pick a
-        concept and I&apos;ll have you explain it, then show you what&apos;s missing.
+        Pick a topic. <b>Learn</b> walks you through it then has you teach it
+        back to lock it in; <b>Teach back</b> jumps straight to explaining what
+        you already know so I can find the holes.
       </p>
       <div style={styles.topicRow}>
         <input
           style={styles.topicInput}
-          value={concept}
+          value={topic}
           placeholder="e.g. photosynthesis, the causes of WWI…"
-          onChange={(e) => setConcept(e.target.value)}
+          onChange={(e) => setTopic(e.target.value)}
           onKeyDown={(e) => {
-            if (e.key === "Enter") start(concept);
+            if (e.key === "Enter") run(onLearn, topic);
           }}
           disabled={busy}
         />
         <button
           style={styles.topicBtn}
-          disabled={busy || !concept.trim()}
-          onClick={() => start(concept)}
+          disabled={busy || !topic.trim()}
+          onClick={() => run(onLearn, topic)}
+          title="Open a lesson that flows into a teach-back"
         >
-          Teach →
+          Learn →
+        </button>
+        <button
+          style={styles.topicBtn}
+          disabled={busy || !topic.trim()}
+          onClick={() => run(onTeachBack, topic)}
+          title="Jump straight to teaching it back"
+        >
+          Teach back →
         </button>
       </div>
       {suggestions.length > 0 && (
@@ -2788,8 +2722,8 @@ function TeachBackStarter({
               key={s}
               style={styles.topicChip}
               disabled={busy}
-              onClick={() => start(s)}
-              title={`Teach back ${s}`}
+              onClick={() => setTopic(s)}
+              title={`Fill the box with ${s}`}
             >
               {s}
             </button>
@@ -2802,7 +2736,7 @@ function TeachBackStarter({
 
 // Home-dashboard card: "what to study next", ranked from the learner's weak
 // areas (topics they've gotten wrong / low grades in `missed`). Each suggestion
-// opens a lesson via the same startTopicChat path the TopicStarter chips use.
+// opens a lesson via the same startTopicChat path the LearnStarter's Learn button uses.
 // Only shown once we actually know some weak areas, so it stays honest to its name.
 function StudyNextCard({
   profile,
@@ -14031,19 +13965,13 @@ function ElioraApp() {
               onSetPriority={setDailyTaskPriority}
               onBudget={budgetDailyTime}
             />
-            <TopicStarter
+            <LearnStarter
               profile={profile}
               subjects={subjects}
               missed={missed}
               busy={busy || !!pendingKickoff}
-              onStart={startTopicChat}
-            />
-            <TeachBackStarter
-              profile={profile}
-              subjects={subjects}
-              missed={missed}
-              busy={busy || !!pendingKickoff}
-              onStart={startTeachBack}
+              onLearn={startTopicChat}
+              onTeachBack={startTeachBack}
             />
             <StudyNextCard
               profile={profile}

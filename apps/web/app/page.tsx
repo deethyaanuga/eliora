@@ -1410,6 +1410,84 @@ function VideoCards({ videos }: { videos: Video[] }) {
   );
 }
 
+// How demanding the teach-back should be, framed as an academic ladder from
+// kindergarten (simplest — explain the gist to a 5-year-old) up to college
+// (rigorous — precise terms, edge cases, probing follow-ups). Higher rungs
+// expect more depth. Threaded into every teach-back entry point so the
+// challenge Eliora sets matches the pick.
+type TeachLevel =
+  | "kindergarten"
+  | "elementary"
+  | "middle"
+  | "high"
+  | "college";
+
+const TEACH_LEVELS: { id: TeachLevel; label: string; emoji: string; hint: string }[] = [
+  { id: "kindergarten", label: "Kindergarten", emoji: "🧸", hint: "Explain the gist to a 5-year-old — plainest words, hints welcome" },
+  { id: "elementary", label: "Elementary", emoji: "✏️", hint: "Basic idea and why it matters, simple language, small hints ok" },
+  { id: "middle", label: "Middle", emoji: "🏫", hint: "Standard check — clear explanation covering the key angles" },
+  { id: "high", label: "High", emoji: "🎓", hint: "Thorough and accurate — correct terms, one testing follow-up" },
+  { id: "college", label: "College", emoji: "🏛️", hint: "Rigorous — mechanism, edge cases, probing follow-up questions" },
+];
+
+// The level-specific framing that goes inside the teach-back challenge: how
+// demanding the ask is, how many angles to cover, and whether hints or grilling
+// follow-ups are in play. Kept separate so the challenge spine stays shared.
+function teachLevelFraming(level: TeachLevel): string {
+  switch (level) {
+    case "kindergarten":
+      return (
+        `Keep it as simple as possible — like I'm explaining it to a 5-year-old. ` +
+        `Ask me for just the one main idea in the plainest words, with an ` +
+        `everyday example or analogy. Be very forgiving; if I stall or go quiet, ` +
+        `offer a gentle hint to nudge me along. `
+      );
+    case "elementary":
+      return (
+        `Keep it simple, the way I'd explain it to a younger kid. Ask me for the ` +
+        `basic idea and why it matters in plain language, and point out one key ` +
+        `angle to hit. If I get stuck, offer a small hint. `
+      );
+    case "high":
+      return (
+        `Hold me to a high-school standard. Ask me to explain it thoroughly and ` +
+        `accurately, covering three key angles — including how the parts fit ` +
+        `together and one real example — and expect correct terms. After I ` +
+        `explain, ask one follow-up question to test my reasoning. `
+      );
+    case "college":
+      return (
+        `Hold me to a rigorous, college-level standard. Ask me to explain it ` +
+        `precisely with the right terminology, covering the underlying mechanism, ` +
+        `an edge case, and how it connects to a related idea. After I explain, ` +
+        `grill me with one or two probing follow-up questions before giving ` +
+        `feedback, and don't let vague or hand-wavy answers slide. `
+      );
+    default:
+      return (
+        `Ask me to explain it in my own words, and list two or three key angles ` +
+        `I should be sure to cover. `
+      );
+  }
+}
+
+// A readable phrase for the level, for baking into prompts (e.g. "at a
+// middle-school level"). Kept distinct from the short UI labels.
+function teachLevelWord(level: TeachLevel): string {
+  switch (level) {
+    case "kindergarten":
+      return "kindergarten";
+    case "elementary":
+      return "elementary-school";
+    case "high":
+      return "high-school";
+    case "college":
+      return "college";
+    default:
+      return "middle-school";
+  }
+}
+
 // Record yourself teaching a concept to camera (the Feynman technique works
 // even better out loud). We capture video for the learner to watch back AND —
 // where the browser supports speech recognition — transcribe what they say so
@@ -3138,6 +3216,8 @@ function LearnStarter({
   subjects,
   missed,
   busy,
+  level,
+  onLevel,
   onLearn,
   onTeachBack,
 }: {
@@ -3145,8 +3225,10 @@ function LearnStarter({
   subjects: string[];
   missed: string[];
   busy: boolean;
+  level: TeachLevel;
+  onLevel: (level: TeachLevel) => void;
   onLearn: (topic: string) => void;
-  onTeachBack: (concept: string) => void;
+  onTeachBack: (concept: string, level: TeachLevel) => void;
 }) {
   const [topic, setTopic] = useState("");
   // Weak spots first — the topics you got wrong are where both a lesson and a
@@ -3196,11 +3278,39 @@ function LearnStarter({
         <button
           style={styles.topicBtn}
           disabled={busy || !topic.trim()}
-          onClick={() => run(onTeachBack, topic)}
+          onClick={() => {
+            const v = topic.trim();
+            if (!v || busy) return;
+            onTeachBack(v, level);
+            setTopic("");
+          }}
           title="Jump straight to teaching it back"
         >
           Teach back →
         </button>
+      </div>
+      <div
+        style={styles.teachLevelGroup}
+        role="group"
+        aria-label="Teach-back difficulty"
+      >
+        <span style={styles.teachLevelLabel}>Level</span>
+        {TEACH_LEVELS.map((lvl) => (
+          <button
+            key={lvl.id}
+            type="button"
+            onClick={() => onLevel(lvl.id)}
+            disabled={busy}
+            title={lvl.hint}
+            aria-pressed={level === lvl.id}
+            style={{
+              ...styles.teachLevelBtn,
+              ...(level === lvl.id ? styles.teachLevelBtnActive : null),
+            }}
+          >
+            {lvl.emoji} {lvl.label}
+          </button>
+        ))}
       </div>
       {suggestions.length > 0 && (
         <div style={styles.topicChips}>
@@ -11753,6 +11863,9 @@ function ElioraApp() {
   const [speechSupported, setSpeechSupported] = useState(false);
   // When set, the teach-back video recorder is open (value = concept to teach).
   const [recorderOpen, setRecorderOpen] = useState<string | null>(null);
+  // How hard the next teach-back should push — shared by the composer chips and
+  // the recorder so every teach-back entry point respects the current pick.
+  const [teachLevel, setTeachLevel] = useState<TeachLevel>("middle");
   const [remindersOn, setRemindersOn] = useState(false);
   const [notifSupported, setNotifSupported] = useState(false);
   const [dismissed, setDismissed] = useState<string[]>([]);
@@ -13869,25 +13982,43 @@ function ElioraApp() {
     setTab("chat");
     setSidebarOpen(false);
     setPendingKickoff(
-      `I want to work on ${topic}. Can you help me get started — a quick, ` +
-        `beginner-friendly intro and the first small step to take? Walk me ` +
-        `through ${topic} step by step, checking in as we go. Then, once I've ` +
-        `got the basics down, switch into a teach-back on the same topic (the ` +
-        `Feynman technique) — ` +
-        teachBackChallenge(),
+      `I want to work on ${topic}. First, help me actually understand it — a ` +
+        `quick, beginner-friendly intro, then research ${topic} and explain it ` +
+        `clearly, and share a couple of real study videos or links (sources) I ` +
+        `can learn from. Walk me through ${topic} step by step, checking in as ` +
+        `we go. Then, once I've got the basics down, switch into a teach-back on ` +
+        `the same topic (the Feynman technique) — ` +
+        teachBackChallenge(teachLevel) +
+        ` Finally, once it's clicked, ` +
+        extraWork(),
+    );
+  }
+
+  // The "extra work" tail — an applied challenge / mini-project the learner
+  // does AFTER the teach-back, using the topic on a fresh real-world example to
+  // make it stick. Practice, not a graded assignment, so Eliora coaches rather
+  // than doing it. Shared so any lesson flow that wants extra work stays in sync.
+  function extraWork(): string {
+    return (
+      `give me a small piece of extra work to make it stick: an applied ` +
+      `challenge or mini-project where I use what I just learned on a fresh, ` +
+      `real-world example (not one we already did). Explain the task in a line ` +
+      `or two and what "done" looks like, then let me attempt it and coach my ` +
+      `work — don't do it for me.`
     );
   }
 
   // The teach-back (Feynman) challenge tail — identical whether the teach-back
   // stands alone or caps off a lesson, so both flows stay in sync. It's the
   // part after "…and": frame the challenge, wait, then surface gaps + coach.
-  function teachBackChallenge(): string {
+  function teachBackChallenge(level: TeachLevel = "middle"): string {
     return (
-      `give me a short teaching challenge: ask me to explain it in my own ` +
-      `words, and list two or three key angles I should be sure to cover. Then ` +
-      `wait for my explanation. Once I've explained, tell me what I got right, ` +
-      `what's missing, and any misconceptions — then coach me on the gaps so ` +
-      `it sticks.`
+      `give me a short teaching challenge, pitched at a ` +
+      `${teachLevelWord(level)} level. ` +
+      teachLevelFraming(level) +
+      `Then wait for my explanation. Once I've explained, tell me what I got ` +
+      `right, what's missing, and any misconceptions — then coach me on the ` +
+      `gaps so it sticks.`
     );
   }
 
@@ -13895,7 +14026,7 @@ function ElioraApp() {
   // concept is given it's baked in; otherwise Eliora picks one from the
   // conversation so far (or asks). Eliora frames the challenge, waits for the
   // learner's explanation, then surfaces gaps + misconceptions and coaches.
-  function teachBackKickoff(concept: string): string {
+  function teachBackKickoff(concept: string, level: TeachLevel = "middle"): string {
     const c = concept.trim();
     const about = c
       ? `the concept "${c}"`
@@ -13903,12 +14034,12 @@ function ElioraApp() {
     return (
       `Let's do a teach-back so I can find the holes in what I know (the ` +
       `Feynman technique). Pick ${about} and ` +
-      teachBackChallenge()
+      teachBackChallenge(level)
     );
   }
 
   // Open a brand-new chat that runs a teach-back on a concept (Home card path).
-  function startTeachBack(rawConcept: string) {
+  function startTeachBack(rawConcept: string, level: TeachLevel = "middle") {
     const concept = rawConcept.trim();
     if (!concept || busy || pendingKickoff) return;
     const id = newChatId();
@@ -13921,7 +14052,7 @@ function ElioraApp() {
     setInput("");
     setTab("chat");
     setSidebarOpen(false);
-    setPendingKickoff(teachBackKickoff(concept));
+    setPendingKickoff(teachBackKickoff(concept, level));
   }
 
   // Start a teach-back inside the CURRENT chat (composer quick-action). Uses
@@ -13930,7 +14061,7 @@ function ElioraApp() {
     if (busy || pendingKickoff) return;
     const concept = input.trim();
     setInput("");
-    void send(teachBackKickoff(concept));
+    void send(teachBackKickoff(concept, teachLevel));
   }
 
   // Open the camera recorder so the learner can teach the concept out loud.
@@ -13948,11 +14079,18 @@ function ElioraApp() {
     if (!text) return;
     setInput("");
     void send(
-      `I just recorded myself teaching this back out loud. Here's what I said:\n\n` +
+      `I just recorded myself teaching this back out loud, aiming for a ` +
+        `${teachLevelWord(teachLevel)} level. Here's what I said:\n\n` +
         `"${text}"\n\n` +
-        `Check my explanation the way a teacher would: point out anything I got ` +
-        `wrong or muddled, the gaps or missing steps, and one thing I explained ` +
-        `well. Then ask me one question to close the biggest gap.`,
+        `Check my explanation the way a teacher would, holding me to a ` +
+        `${teachLevelWord(teachLevel)} standard: point out anything I got wrong ` +
+        `or muddled, the gaps or missing steps, and one thing I explained well. ` +
+        `Then ask me ` +
+        (teachLevel === "college" || teachLevel === "high"
+          ? `two probing questions to expose the biggest gaps.`
+          : teachLevel === "kindergarten" || teachLevel === "elementary"
+            ? `one gentle question to close the biggest gap.`
+            : `one question to close the biggest gap.`),
     );
   }
 
@@ -14791,6 +14929,8 @@ function ElioraApp() {
               subjects={subjects}
               missed={missed}
               busy={busy || !!pendingKickoff}
+              level={teachLevel}
+              onLevel={setTeachLevel}
               onLearn={startTopicChat}
               onTeachBack={startTeachBack}
             />
@@ -15671,6 +15811,29 @@ function ElioraApp() {
       </div>
 
       <div style={styles.composerActions}>
+        <div
+          style={styles.teachLevelGroup}
+          role="group"
+          aria-label="Teach-back difficulty"
+        >
+          <span style={styles.teachLevelLabel}>Level</span>
+          {TEACH_LEVELS.map((lvl) => (
+            <button
+              key={lvl.id}
+              type="button"
+              onClick={() => setTeachLevel(lvl.id)}
+              disabled={busy || !!pendingKickoff}
+              title={lvl.hint}
+              aria-pressed={teachLevel === lvl.id}
+              style={{
+                ...styles.teachLevelBtn,
+                ...(teachLevel === lvl.id ? styles.teachLevelBtnActive : null),
+              }}
+            >
+              {lvl.emoji} {lvl.label}
+            </button>
+          ))}
+        </div>
         <button
           type="button"
           style={styles.quickChip}
@@ -19690,6 +19853,38 @@ const styles: Record<string, React.CSSProperties> = {
     fontSize: 13,
     fontWeight: 600,
     cursor: "pointer",
+  },
+  teachLevelGroup: {
+    display: "inline-flex",
+    flexWrap: "wrap",
+    alignItems: "center",
+    gap: 4,
+    padding: 3,
+    borderRadius: 16,
+    border: "1px solid var(--border)",
+    background: "var(--surface)",
+  },
+  teachLevelLabel: {
+    fontSize: 11,
+    fontWeight: 700,
+    textTransform: "uppercase",
+    letterSpacing: 0.4,
+    color: "var(--muted)",
+    padding: "0 6px",
+  },
+  teachLevelBtn: {
+    padding: "3px 10px",
+    borderRadius: 999,
+    border: "none",
+    background: "transparent",
+    color: "var(--muted)",
+    fontSize: 12,
+    fontWeight: 600,
+    cursor: "pointer",
+  },
+  teachLevelBtnActive: {
+    background: "var(--accent)",
+    color: "#fff",
   },
   composer: {
     display: "flex",

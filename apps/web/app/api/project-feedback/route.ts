@@ -1,6 +1,6 @@
 import OpenAI from "openai";
 import {
-  ELIORA_SUMMARY_MODEL,
+  ELIORA_CHAT_MODEL,
   projectFeedbackPrompt,
   type ProjectFeedbackRequest,
   type UploadDoc,
@@ -46,10 +46,18 @@ const FEEDBACK_TOOL: OpenAI.Chat.Completions.ChatCompletionTool = {
                 type: "string",
                 description: "The rubric line item, worded as on the rubric.",
               },
+              evidence: {
+                type: "string",
+                description:
+                  "The exact part(s) of the project that decide this criterion " +
+                  "— a short quote, section name, or 'not found in the project'. " +
+                  "Find this BEFORE settling on the score.",
+              },
               estimatedScore: {
                 type: "string",
                 description:
-                  "Score in the rubric's own scale (points / level / percent).",
+                  "Score in the rubric's own scale (points / level / percent), " +
+                  "following from the evidence.",
               },
               strengths: {
                 type: "string",
@@ -61,7 +69,13 @@ const FEEDBACK_TOOL: OpenAI.Chat.Completions.ChatCompletionTool = {
                   "What's missing or weak here, and how to improve it.",
               },
             },
-            required: ["criterion", "estimatedScore", "strengths", "gaps"],
+            required: [
+              "criterion",
+              "evidence",
+              "estimatedScore",
+              "strengths",
+              "gaps",
+            ],
           },
         },
         topNextSteps: {
@@ -166,8 +180,11 @@ export async function POST(req: Request) {
   try {
     const client = new OpenAI(); // reads OPENAI_API_KEY; throws if missing
     const completion = await client.chat.completions.create({
-      model: ELIORA_SUMMARY_MODEL,
-      max_completion_tokens: 2500,
+      // Rubric grading is reasoning-heavy, so use the stronger chat model (a
+      // reasoning model) rather than the summary model. Its hidden reasoning
+      // tokens also draw from max_completion_tokens, so the budget is raised.
+      model: ELIORA_CHAT_MODEL,
+      max_completion_tokens: 4000,
       messages: [
         { role: "system", content: projectFeedbackPrompt(body.profile) },
         { role: "user", content: parts },
@@ -187,6 +204,7 @@ export async function POST(req: Request) {
     const criteria = (Array.isArray(args.criteria) ? args.criteria : [])
       .map((c: Record<string, unknown>) => ({
         criterion: toStr(c?.criterion),
+        evidence: toStr(c?.evidence),
         estimatedScore: toStr(c?.estimatedScore),
         strengths: toStr(c?.strengths),
         gaps: toStr(c?.gaps),

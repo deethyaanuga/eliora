@@ -1,6 +1,6 @@
 import OpenAI from "openai";
 import {
-  ELIORA_SUMMARY_MODEL,
+  ELIORA_CHAT_MODEL,
   feedbackSystemPrompt,
   type LearnerProfile,
 } from "@eliora/shared";
@@ -69,9 +69,18 @@ const FEEDBACK_TOOL: OpenAI.Chat.Completions.ChatCompletionTool = {
             required: ["type", "suggestion"],
           },
         },
+        rationale: {
+          type: "string",
+          description:
+            "1–2 sentences justifying the score/grade: the specific evidence in " +
+            "the work (and the rubric, if one was given) that drives the number. " +
+            "Decide this BEFORE the score.",
+        },
         score: {
           type: "integer",
-          description: "Rough quality estimate 0–100 (a friendly gauge).",
+          description:
+            "Rough quality estimate 0–100 (a friendly gauge), following from the " +
+            "rationale.",
         },
         grade: { type: "string", description: "Matching letter grade (A–F)." },
         nextStep: {
@@ -155,8 +164,11 @@ export async function POST(req: Request) {
   try {
     const client = new OpenAI(); // reads OPENAI_API_KEY; throws if missing
     const completion = await client.chat.completions.create({
-      model: ELIORA_SUMMARY_MODEL,
-      max_completion_tokens: 900,
+      // Grading is reasoning-heavy, so use the stronger chat model (a reasoning
+      // model) rather than the summary model. Its hidden reasoning tokens also
+      // draw from max_completion_tokens, so the budget is raised.
+      model: ELIORA_CHAT_MODEL,
+      max_completion_tokens: 2500,
       messages: [
         { role: "system", content: feedbackSystemPrompt(body.profile) },
         { role: "user", content: userContent },
@@ -197,6 +209,7 @@ export async function POST(req: Request) {
           text: str(it.text),
           suggestion: String(it.suggestion).trim(),
         })),
+      rationale: str(args.rationale),
       score: num(args.score),
       grade: str(args.grade),
       nextStep: str(args.nextStep),

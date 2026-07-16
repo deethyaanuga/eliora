@@ -3365,6 +3365,106 @@ function Suggestions({
   );
 }
 
+// Tappable question starters shown during a lesson so a learner can ask about
+// what they're studying without having to phrase it from scratch. A couple are
+// tailored to the subject (math wants worked examples, history wants cause &
+// effect, a language wants a sentence…); the rest are universal "dig deeper"
+// moves. The subject is guessed from the lesson topic plus the learner's class
+// and subject folders, so the prompts stay on-subject even when the topic is vague.
+type LessonPrompt = { label: string; prompt: string };
+type LessonSubjectKind =
+  | "math"
+  | "cs"
+  | "history"
+  | "science"
+  | "language"
+  | "english"
+  | "generic";
+
+function lessonSubjectKind(text: string): LessonSubjectKind {
+  const t = text.toLowerCase();
+  const has = (...ws: string[]) => ws.some((w) => t.includes(w));
+  // Check computer science before plain "science" so "computer science" → cs.
+  if (
+    has("comput", "program", "coding", "python", "javascript", "java", "algorithm", "data structure", "software", "html", "css")
+  )
+    return "cs";
+  if (
+    has("math", "algebra", "geometry", "calculus", "trig", "fraction", "equation", "statistic", "arithmetic", "precalc", "derivative", "integral")
+  )
+    return "math";
+  if (
+    has("history", "civics", "government", "econom", "geography", "social studies", "revolution", "war", "wwi", "wwii", "empire", "politic", "ancient")
+  )
+    return "history";
+  if (
+    has("biology", "chemistry", "physics", "science", "anatomy", "ecolog", "photosynth", "atom", "cell", "molecul", "genetic", "planet", "energy", "reaction")
+  )
+    return "science";
+  if (
+    has("spanish", "french", "german", "latin", "mandarin", "chinese", "japanese", "italian", "vocab", "conjugat", "pronoun")
+  )
+    return "language";
+  if (
+    has("english", "essay", "writing", "grammar", "literature", "poem", "poetry", "novel", "reading", "shakespeare", "theme", "rhetoric", "author")
+  )
+    return "english";
+  return "generic";
+}
+
+const LESSON_PROMPTS_BY_SUBJECT: Record<LessonSubjectKind, LessonPrompt[]> = {
+  math: [
+    { label: "Worked example", prompt: "Walk me through a worked example step by step." },
+    { label: "Why it works", prompt: "Where does this come from — why does it work?" },
+    { label: "When do I use it?", prompt: "What kinds of problems is this used to solve?" },
+  ],
+  science: [
+    { label: "Real-world example", prompt: "Show me how this works in the real world." },
+    { label: "Give an analogy", prompt: "Can you explain this with a simple analogy or picture?" },
+    { label: "Cause & effect", prompt: "What's the cause and effect going on here?" },
+  ],
+  history: [
+    { label: "Causes & effects", prompt: "What caused this and what were its effects?" },
+    { label: "Why it matters", prompt: "Why does this matter, and how does it connect to today?" },
+    { label: "Key people", prompt: "Who were the key people here and why did they matter?" },
+  ],
+  english: [
+    { label: "Show an example", prompt: "Can you show me a short example passage?" },
+    { label: "Key themes", prompt: "What are the key themes or techniques here?" },
+    { label: "Help me write", prompt: "How would I write about this in an essay?" },
+  ],
+  cs: [
+    { label: "Code example", prompt: "Can you show me a small code example?" },
+    { label: "When do I use it?", prompt: "When would I actually use this in real code?" },
+    { label: "Common bug", prompt: "What's a common bug or mistake with this?" },
+  ],
+  language: [
+    { label: "Use in a sentence", prompt: "Can you show me this used in a sentence?" },
+    { label: "How to say it", prompt: "How do I pronounce this correctly?" },
+    { label: "Common mistakes", prompt: "What are common mistakes to avoid with this?" },
+  ],
+  generic: [
+    { label: "Real example", prompt: "Give me a real-world example of this." },
+    { label: "Why it matters", prompt: "Why does this matter and where would I use it?" },
+    { label: "Break it down", prompt: "Can you break this down into simpler pieces?" },
+  ],
+};
+
+// The tail is subject-agnostic — moves that help on any lesson.
+const LESSON_PROMPTS_GENERIC: LessonPrompt[] = [
+  { label: "Explain simpler", prompt: "Can you explain that more simply?" },
+  { label: "Quiz me", prompt: "Quiz me on this to check what I understood." },
+];
+
+function lessonPromptsFor(
+  topic: string,
+  subjects: string[],
+  klass?: string,
+): LessonPrompt[] {
+  const kind = lessonSubjectKind([topic, klass ?? "", ...subjects].join(" "));
+  return [...LESSON_PROMPTS_BY_SUBJECT[kind], ...LESSON_PROMPTS_GENERIC];
+}
+
 // Home-dashboard card: one topic input with two ways to work it — "Learn"
 // opens a lesson that flows into a teach-back on the same topic, and "Teach
 // back" jumps straight to the Feynman exercise on what you already know. Tapping
@@ -9049,6 +9149,7 @@ function isBareYouTubeUrl(s: string): boolean {
 type GradeDoc = { name: string; base64: string; mediaType: string };
 type CriterionScore = {
   criterion: string;
+  evidence?: string;
   estimatedScore: string;
   strengths: string;
   gaps: string;
@@ -9205,6 +9306,11 @@ function ProjectGrader({ profile }: { profile: LearnerProfile }) {
               <div style={styles.qaHead}>
                 {c.criterion} — {c.estimatedScore}
               </div>
+              {c.evidence && (
+                <div style={styles.resultText}>
+                  <strong>Evidence:</strong> {c.evidence}
+                </div>
+              )}
               <div style={styles.resultText}>
                 <strong>Strengths:</strong> {c.strengths}
               </div>
@@ -10776,6 +10882,7 @@ type Feedback = {
   strengths: string[];
   improve: { point: string; how?: string }[];
   issues?: FeedbackIssue[];
+  rationale?: string;
   score?: number;
   grade?: string;
   nextStep?: string;
@@ -10967,6 +11074,11 @@ function AssignmentFeedback({
             </span>
           )}
           <p style={styles.afbOverall}>{fb.overall}</p>
+          {fb.rationale && (
+            <p style={{ ...styles.afbOverall, color: "var(--muted)", fontSize: 13 }}>
+              <b>Why this grade:</b> {fb.rationale}
+            </p>
+          )}
           {(() => {
             const st = writingStats(work);
             return st ? (
@@ -16386,6 +16498,30 @@ function ElioraApp() {
         ))}
       </div>
 
+      {messages.length > 0 && (
+        <div
+          style={styles.lessonAsk}
+          role="group"
+          aria-label="Ask a question about this lesson"
+        >
+          <span style={styles.lessonAskLabel}>Ask</span>
+          {lessonPromptsFor(activeChat?.title ?? "", subjects, profile?.klass).map(
+            (p) => (
+              <button
+                key={p.label}
+                type="button"
+                style={styles.quickChip}
+                disabled={busy || !!pendingKickoff}
+                onClick={() => void send(p.prompt)}
+                title={p.prompt}
+              >
+                {p.label}
+              </button>
+            ),
+          )}
+        </div>
+      )}
+
       <div style={styles.composerActions}>
         <div
           style={styles.teachLevelGroup}
@@ -20419,6 +20555,21 @@ const styles: Record<string, React.CSSProperties> = {
     flexWrap: "wrap",
     gap: 6,
     padding: "8px 0 0",
+  },
+  lessonAsk: {
+    display: "flex",
+    flexWrap: "wrap",
+    alignItems: "center",
+    gap: 6,
+    padding: "10px 0 0",
+  },
+  lessonAskLabel: {
+    fontSize: 11,
+    fontWeight: 700,
+    textTransform: "uppercase",
+    letterSpacing: 0.4,
+    color: "var(--muted)",
+    paddingRight: 2,
   },
   quickChip: {
     padding: "5px 12px",

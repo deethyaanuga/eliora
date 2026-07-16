@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useRef, useState, type ReactNode } from "react";
+import { useCallback, useEffect, useRef, useState, type ReactNode } from "react";
 import { signIn, signOut, useSession } from "next-auth/react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -1525,29 +1525,70 @@ function TeachBackRecorder({
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     ("SpeechRecognition" in window || "webkitSpeechRecognition" in (window as any));
 
-  // Acquire the camera + mic once, on open.
-  useEffect(() => {
-    let cancelled = false;
-    (async () => {
-      try {
-        const stream = await navigator.mediaDevices.getUserMedia({
-          video: true,
-          audio: true,
-        });
-        if (cancelled) {
-          stream.getTracks().forEach((t) => t.stop());
-          return;
-        }
-        streamRef.current = stream;
-        setReady(true);
-      } catch {
+  // Whether this component is still mounted — lets an in-flight getUserMedia
+  // bail out cleanly if the modal was closed before the camera came up.
+  const mountedRef = useRef(true);
+
+  // Ask the browser for the camera + mic. Called on open and again whenever the
+  // learner hits "Try again" after granting access. Translates the browser's
+  // error into a message that tells them exactly what to fix.
+  const acquire = useCallback(async () => {
+    setError(null);
+    setReady(false);
+    // Secure-context / unsupported-browser guard: getUserMedia only exists on
+    // https:// or localhost. Without this we'd throw a cryptic "undefined".
+    if (
+      typeof navigator === "undefined" ||
+      !navigator.mediaDevices ||
+      !navigator.mediaDevices.getUserMedia
+    ) {
+      setError(
+        window.isSecureContext
+          ? "This browser doesn't support camera recording. Try Chrome, Edge, or Safari."
+          : "Your camera can only be used over a secure (https) connection. Open this page via https:// or localhost and try again.",
+      );
+      return;
+    }
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({
+        video: true,
+        audio: true,
+      });
+      if (!mountedRef.current) {
+        stream.getTracks().forEach((t) => t.stop());
+        return;
+      }
+      streamRef.current = stream;
+      setReady(true);
+    } catch (e) {
+      if (!mountedRef.current) return;
+      const name = (e as DOMException)?.name;
+      if (name === "NotAllowedError" || name === "SecurityError") {
         setError(
-          "Couldn't reach your camera and microphone. Check your browser's permissions and try again.",
+          "Camera and mic access was blocked. Click the camera icon in your browser's address bar, allow access, then hit Try again.",
+        );
+      } else if (name === "NotFoundError" || name === "OverconstrainedError") {
+        setError(
+          "No camera or microphone was found. Plug one in (or check it isn't disabled), then hit Try again.",
+        );
+      } else if (name === "NotReadableError") {
+        setError(
+          "Your camera is already in use by another app. Close it (Zoom, FaceTime, etc.), then hit Try again.",
+        );
+      } else {
+        setError(
+          "Couldn't reach your camera and microphone. Check your browser's permissions, then hit Try again.",
         );
       }
-    })();
+    }
+  }, []);
+
+  // Acquire the camera + mic on open; tear everything down on unmount.
+  useEffect(() => {
+    mountedRef.current = true;
+    acquire();
     return () => {
-      cancelled = true;
+      mountedRef.current = false;
       teardown();
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -1705,7 +1746,14 @@ function TeachBackRecorder({
         </p>
 
         {error ? (
-          <div style={styles.recError}>{error}</div>
+          <>
+            <div style={styles.recError}>{error}</div>
+            <div style={styles.recControls}>
+              <button style={styles.recPrimary} onClick={acquire}>
+                ↺ Try again
+              </button>
+            </div>
+          </>
         ) : (
           <>
             <div style={styles.recStage}>

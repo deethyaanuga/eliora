@@ -18883,7 +18883,7 @@ const styles: Record<string, React.CSSProperties> = {
   },
   musicTabActive: {
     background: "var(--accent-soft)",
-    borderColor: "var(--accent)",
+    border: "1px solid var(--accent)",
     color: "var(--accent)",
     fontWeight: 700,
   },

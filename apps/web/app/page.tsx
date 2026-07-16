@@ -1488,6 +1488,117 @@ function teachLevelWord(level: TeachLevel): string {
   }
 }
 
+// —— Teach a student —————————————————————————————————————————————————————
+// The flip side of teach-back. Instead of explaining to Eliora-the-teacher, you
+// teach a concept to Eliora role-playing a STUDENT who learns a certain way.
+// The four learning styles (the VARK model) make the student get stuck — and
+// light up — differently, so you have to shape your explanation to reach them.
+// Teaching one idea four different ways is the deepest test of understanding.
+type StudentStyle = "visual" | "auditory" | "reading" | "kinesthetic";
+
+const STUDENT_STYLES: {
+  id: StudentStyle;
+  name: string;
+  label: string;
+  emoji: string;
+  hint: string;
+}[] = [
+  { id: "visual", name: "Maya", label: "Visual", emoji: "👁️", hint: "Maya — learns from pictures, diagrams, and how things are laid out" },
+  { id: "auditory", name: "Theo", label: "Auditory", emoji: "👂", hint: "Theo — learns by hearing it explained, talking it through, analogies & stories" },
+  { id: "reading", name: "Riya", label: "Reading/Writing", emoji: "✍️", hint: "Riya — learns from written steps, definitions, and lists she can note down" },
+  { id: "kinesthetic", name: "Kai", label: "Hands-on", emoji: "✋", hint: "Kai — learns by doing: real examples, worked problems, hands-on practice" },
+];
+
+function studentStyleInfo(style: StudentStyle) {
+  return STUDENT_STYLES.find((s) => s.id === style) ?? STUDENT_STYLES[0];
+}
+
+// How the student Eliora plays behaves in character: what confuses them, the
+// questions they ask, and what finally makes it click — all keyed to their
+// learning style. This is the heart of the exercise: you only reach the student
+// by teaching to the way they learn.
+function studentStyleFraming(style: StudentStyle): string {
+  switch (style) {
+    case "visual":
+      return (
+        `You learn by SEEING. You think in pictures, diagrams, and where things ` +
+        `sit relative to each other, and you get lost in long word-only ` +
+        `explanations. Ask me to show you what it looks like — to sketch it, ` +
+        `describe a diagram, use colors or arrows, or paint a mental picture. ` +
+        `When I give you something you can picture, say it finally clicks; when ` +
+        `I just pile on words, say your eyes glaze over and ask me to help you ` +
+        `see it. `
+      );
+    case "auditory":
+      return (
+        `You learn by HEARING and TALKING it through. You want it said out loud ` +
+        `in plain language, with analogies, stories, and a little back-and-forth ` +
+        `— a silent diagram does nothing for you. Ask me to explain it aloud a ` +
+        `different way, give you an analogy, or talk through the reasoning step ` +
+        `by step, and repeat key bits back to check you heard right. When I use ` +
+        `a good analogy or rhythm, say it clicks; when I just point at something ` +
+        `visual, say you need to hear how it works. `
+      );
+    case "reading":
+      return (
+        `You learn from WORDS ON A PAGE. You want clear written steps, precise ` +
+        `definitions, and lists you could copy into your notes — vague talk ` +
+        `frustrates you. Ask me to lay it out as numbered steps, define the key ` +
+        `terms, or give you the rule in one clean sentence. When I give you ` +
+        `something structured you could write down, say it clicks; when I stay ` +
+        `hand-wavy, say you can't take notes on that and ask me to spell it out. `
+      );
+    case "kinesthetic":
+      return (
+        `You learn by DOING. Abstract theory bores and loses you fast — you need ` +
+        `a real example, a worked problem, or something hands-on you can try ` +
+        `yourself. Ask me how you'd actually USE this, for a concrete real-life ` +
+        `example, or to walk through a problem together. When I give you ` +
+        `something to do or a real scenario, say it clicks; when I stay abstract, ` +
+        `say you're not following and ask for a real example. `
+      );
+    default:
+      return "";
+  }
+}
+
+// The message that kicks off a "teach a student" role-play. Eliora plays a
+// student with the given learning style at the given grade level; you're the
+// teacher. It opens in character, reacts turn by turn to how well you adapt to
+// the way it learns, and — once it clicks — steps out of character to coach you.
+function teachStudentKickoff(
+  topic: string,
+  style: StudentStyle,
+  level: TeachLevel = "middle",
+): string {
+  const s = studentStyleInfo(style);
+  const t = topic.trim();
+  const about = t ? `"${t}"` : "a topic I'll pick in a moment";
+  const styleWord = s.label.toLowerCase();
+  return (
+    `Let's role-play so I can practice teaching — the best test of whether I ` +
+    `really understand something is whether I can teach it to someone who ` +
+    `learns differently than I do.\n\n` +
+    `You are ${s.name}, a ${teachLevelWord(level)} student, and I'm your ` +
+    `teacher. Today I'm going to teach you ${about}. Stay fully in character ` +
+    `as ${s.name} the whole time.\n\n` +
+    `${s.name}'s learning style: ${studentStyleFraming(style)}\n` +
+    `Behave like a real ${teachLevelWord(level)} student: use vocabulary that ` +
+    `fits your age, be curious but easily confused, and at some point reveal ` +
+    `one small, believable misconception for me to catch and fix. Ask me short, ` +
+    `in-character questions the way ${s.name} really would — don't explain the ` +
+    `topic to me, and don't break character to give me hints.\n\n` +
+    `Start now: in a sentence or two, as ${s.name}, tell me you're a bit lost ` +
+    `on ${about} and ask me to teach you — hinting at how you learn best. Then ` +
+    `let me teach, reacting honestly each turn: only say it truly clicks once ` +
+    `I've explained it in a way that fits how you learn.\n\n` +
+    `Once you genuinely get it, STOP the role-play and switch to being Eliora, ` +
+    `my coach: tell me what I taught well, whether I adapted to how ${s.name} ` +
+    `learns (a ${styleWord} learner) or missed it, and give me one concrete ` +
+    `tip for teaching a ${styleWord} learner next time.`
+  );
+}
+
 // Record yourself teaching a concept to camera (the Feynman technique works
 // even better out loud). We capture video for the learner to watch back AND —
 // where the browser supports speech recognition — transcribe what they say so
@@ -3341,6 +3452,140 @@ function LearnStarter({
         style={styles.teachLevelGroup}
         role="group"
         aria-label="Teach-back difficulty"
+      >
+        <span style={styles.teachLevelLabel}>Level</span>
+        {TEACH_LEVELS.map((lvl) => (
+          <button
+            key={lvl.id}
+            type="button"
+            onClick={() => onLevel(lvl.id)}
+            disabled={busy}
+            title={lvl.hint}
+            aria-pressed={level === lvl.id}
+            style={{
+              ...styles.teachLevelBtn,
+              ...(level === lvl.id ? styles.teachLevelBtnActive : null),
+            }}
+          >
+            {lvl.emoji} {lvl.label}
+          </button>
+        ))}
+      </div>
+      {suggestions.length > 0 && (
+        <div style={styles.topicChips}>
+          {suggestions.map((s) => (
+            <button
+              key={s}
+              style={styles.topicChip}
+              disabled={busy}
+              onClick={() => setTopic(s)}
+              title={`Fill the box with ${s}`}
+            >
+              {s}
+            </button>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+// Home-dashboard card: the flip side of teach-back. Pick a topic and a student
+// who learns a certain way, and Eliora role-plays that student for you to teach.
+// Teaching one idea to a visual, an auditory, a reading, and a hands-on learner
+// is the deepest way to prove — and deepen — that you really understand it.
+function TeachStudentStarter({
+  subjects,
+  missed,
+  busy,
+  style,
+  onStyle,
+  level,
+  onLevel,
+  onTeach,
+}: {
+  subjects: string[];
+  missed: string[];
+  busy: boolean;
+  style: StudentStyle;
+  onStyle: (s: StudentStyle) => void;
+  level: TeachLevel;
+  onLevel: (level: TeachLevel) => void;
+  onTeach: (topic: string, style: StudentStyle, level: TeachLevel) => void;
+}) {
+  const [topic, setTopic] = useState("");
+  const picked = studentStyleInfo(style);
+  // Weak spots first — teaching a topic you got wrong is where explaining it to
+  // a different kind of learner pays off most.
+  const suggestions = Array.from(
+    new Set(
+      [...missed.slice(0, 3), ...subjects].map((s) => s.trim()).filter(Boolean),
+    ),
+  ).slice(0, 5);
+  const run = () => {
+    const v = topic.trim();
+    if (!v || busy) return;
+    onTeach(v, style, level);
+    setTopic("");
+  };
+  return (
+    <div style={styles.card}>
+      <div style={styles.cardHead}>
+        <span style={styles.cardClass}>🧑‍🏫 Teach a student</span>
+      </div>
+      <p style={{ color: "var(--muted)", margin: "2px 0 10px", fontSize: 13 }}>
+        Pick a topic and a student. I&apos;ll play <b>{picked.name}</b>, who
+        learns best the <b>{picked.label.toLowerCase()}</b> way — you teach me,
+        and it only counts once it clicks for how I learn. Teaching every style
+        is the real test of what you know.
+      </p>
+      <div style={styles.topicRow}>
+        <input
+          style={styles.topicInput}
+          value={topic}
+          placeholder="e.g. fractions, photosynthesis, supply & demand…"
+          onChange={(e) => setTopic(e.target.value)}
+          onKeyDown={(e) => {
+            if (e.key === "Enter") run();
+          }}
+          disabled={busy}
+        />
+        <button
+          style={styles.topicBtn}
+          disabled={busy || !topic.trim()}
+          onClick={run}
+          title={`Teach ${picked.name} — a ${picked.label.toLowerCase()} learner`}
+        >
+          Teach {picked.name} →
+        </button>
+      </div>
+      <div
+        style={styles.teachLevelGroup}
+        role="group"
+        aria-label="Student learning style"
+      >
+        <span style={styles.teachLevelLabel}>Student</span>
+        {STUDENT_STYLES.map((s) => (
+          <button
+            key={s.id}
+            type="button"
+            onClick={() => onStyle(s.id)}
+            disabled={busy}
+            title={s.hint}
+            aria-pressed={style === s.id}
+            style={{
+              ...styles.teachLevelBtn,
+              ...(style === s.id ? styles.teachLevelBtnActive : null),
+            }}
+          >
+            {s.emoji} {s.label}
+          </button>
+        ))}
+      </div>
+      <div
+        style={{ ...styles.teachLevelGroup, marginTop: 8 }}
+        role="group"
+        aria-label="Student grade level"
       >
         <span style={styles.teachLevelLabel}>Level</span>
         {TEACH_LEVELS.map((lvl) => (
@@ -10227,6 +10472,239 @@ function QuizView({
   );
 }
 
+// Dedicated "test yourself" flow: the learner names a topic (or taps a subject
+// / weak area), picks how hard and how many questions, and Eliora generates a
+// fresh multiple-choice quiz on demand — grounded in the topic, not in pasted
+// material. Wrong answers still feed the mistake tracker and can spin up a
+// targeted study guide, exactly like a quiz built from notes.
+type QuizDifficulty =
+  | "kindergarten"
+  | "elementary"
+  | "middle"
+  | "high"
+  | "college";
+
+const QUIZ_DIFFICULTIES: { key: QuizDifficulty; label: string }[] = [
+  { key: "kindergarten", label: "Kindergarten" },
+  { key: "elementary", label: "Elementary" },
+  { key: "middle", label: "Middle school" },
+  { key: "high", label: "High school" },
+  { key: "college", label: "College" },
+];
+
+function PracticeQuiz({
+  profile,
+  subjects,
+  missed,
+  onMissed,
+  onMistake,
+  onStudyGuide,
+}: {
+  profile: LearnerProfile | null;
+  subjects: string[];
+  missed: string[];
+  onMissed: (topic: string) => void;
+  onMistake: (m: {
+    concept: string;
+    why?: string;
+    fix?: string;
+  }) => void;
+  onStudyGuide: (detail: string) => void;
+}) {
+  const [topic, setTopic] = useState("");
+  const [difficulty, setDifficulty] = useState<QuizDifficulty>("high");
+  const [count, setCount] = useState(5);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [quiz, setQuiz] = useState<QuizQuestion[] | null>(null);
+  const [quizTopic, setQuizTopic] = useState("");
+
+  // One-tap starting points: the classes they're studying, then anything
+  // they've been getting wrong (deduped, weak areas first).
+  const suggestions = Array.from(
+    new Set([...subjects, ...missed].map((s) => s.trim()).filter(Boolean)),
+  ).slice(0, 8);
+
+  async function generate(t: string) {
+    const clean = t.trim();
+    if (!clean || busy) return;
+    setBusy(true);
+    setError(null);
+    setQuiz(null);
+    try {
+      const res = await fetch("/api/practice-quiz", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          topic: clean,
+          count,
+          difficulty,
+          // Aim the quiz at weak areas that relate to this topic when we can,
+          // otherwise pass them all so the model can weight toward them.
+          focus: missed.slice(0, 8),
+          profile: profile ?? undefined,
+        }),
+      });
+      const data = await res.json();
+      if (data.error || !Array.isArray(data.quiz) || !data.quiz.length) {
+        setError(data.error || "I couldn't build a quiz on that. Try another topic.");
+      } else {
+        setQuiz(data.quiz);
+        setQuizTopic(clean);
+      }
+    } catch {
+      setError("Something went wrong. Please try again.");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  function reset() {
+    setQuiz(null);
+    setError(null);
+  }
+
+  return (
+    <div style={styles.studyScroll}>
+      <div style={styles.card}>
+        <div style={styles.cardHead}>
+          <span style={styles.cardClass}>🧠 Practice quiz</span>
+        </div>
+        <p style={styles.assignEmpty}>
+          Pick something to be quizzed on — a class, a topic, or something you&apos;ve
+          been getting wrong. Eliora writes a fresh multiple-choice quiz just for
+          you.
+        </p>
+
+        {!quiz && (
+          <>
+            <div style={styles.assignAddRow}>
+              <input
+                style={styles.assignInput}
+                value={topic}
+                placeholder="Quiz me on… (e.g. photosynthesis, WWII causes)"
+                onChange={(e) => setTopic(e.target.value)}
+                onKeyDown={(e) => {
+                  if (e.key === "Enter") generate(topic);
+                }}
+                disabled={busy}
+              />
+              <button
+                style={styles.assignAddBtn}
+                onClick={() => generate(topic)}
+                disabled={busy || !topic.trim()}
+              >
+                {busy ? "Writing…" : "Start"}
+              </button>
+            </div>
+
+            {suggestions.length > 0 && (
+              <div style={{ ...styles.folderRow, marginTop: 6 }}>
+                {suggestions.map((s) => (
+                  <button
+                    key={s}
+                    style={styles.folder}
+                    onClick={() => {
+                      setTopic(s);
+                      generate(s);
+                    }}
+                    disabled={busy}
+                  >
+                    {missed.includes(s) ? "🎯 " : "📁 "}
+                    {s}
+                  </button>
+                ))}
+              </div>
+            )}
+
+            <div style={{ marginTop: 14 }}>
+              <div style={styles.quizQ}>How hard?</div>
+              <div style={{ ...styles.folderRow, marginTop: 4 }}>
+                {QUIZ_DIFFICULTIES.map((d) => (
+                  <button
+                    key={d.key}
+                    onClick={() => setDifficulty(d.key)}
+                    disabled={busy}
+                    style={{
+                      ...styles.folder,
+                      ...(difficulty === d.key
+                        ? {
+                            background: "var(--assistant-bubble)",
+                            fontWeight: 700,
+                          }
+                        : {}),
+                    }}
+                  >
+                    {d.label}
+                  </button>
+                ))}
+              </div>
+            </div>
+
+            <div style={{ marginTop: 14 }}>
+              <div style={styles.quizQ}>How many questions?</div>
+              <div style={{ ...styles.folderRow, marginTop: 4 }}>
+                {[3, 5, 7, 10].map((n) => (
+                  <button
+                    key={n}
+                    onClick={() => setCount(n)}
+                    disabled={busy}
+                    style={{
+                      ...styles.folder,
+                      ...(count === n
+                        ? {
+                            background: "var(--assistant-bubble)",
+                            fontWeight: 700,
+                          }
+                        : {}),
+                    }}
+                  >
+                    {n}
+                  </button>
+                ))}
+              </div>
+            </div>
+
+            {error && (
+              <div style={{ ...styles.assignEmpty, color: "#b3453b" }}>{error}</div>
+            )}
+          </>
+        )}
+      </div>
+
+      {busy && !quiz && (
+        <div style={styles.card}>
+          <p style={styles.assignEmpty}>Writing your quiz… ✍️</p>
+        </div>
+      )}
+
+      {quiz && (
+        <>
+          <div
+            style={{
+              display: "flex",
+              alignItems: "center",
+              justifyContent: "space-between",
+              margin: "2px 2px 8px",
+            }}
+          >
+            <span style={styles.cardClass}>📝 {quizTopic}</span>
+            <button style={styles.assignAddBtn} onClick={reset}>
+              ← New quiz
+            </button>
+          </div>
+          <QuizView
+            quiz={quiz}
+            onMissed={onMissed}
+            onMistake={onMistake}
+            onStudyGuide={onStudyGuide}
+          />
+        </>
+      )}
+    </div>
+  );
+}
+
 // Folders Eliora creates for each subject the student needs help with.
 function SubjectsPanel({
   subjects,
@@ -11861,6 +12339,7 @@ function ElioraApp() {
     | "home"
     | "chat"
     | "summarize"
+    | "practice"
     | "calendar"
     | "plan"
     | "progress"
@@ -11914,6 +12393,9 @@ function ElioraApp() {
   // How hard the next teach-back should push — shared by the composer chips and
   // the recorder so every teach-back entry point respects the current pick.
   const [teachLevel, setTeachLevel] = useState<TeachLevel>("middle");
+  // Which kind of learner Eliora role-plays in "Teach a student" — the topic you
+  // teach stays the same, but the student you have to reach changes.
+  const [studentStyle, setStudentStyle] = useState<StudentStyle>("visual");
   const [remindersOn, setRemindersOn] = useState(false);
   const [notifSupported, setNotifSupported] = useState(false);
   const [dismissed, setDismissed] = useState<string[]>([]);
@@ -14103,6 +14585,29 @@ function ElioraApp() {
     setPendingKickoff(teachBackKickoff(concept, level));
   }
 
+  // Open a brand-new chat where you teach a topic to Eliora playing a student
+  // with a particular learning style (Home "Teach a student" card path).
+  function startTeachStudent(
+    rawTopic: string,
+    style: StudentStyle,
+    level: TeachLevel = "middle",
+  ) {
+    const topic = rawTopic.trim();
+    if (!topic || busy || pendingKickoff) return;
+    const s = studentStyleInfo(style);
+    const id = newChatId();
+    // Keep the greeting first so send()'s history slicing stays correct.
+    const msgs = profile ? [greetingFor(profile)] : [];
+    const label = `Teach ${s.name}: ${topic}`;
+    const title = label.length > 28 ? label.slice(0, 28) + "…" : label;
+    setChats((prev) => [...prev, { id, title, messages: msgs, named: true }]);
+    setActiveChatId(id);
+    setInput("");
+    setTab("chat");
+    setSidebarOpen(false);
+    setPendingKickoff(teachStudentKickoff(topic, style, level));
+  }
+
   // Start a teach-back inside the CURRENT chat (composer quick-action). Uses
   // whatever's in the composer as the concept, or lets Eliora pick from context.
   function teachBackInChat() {
@@ -14551,6 +15056,7 @@ function ElioraApp() {
               ["home", "🏠 Home"],
               ["chat", "💬 Chat"],
               ["summarize", "📝 Notes"],
+              ["practice", "🧠 Practice"],
               ["calendar", "📅 Calendar"],
               ["plan", "🎯 Plan"],
               ["progress", "📊 Progress"],
@@ -14982,6 +15488,16 @@ function ElioraApp() {
               onLearn={startTopicChat}
               onTeachBack={startTeachBack}
             />
+            <TeachStudentStarter
+              subjects={subjects}
+              missed={missed}
+              busy={busy || !!pendingKickoff}
+              style={studentStyle}
+              onStyle={setStudentStyle}
+              level={teachLevel}
+              onLevel={setTeachLevel}
+              onTeach={startTeachStudent}
+            />
             <StudyNextCard
               profile={profile}
               missed={missed}
@@ -15009,6 +15525,7 @@ function ElioraApp() {
                 [
                   ["💬", "New chat", "Talk through anything", () => newChat()],
                   ["📝", "Summarize notes", "Notes → study set", () => setTab("summarize")],
+                  ["🧠", "Practice quiz", "Test what you know", () => setTab("practice")],
                   ["🎯", "My plan", "See your next step", () => setTab("plan")],
                   ["🗺️", "4-year plan", "Map your path", () => setTab("plan")],
                 ] as const
@@ -15121,6 +15638,17 @@ function ElioraApp() {
             ]);
             setTab("chat");
           }}
+          onStudyGuide={studyGuideFromQuiz}
+        />
+      )}
+
+      {tab === "practice" && (
+        <PracticeQuiz
+          profile={profile}
+          subjects={subjects}
+          missed={missed}
+          onMissed={addMissed}
+          onMistake={(m) => logMistake({ ...m, source: "quiz" })}
           onStudyGuide={studyGuideFromQuiz}
         />
       )}
@@ -18371,9 +18899,11 @@ const styles: Record<string, React.CSSProperties> = {
   practiceStage: {
     position: "relative",
     width: "100%",
-    aspectRatio: "16 / 9",
+    aspectRatio: "4 / 3",
+    minHeight: 480,
+    maxHeight: "70vh",
     background: "#000",
-    borderRadius: 16,
+    borderRadius: 18,
     overflow: "hidden",
     border: "1px solid var(--border)",
   },
@@ -18395,19 +18925,19 @@ const styles: Record<string, React.CSSProperties> = {
     gap: 10,
     background: "var(--surface)",
   },
-  practiceAudioIcon: { fontSize: 52 },
+  practiceAudioIcon: { fontSize: 80 },
   practiceRecDot: {
     position: "absolute",
-    top: 12,
-    left: 12,
+    top: 16,
+    left: 16,
     display: "flex",
     alignItems: "center",
-    gap: 8,
+    gap: 10,
     background: "rgba(0,0,0,0.55)",
     color: "#fff",
-    fontSize: 14,
+    fontSize: 17,
     fontWeight: 700,
-    padding: "6px 12px",
+    padding: "8px 16px",
     borderRadius: 999,
   },
   practiceRecPulse: {

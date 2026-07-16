@@ -1939,6 +1939,72 @@ material, a one-line explanation, and a short topic tag. Call the make_quiz tool
 with the questions.${tailor}`;
 }
 
+// ---------------------------------------------------------------------------
+// Practice quizzes.
+//
+// Unlike the summarizer's quiz (which is grounded ONLY in pasted material), a
+// practice quiz is generated from a TOPIC the learner names, optionally aimed
+// at the things they've been getting wrong. This is the "test yourself" flow:
+// pick a subject, choose how hard and how many questions, and drill.
+// ---------------------------------------------------------------------------
+
+export type QuizDifficulty =
+  | "kindergarten"
+  | "elementary"
+  | "middle"
+  | "high"
+  | "college";
+
+export interface PracticeQuizRequest {
+  topic: string; // what to quiz on, e.g. "photosynthesis" or "Algebra 1: factoring"
+  count?: number; // how many questions (default 5, clamped 3–10)
+  difficulty?: QuizDifficulty; // grade band to pitch the questions at
+  focus?: string[]; // weak topics / past mistakes to target first
+  profile?: LearnerProfile;
+}
+
+const QUIZ_DIFFICULTY_LABEL: Record<QuizDifficulty, string> = {
+  kindergarten: "kindergarten (ages 5–6): very simple recall, one clear idea per question",
+  elementary: "elementary school (grades 1–5): basic recall and simple reasoning",
+  middle: "middle school (grades 6–8): solid understanding and one-step application",
+  high: "high school (grades 9–12): application, analysis, and common-mistake traps",
+  college: "college level: deep application, synthesis, and edge cases",
+};
+
+// System prompt for a topic-based practice quiz. Unlike the summarizer this
+// does NOT require pasted material — the model draws on its own knowledge of the
+// topic, but must keep every question factually correct and unambiguous.
+export function practiceQuizPrompt(req: PracticeQuizRequest): string {
+  const count = Math.min(10, Math.max(3, req.count ?? 5));
+  const band = QUIZ_DIFFICULTY_LABEL[req.difficulty ?? "high"];
+  const focus =
+    req.focus && req.focus.length
+      ? `\nThe learner has been getting these things wrong — weight the quiz \
+toward them and gently re-check the underlying idea: ${req.focus
+          .slice(0, 8)
+          .join("; ")}.`
+      : "";
+  return `You are Eliora, a warm, encouraging study coach. Create a ${count}-question \
+multiple-choice PRACTICE QUIZ on: "${req.topic.trim()}".
+
+Pitch it at ${band}.
+
+Rules:
+- Exactly ${count} questions. Each has 3–4 answer options and EXACTLY ONE correct answer.
+- Every question and every correct answer must be FACTUALLY CORRECT and unambiguous. \
+Do not write trick questions with two defensible answers.
+- Make the wrong options plausible (common misconceptions), not obviously silly.
+- For each question include a short one-line "explanation" of why the correct answer \
+is right, and a short "topic" tag naming the sub-concept it tests.
+- Vary difficulty within the set: start easier, build up. Mix recall with \
+"apply it / explain why" questions.
+- Keep language plain and questions short — easy to read for someone with ADHD.${focus}${learnerTailor(
+    req.profile,
+  )}
+
+Call the make_quiz tool with the questions.`;
+}
+
 // Follow-up Q&A about the study notes Eliora just generated. The notes travel
 // in the system prompt as the ONLY source of truth so answers stay grounded.
 export interface NotesQaRequest {

@@ -4138,6 +4138,7 @@ type CustomReward = {
   title: string;
   cost: number;
   redeemed: number; // how many times it's been claimed
+  log?: string[]; // what the student typed each time they redeemed ("their output")
 };
 
 const REWARD_EMOJIS = [
@@ -4156,12 +4157,21 @@ function MyRewardsCard({
   rewards: CustomReward[];
   goals: SmartGoal[];
   onAdd: (emoji: string, title: string, cost: number) => void;
-  onRedeem: (id: string) => void;
+  onRedeem: (id: string, note?: string) => void;
   onRemove: (id: string) => void;
 }) {
   const [emoji, setEmoji] = useState(REWARD_EMOJIS[0]);
   const [title, setTitle] = useState("");
   const [cost, setCost] = useState("");
+  // Which reward is mid-redeem (its compose box is open) and what the student
+  // is typing as "their output" — a note about what they did to earn it.
+  const [redeemingId, setRedeemingId] = useState<string | null>(null);
+  const [note, setNote] = useState("");
+  const claim = (id: string) => {
+    onRedeem(id, note.trim() || undefined);
+    setRedeemingId(null);
+    setNote("");
+  };
   const costNum = parseInt(cost, 10);
   const canAdd = !!title.trim() && Number.isFinite(costNum) && costNum > 0;
   const add = () => {
@@ -4196,51 +4206,88 @@ function MyRewardsCard({
           // A reward can be the prize for an active goal — surface that tie so
           // the learner sees which goal unlocks this treat for free.
           const prizeGoal = goals.find((g) => g.rewardId === r.id && !g.done);
+          const composing = redeemingId === r.id;
+          const log = r.log ?? [];
           return (
-            <div key={r.id} style={styles.rewardItem}>
-              <span style={styles.rewardEmoji}>{r.emoji}</span>
-              <div style={{ flex: 1, minWidth: 0 }}>
-                <div style={styles.rewardTitle}>
-                  {r.title}
-                  {r.redeemed > 0 && (
-                    <span style={styles.rewardRedeemed}>
-                      {" "}
-                      · claimed ×{r.redeemed}
-                    </span>
-                  )}
-                </div>
-                {prizeGoal && (
-                  <div style={styles.rewardGoalTag} title="Achieve this goal to unlock this reward free">
-                    🎯 Prize for: {prizeGoal.statement?.trim() || prizeGoal.specific}
+            <div key={r.id} style={styles.rewardWrap}>
+              <div style={styles.rewardItem}>
+                <span style={styles.rewardEmoji}>{r.emoji}</span>
+                <div style={{ flex: 1, minWidth: 0 }}>
+                  <div style={styles.rewardTitle}>
+                    {r.title}
+                    {r.redeemed > 0 && (
+                      <span style={styles.rewardRedeemed}>
+                        {" "}
+                        · claimed ×{r.redeemed}
+                      </span>
+                    )}
                   </div>
-                )}
-                <div style={styles.rewardTrack}>
-                  <div style={{ ...styles.rewardFill, width: `${pct}%` }} />
+                  {prizeGoal && (
+                    <div style={styles.rewardGoalTag} title="Achieve this goal to unlock this reward free">
+                      🎯 Prize for: {prizeGoal.statement?.trim() || prizeGoal.specific}
+                    </div>
+                  )}
+                  <div style={styles.rewardTrack}>
+                    <div style={{ ...styles.rewardFill, width: `${pct}%` }} />
+                  </div>
                 </div>
+                <span style={styles.rewardCost}>{r.cost} XP</span>
+                <button
+                  style={{
+                    ...styles.rewardRedeemBtn,
+                    ...(afford ? {} : styles.rewardRedeemOff),
+                  }}
+                  disabled={!afford}
+                  onClick={() =>
+                    composing
+                      ? setRedeemingId(null)
+                      : (setRedeemingId(r.id), setNote(""))
+                  }
+                  title={
+                    afford
+                      ? "Redeem this reward"
+                      : `Earn ${r.cost - availableXp} more XP`
+                  }
+                >
+                  {afford ? (composing ? "Cancel" : "Redeem") : "🔒"}
+                </button>
+                <button
+                  style={styles.assignRemove}
+                  onClick={() => onRemove(r.id)}
+                  aria-label="Remove reward"
+                >
+                  ×
+                </button>
               </div>
-              <span style={styles.rewardCost}>{r.cost} XP</span>
-              <button
-                style={{
-                  ...styles.rewardRedeemBtn,
-                  ...(afford ? {} : styles.rewardRedeemOff),
-                }}
-                disabled={!afford}
-                onClick={() => onRedeem(r.id)}
-                title={
-                  afford
-                    ? "Redeem this reward"
-                    : `Earn ${r.cost - availableXp} more XP`
-                }
-              >
-                {afford ? "Redeem" : "🔒"}
-              </button>
-              <button
-                style={styles.assignRemove}
-                onClick={() => onRemove(r.id)}
-                aria-label="Remove reward"
-              >
-                ×
-              </button>
+              {composing && (
+                <div style={styles.rewardComposeBox}>
+                  <textarea
+                    style={styles.rewardComposeInput}
+                    value={note}
+                    autoFocus
+                    placeholder="Type what you did to earn this (optional) — e.g. finished 3 practice sets and hit my study streak…"
+                    onChange={(e) => setNote(e.target.value)}
+                    onKeyDown={(e) => {
+                      if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) claim(r.id);
+                    }}
+                  />
+                  <button style={styles.rewardClaimBtn} onClick={() => claim(r.id)}>
+                    🎉 Claim · −{r.cost} XP
+                  </button>
+                </div>
+              )}
+              {log.length > 0 && (
+                <div style={styles.rewardLog}>
+                  {log
+                    .slice()
+                    .reverse()
+                    .map((entry, i) => (
+                      <div key={i} style={styles.rewardLogItem}>
+                        <span style={styles.rewardLogDot}>·</span> {entry}
+                      </div>
+                    ))}
+                </div>
+              )}
             </div>
           );
         })
@@ -11164,6 +11211,220 @@ function AssignmentFeedback({
   );
 }
 
+type NotesMode = "clean" | "handwriting" | "highlight";
+type PolishedNotes = {
+  cleaned: string;
+  keyIdeas: string[];
+  keyTerms: { term: string; definition: string }[];
+  note?: string;
+};
+
+// Smart-notes study tool: paste messy notes (or upload a photo of handwriting)
+// and get them back cleaned up, transcribed, and with the key ideas highlighted.
+// Three modes map to the three AI note features; all hit /api/notes-polish.
+function SmartNotes({ profile }: { profile: LearnerProfile | null }) {
+  const [mode, setMode] = useState<NotesMode>("clean");
+  const [text, setText] = useState("");
+  const [file, setFile] = useState<{
+    base64: string;
+    mediaType: string;
+    name: string;
+  } | null>(null);
+  const [loading, setLoading] = useState(false);
+  const [out, setOut] = useState<PolishedNotes | null>(null);
+  const [err, setErr] = useState("");
+  const [copied, setCopied] = useState(false);
+  const canSubmit = (text.trim().length >= 10 || !!file) && !loading;
+
+  function onFile(files: FileList | null) {
+    const f = files?.[0];
+    if (!f) return;
+    const r = new FileReader();
+    r.onload = () => {
+      const s = String(r.result);
+      setFile({
+        base64: s.slice(s.indexOf(",") + 1),
+        mediaType: f.type || "text/plain",
+        name: f.name,
+      });
+      // A photo almost always means handwriting → switch to that mode for them.
+      if ((f.type || "").startsWith("image/")) setMode("handwriting");
+    };
+    r.readAsDataURL(f);
+  }
+
+  async function polish() {
+    if (!canSubmit) return;
+    setLoading(true);
+    setErr("");
+    setOut(null);
+    setCopied(false);
+    try {
+      const res = await fetch("/api/notes-polish", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          mode,
+          text: text.trim() || undefined,
+          fileBase64: file?.base64,
+          fileMediaType: file?.mediaType,
+          fileName: file?.name,
+          profile: profile ?? undefined,
+        }),
+      });
+      const data = (await res.json()) as {
+        result?: PolishedNotes;
+        error?: string;
+      };
+      if (data.result) setOut(data.result);
+      else setErr(data.error || "Couldn't tidy those notes — try again.");
+    } catch {
+      setErr("Couldn't reach the server. Please try again.");
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  async function copyCleaned() {
+    if (!out?.cleaned) return;
+    // Strip the ==highlight== markers so the copied text is plain and clean.
+    const plain = out.cleaned.replace(/==([^=]+)==/g, "$1");
+    try {
+      await navigator.clipboard.writeText(plain);
+      setCopied(true);
+      setTimeout(() => setCopied(false), 1500);
+    } catch {
+      /* clipboard blocked — no-op */
+    }
+  }
+
+  const modes = [
+    ["clean", "🧹 Clean up"],
+    ["handwriting", "✍️ Handwriting"],
+    ["highlight", "🖍️ Highlight"],
+  ] as const;
+
+  return (
+    <div style={styles.card}>
+      <div style={styles.cardHead}>
+        <span style={styles.cardClass}>📝 Smart notes</span>
+      </div>
+      <p style={{ color: "var(--muted)", margin: "4px 0 10px", fontSize: 13.5 }}>
+        Paste messy notes or upload a photo of your handwriting. I'll clean them
+        up, turn handwriting into text, and highlight the key ideas.
+      </p>
+      <div style={styles.outputRow}>
+        {modes.map(([k, label]) => (
+          <button
+            key={k}
+            onClick={() => setMode(k)}
+            style={{ ...styles.outChip, ...(mode === k ? styles.outChipActive : {}) }}
+          >
+            {label}
+          </button>
+        ))}
+      </div>
+      <textarea
+        style={{ ...styles.fypTextarea, marginTop: 10 }}
+        value={text}
+        placeholder={
+          mode === "handwriting"
+            ? "Upload a photo below — or type/paste any notes to tidy up…"
+            : "Paste your messy notes here…"
+        }
+        onChange={(e) => setText(e.target.value)}
+      />
+      <div style={styles.fypUploadRow}>
+        <label style={styles.fypUploadBtn}>
+          📎 {mode === "handwriting" ? "Upload a photo of your notes" : "Upload a file"}
+          <input
+            type="file"
+            accept=".pdf,.txt,.md,image/*,application/pdf"
+            style={styles.fypFileInputHidden}
+            onChange={(e) => onFile(e.target.files)}
+          />
+        </label>
+        <span style={{ color: "var(--muted)", fontSize: 12.5 }}>
+          photo, PDF, or text
+        </span>
+      </div>
+      {file && (
+        <div style={styles.fypDocList}>
+          <span style={styles.fypDocChip}>
+            {file.mediaType.startsWith("image/") ? "🖼️" : "📄"} {file.name}
+            <button
+              style={styles.fypDocRemove}
+              onClick={() => setFile(null)}
+              aria-label="Remove file"
+            >
+              ×
+            </button>
+          </span>
+        </div>
+      )}
+      <button
+        style={{
+          ...styles.studyToolBtn,
+          width: "100%",
+          marginTop: 12,
+          ...(canSubmit ? {} : { opacity: 0.5, cursor: "default" }),
+        }}
+        disabled={!canSubmit}
+        onClick={polish}
+      >
+        {loading
+          ? "Tidying your notes…"
+          : mode === "handwriting"
+            ? "✍️ Convert to text"
+            : mode === "highlight"
+              ? "🖍️ Highlight key ideas"
+              : "🧹 Clean up notes"}
+      </button>
+      {err && (
+        <p style={{ color: "#c0392b", fontSize: 13, marginTop: 8 }}>{err}</p>
+      )}
+      {out && (
+        <div style={styles.afbResult}>
+          {out.note && <p style={styles.afbOverall}>{out.note}</p>}
+          {out.cleaned && (
+            <>
+              <div style={styles.afbSecHead}>
+                📝 Clean notes
+                <button style={styles.notesCopyBtn} onClick={copyCleaned}>
+                  {copied ? "✓ Copied" : "⧉ Copy"}
+                </button>
+              </div>
+              <div style={styles.resultMd}>
+                {renderMarkdown(out.cleaned, "var(--accent)")}
+              </div>
+            </>
+          )}
+          {out.keyIdeas.length > 0 && (
+            <>
+              <div style={styles.afbSecHead}>💡 Key ideas</div>
+              {out.keyIdeas.map((idea, i) => (
+                <div key={i} style={styles.afbLi}>
+                  • {idea}
+                </div>
+              ))}
+            </>
+          )}
+          {out.keyTerms.length > 0 && (
+            <>
+              <div style={styles.afbSecHead}>📚 Key terms</div>
+              {out.keyTerms.map((t, i) => (
+                <div key={i} style={styles.afbLi}>
+                  • <b>{t.term}</b> — {t.definition}
+                </div>
+              ))}
+            </>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
 function greetingFor(p: LearnerProfile): Message {
   const name = p.name?.trim() ? `, ${p.name.trim()}` : "";
   return {
@@ -12410,12 +12671,21 @@ function ElioraApp() {
       },
     ]);
   };
-  const redeemCustomReward = (id: string) => {
+  const redeemCustomReward = (id: string, note?: string) => {
     const r = customRewards.find((x) => x.id === id);
     if (!r || totalXp - spentXp < r.cost) return; // can't afford it
     setSpentXp((s) => s + r.cost);
+    const entry = note?.trim();
     setCustomRewards((prev) =>
-      prev.map((x) => (x.id === id ? { ...x, redeemed: x.redeemed + 1 } : x)),
+      prev.map((x) =>
+        x.id === id
+          ? {
+              ...x,
+              redeemed: x.redeemed + 1,
+              log: entry ? [...(x.log ?? []), entry] : x.log,
+            }
+          : x,
+      ),
     );
     setXpToast(`🎉 Redeemed ${r.emoji} ${r.title} · −${r.cost} XP`);
   };
@@ -16398,6 +16668,7 @@ function ElioraApp() {
               />
             </div>
           </div>
+          <SmartNotes profile={profile} />
           <PresentationPractice />
           <ProjectGrader profile={profile} />
           <AssignmentFeedback
@@ -16889,13 +17160,56 @@ const styles: Record<string, React.CSSProperties> = {
     gap: 8,
     marginTop: 8,
   },
+  rewardWrap: { borderTop: "1px solid var(--border)" },
   rewardItem: {
     display: "flex",
     alignItems: "center",
     gap: 10,
     padding: "9px 0",
-    borderTop: "1px solid var(--border)",
   },
+  rewardComposeBox: {
+    display: "flex",
+    flexDirection: "column",
+    gap: 8,
+    padding: "0 0 12px 36px",
+  },
+  rewardComposeInput: {
+    width: "100%",
+    minHeight: 60,
+    resize: "vertical",
+    padding: "9px 11px",
+    borderRadius: 10,
+    border: "1px solid var(--border)",
+    background: "var(--surface)",
+    color: "var(--assistant-text)",
+    fontSize: 13.5,
+    fontFamily: "inherit",
+    lineHeight: 1.45,
+    boxSizing: "border-box",
+  },
+  rewardClaimBtn: {
+    alignSelf: "flex-start",
+    padding: "7px 14px",
+    borderRadius: 9,
+    border: "none",
+    background: "var(--accent)",
+    color: "#fff",
+    fontSize: 13,
+    fontWeight: 700,
+    cursor: "pointer",
+  },
+  rewardLog: {
+    display: "flex",
+    flexDirection: "column",
+    gap: 3,
+    padding: "0 0 10px 36px",
+  },
+  rewardLogItem: {
+    fontSize: 12.5,
+    color: "var(--muted)",
+    lineHeight: 1.4,
+  },
+  rewardLogDot: { color: "var(--accent)", fontWeight: 700 },
   rewardEmoji: { fontSize: 22, flexShrink: 0, width: 26, textAlign: "center" },
   rewardTitle: {
     fontSize: 14,
@@ -19035,9 +19349,9 @@ const styles: Record<string, React.CSSProperties> = {
   practiceStage: {
     position: "relative",
     width: "100%",
-    aspectRatio: "4 / 3",
-    minHeight: 480,
-    maxHeight: "70vh",
+    aspectRatio: "16 / 10",
+    minHeight: 640,
+    maxHeight: "88vh",
     background: "#000",
     borderRadius: 18,
     overflow: "hidden",
@@ -21345,6 +21659,21 @@ const styles: Record<string, React.CSSProperties> = {
     cursor: "pointer",
     whiteSpace: "nowrap",
   },
+  notesCopyBtn: {
+    float: "right",
+    marginTop: -3,
+    padding: "3px 10px",
+    borderRadius: 999,
+    border: "1px solid var(--accent)",
+    background: "transparent",
+    color: "var(--accent)",
+    fontSize: 11.5,
+    fontWeight: 600,
+    textTransform: "none",
+    letterSpacing: 0,
+    cursor: "pointer",
+    whiteSpace: "nowrap",
+  },
   afbStats: {
     display: "flex",
     flexWrap: "wrap",
@@ -21479,6 +21808,38 @@ const styles: Record<string, React.CSSProperties> = {
     marginTop: 6,
     fontSize: 13,
     color: "var(--assistant-text)",
+  },
+  fypFileInputHidden: {
+    position: "absolute",
+    width: 1,
+    height: 1,
+    padding: 0,
+    margin: -1,
+    overflow: "hidden",
+    clip: "rect(0 0 0 0)",
+    whiteSpace: "nowrap",
+    border: 0,
+  },
+  fypUploadRow: {
+    display: "flex",
+    alignItems: "center",
+    gap: 10,
+    flexWrap: "wrap",
+    marginTop: 12,
+  },
+  fypUploadBtn: {
+    display: "inline-flex",
+    alignItems: "center",
+    gap: 7,
+    padding: "10px 16px",
+    background: "var(--surface)",
+    border: "1px solid var(--accent)",
+    borderRadius: 12,
+    fontSize: 14,
+    fontWeight: 600,
+    color: "var(--accent)",
+    cursor: "pointer",
+    whiteSpace: "nowrap",
   },
   fypGradeUpload: {
     display: "block",

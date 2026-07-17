@@ -357,6 +357,73 @@ assignment (still call the tool, with that in "overall").${tailor}
 Return your feedback by calling the give_feedback tool.`;
 }
 
+// ---- /api/notes-polish: three "smart notes" actions ----------------------
+// Take rough input — messy typed notes, OR a photo of handwritten notes — and
+// return a clean, organized version with the key ideas marked. One endpoint,
+// three modes: clean up messy notes, convert handwriting to text, and
+// auto-highlight the key ideas. Forced through the polish_notes tool so the
+// output is always structured (cleaned markdown + pulled-out key ideas/terms).
+
+export type NotesPolishMode = "clean" | "handwriting" | "highlight";
+
+export interface NotesPolishRequest {
+  mode: NotesPolishMode;
+  text?: string; // pasted messy notes, or a decoded text file
+  fileBase64?: string; // base64 image/pdf/text (e.g. a photo of handwriting)
+  fileMediaType?: string; // e.g. "image/jpeg", "application/pdf"
+  fileName?: string;
+  profile?: LearnerProfile;
+}
+
+export function notesPolishSystemPrompt(
+  mode: NotesPolishMode,
+  profile?: LearnerProfile,
+): string {
+  const ground = `You are Eliora, a warm study coach helping a student tidy up \
+their notes. Work ONLY from what the student gives you. Do NOT invent facts, \
+dates, names, or claims that aren't in their notes — you may fix wording, \
+spelling, grammar, and organization, and spell out an abbreviation the student \
+clearly meant, but never add new content they didn't write.`;
+
+  const task =
+    mode === "handwriting"
+      ? `The student uploaded a PHOTO or scan of HANDWRITTEN notes. First read \
+and transcribe the handwriting as faithfully as you can. If a word is genuinely \
+unreadable, write [?] rather than guessing. Then lightly clean it up: fix obvious \
+spelling and spacing, and organize it into clear markdown headings and bullets \
+without changing the meaning.`
+      : mode === "highlight"
+        ? `The notes may already be readable — your main job is to surface the KEY \
+IDEAS. Keep the student's content, tidy it into clean markdown headings and \
+bullets, and mark the most important takeaways so they stand out (see the \
+highlight rule below). Be generous but not indiscriminate with highlights here — \
+this mode is about making the key ideas pop.`
+        : `The student's notes are messy — rushed, disorganized, full of \
+fragments and abbreviations. Clean them up: fix spelling, grammar, and spacing; \
+group related points; and organize everything into clear markdown headings and \
+bullets so it's easy to study from. Keep every real point they made.`;
+
+  return `${ground}
+
+${task}
+
+Return your result by calling the polish_notes tool with:
+- "cleaned": the tidied notes as markdown (## headings, - bullets, **bold**). \
+Wrap the single most important phrase in each section — the core takeaway, key \
+term, or fact worth remembering — in ==double equals== so it shows up \
+highlighted. Highlight sparingly (one or two per section); if everything is \
+highlighted, nothing stands out.
+- "keyIdeas": the 3–7 most important takeaways, pulled out as short standalone \
+lines a student could review at a glance.
+- "keyTerms": the important terms with a plain, one-line definition each (only \
+terms actually present in the notes; omit if there are none).
+- "note": ONE short, warm sentence — e.g. what you cleaned up or transcribed, or \
+a kind nudge if the notes were too sparse to do much with.
+
+If the notes are empty or unreadable, still call the tool: put a kind ask for \
+more in "note" and leave the lists empty.${learnerTailor(profile)}`;
+}
+
 // ---- /api/suggest prompts (a family of AI "suggestion" helpers) ----
 
 // Weekly focus: turn goals + calendar + assignments into a short prioritized list.

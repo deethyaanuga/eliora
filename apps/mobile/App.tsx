@@ -1739,6 +1739,229 @@ function QuizView({
   );
 }
 
+// "Test yourself" flow: name a topic (or tap a class / weak area), pick how hard
+// and how many questions, and Eliora generates a fresh multiple-choice quiz on
+// demand — grounded in the topic, not in pasted material. Wrong answers still
+// feed the weak-topics list and can spin up a targeted study guide via chat.
+type QuizDifficulty =
+  | "kindergarten"
+  | "elementary"
+  | "middle"
+  | "high"
+  | "college";
+
+const QUIZ_DIFFICULTIES: { key: QuizDifficulty; label: string }[] = [
+  { key: "kindergarten", label: "Kindergarten" },
+  { key: "elementary", label: "Elementary" },
+  { key: "middle", label: "Middle" },
+  { key: "high", label: "High school" },
+  { key: "college", label: "College" },
+];
+
+function PracticeQuiz({
+  profile,
+  subjects,
+  missed,
+  onMissed,
+  onStudyGuide,
+}: {
+  profile: LearnerProfile | null;
+  subjects: string[];
+  missed: string[];
+  onMissed: (topic: string) => void;
+  onStudyGuide: (detail: string) => void;
+}) {
+  const [topic, setTopic] = useState("");
+  const [difficulty, setDifficulty] = useState<QuizDifficulty>("high");
+  const [count, setCount] = useState(5);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [quiz, setQuiz] = useState<QuizQuestion[] | null>(null);
+  const [quizTopic, setQuizTopic] = useState("");
+
+  const suggestions = Array.from(
+    new Set([...subjects, ...missed].map((s) => s.trim()).filter(Boolean)),
+  ).slice(0, 8);
+
+  async function generate(t: string) {
+    const clean = t.trim();
+    if (!clean || busy) return;
+    setBusy(true);
+    setError(null);
+    setQuiz(null);
+    try {
+      const res = await expoFetch(`${API_BASE_URL}/api/practice-quiz`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          topic: clean,
+          count,
+          difficulty,
+          focus: missed.slice(0, 8),
+          profile: profile ?? undefined,
+        }),
+      });
+      const data = await res.json();
+      if (data.error || !Array.isArray(data.quiz) || !data.quiz.length) {
+        setError(
+          data.error || "I couldn't build a quiz on that. Try another topic.",
+        );
+      } else {
+        setQuiz(data.quiz);
+        setQuizTopic(clean);
+      }
+    } catch {
+      setError("Something went wrong. Please try again.");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <>
+      <View style={styles.card}>
+        <View style={styles.cardHead}>
+          <Text style={styles.cardClass}>🧠 Practice quiz</Text>
+        </View>
+        <Text style={styles.assignEmpty}>
+          Pick something to be quizzed on — a class, a topic, or something
+          you&apos;ve been getting wrong. Eliora writes a fresh quiz just for you.
+        </Text>
+
+        {!quiz && (
+          <>
+            <View style={styles.assignAddRow}>
+              <TextInput
+                style={styles.assignInput}
+                value={topic}
+                placeholder="Quiz me on… (e.g. photosynthesis)"
+                placeholderTextColor="#9aa39c"
+                onChangeText={setTopic}
+                editable={!busy}
+                onSubmitEditing={() => generate(topic)}
+              />
+              <TouchableOpacity
+                style={styles.assignAddBtn}
+                onPress={() => generate(topic)}
+                disabled={busy || !topic.trim()}
+              >
+                <Text style={styles.assignAddBtnText}>
+                  {busy ? "…" : "Start"}
+                </Text>
+              </TouchableOpacity>
+            </View>
+
+            {suggestions.length > 0 && (
+              <View style={styles.folderRow}>
+                {suggestions.map((s) => (
+                  <TouchableOpacity
+                    key={s}
+                    style={styles.folder}
+                    disabled={busy}
+                    onPress={() => {
+                      setTopic(s);
+                      generate(s);
+                    }}
+                  >
+                    <Text style={styles.folderText}>
+                      {missed.includes(s) ? "🎯 " : "📁 "}
+                      {s}
+                    </Text>
+                  </TouchableOpacity>
+                ))}
+              </View>
+            )}
+
+            <Text style={[styles.quizQ, { marginTop: 14 }]}>How hard?</Text>
+            <View style={styles.assignSubjRow}>
+              {QUIZ_DIFFICULTIES.map((d) => (
+                <TouchableOpacity
+                  key={d.key}
+                  disabled={busy}
+                  onPress={() => setDifficulty(d.key)}
+                  style={[
+                    styles.assignSubjChip,
+                    difficulty === d.key && styles.assignSubjChipActive,
+                  ]}
+                >
+                  <Text
+                    style={[
+                      styles.assignSubjChipText,
+                      difficulty === d.key && styles.assignSubjChipTextActive,
+                    ]}
+                  >
+                    {d.label}
+                  </Text>
+                </TouchableOpacity>
+              ))}
+            </View>
+
+            <Text style={[styles.quizQ, { marginTop: 14 }]}>
+              How many questions?
+            </Text>
+            <View style={styles.assignSubjRow}>
+              {[3, 5, 7, 10].map((n) => (
+                <TouchableOpacity
+                  key={n}
+                  disabled={busy}
+                  onPress={() => setCount(n)}
+                  style={[
+                    styles.assignSubjChip,
+                    count === n && styles.assignSubjChipActive,
+                  ]}
+                >
+                  <Text
+                    style={[
+                      styles.assignSubjChipText,
+                      count === n && styles.assignSubjChipTextActive,
+                    ]}
+                  >
+                    {n}
+                  </Text>
+                </TouchableOpacity>
+              ))}
+            </View>
+
+            {error && (
+              <Text style={[styles.assignEmpty, { color: "#b3453b" }]}>
+                {error}
+              </Text>
+            )}
+          </>
+        )}
+      </View>
+
+      {busy && !quiz && (
+        <View style={styles.card}>
+          <Text style={styles.assignEmpty}>Writing your quiz… ✍️</Text>
+        </View>
+      )}
+
+      {quiz && (
+        <>
+          <View style={styles.cardHead}>
+            <Text style={styles.cardClass}>📝 {quizTopic}</Text>
+            <TouchableOpacity
+              style={styles.assignAddBtn}
+              onPress={() => {
+                setQuiz(null);
+                setError(null);
+              }}
+            >
+              <Text style={styles.assignAddBtnText}>← New</Text>
+            </TouchableOpacity>
+          </View>
+          <QuizView
+            quiz={quiz}
+            onMissed={onMissed}
+            onStudyGuide={onStudyGuide}
+          />
+        </>
+      )}
+    </>
+  );
+}
+
 function SubjectsPanel({
   subjects,
   onAdd,
@@ -2508,7 +2731,9 @@ export default function App() {
   const [breakingGoalId, setBreakingGoalId] = useState<string | null>(null);
   const [editing, setEditing] = useState(false);
   const [summarizing, setSummarizing] = useState(false);
-  const [tab, setTab] = useState<"chat" | "study" | "calendar" | "plan">("chat");
+  const [tab, setTab] = useState<
+    "chat" | "study" | "practice" | "calendar" | "plan"
+  >("chat");
   const [input, setInput] = useState("");
   const [busy, setBusy] = useState(false);
   const [loaded, setLoaded] = useState(false);
@@ -3414,6 +3639,16 @@ export default function App() {
             📋 Study
           </Text>
         </TouchableOpacity>
+        <TouchableOpacity
+          style={[styles.viewTab, tab === "practice" && styles.viewTabActive]}
+          onPress={() => setTab("practice")}
+        >
+          <Text
+            style={[styles.viewTabText, tab === "practice" && styles.viewTabTextActive]}
+          >
+            🧠 Practice
+          </Text>
+        </TouchableOpacity>
       </ScrollView>
 
       {tab === "plan" ? (
@@ -3597,6 +3832,16 @@ export default function App() {
               ))}
             </View>
           </View>
+        </ScrollView>
+      ) : tab === "practice" ? (
+        <ScrollView contentContainerStyle={styles.studyScroll}>
+          <PracticeQuiz
+            profile={profile}
+            subjects={subjects}
+            missed={missed}
+            onMissed={addMissed}
+            onStudyGuide={studyGuideFromQuiz}
+          />
         </ScrollView>
       ) : tab === "calendar" ? (
         <ScrollView contentContainerStyle={styles.studyScroll}>

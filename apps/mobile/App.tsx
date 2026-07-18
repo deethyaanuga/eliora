@@ -35,7 +35,42 @@ import {
 } from "./notifications";
 
 type Video = { videoId: string; title: string; channel: string; url: string };
-type Flashcard = { front: string; back: string };
+// Short-form study recs that open a search on TikTok / YouTube / Instagram.
+type SocialPlatform = "youtube" | "tiktok" | "instagram";
+type SocialRec = {
+  platform: SocialPlatform;
+  title: string;
+  note?: string;
+  url: string;
+};
+const SOCIAL_META: Record<
+  SocialPlatform,
+  { label: string; emoji: string; color: string }
+> = {
+  youtube: { label: "YouTube", emoji: "▶️", color: "#ff0000" },
+  tiktok: { label: "TikTok", emoji: "🎵", color: "#111111" },
+  instagram: { label: "Instagram", emoji: "📸", color: "#c13584" },
+};
+// A flashcard's learning format (mirrors FlashcardStyle in @eliora/shared).
+type FlashcardStyle = "basic" | "reversed" | "qa" | "cloze" | "example";
+type Flashcard = { front: string; back: string; style?: FlashcardStyle };
+// UI labels per style: what to call each side of the card, plus a picker label.
+const FLASHCARD_STYLES: {
+  key: FlashcardStyle;
+  label: string;
+  emoji: string;
+  front: string;
+  back: string;
+}[] = [
+  { key: "basic", label: "Term → Definition", emoji: "🃏", front: "TERM", back: "ANSWER" },
+  { key: "reversed", label: "Definition → Term", emoji: "🔄", front: "DEFINITION", back: "TERM" },
+  { key: "qa", label: "Question & Answer", emoji: "❓", front: "QUESTION", back: "ANSWER" },
+  { key: "cloze", label: "Fill in the blank", emoji: "✏️", front: "FILL IN THE BLANK", back: "ANSWER" },
+  { key: "example", label: "Concept → Example", emoji: "💡", front: "CONCEPT", back: "EXAMPLE" },
+];
+function flashcardStyleMeta(style?: FlashcardStyle) {
+  return FLASHCARD_STYLES.find((s) => s.key === style) ?? FLASHCARD_STYLES[0];
+}
 type QuizQuestion = {
   question: string;
   options: string[];
@@ -47,6 +82,7 @@ type Message = {
   role: "user" | "assistant";
   content: string;
   videos?: Video[];
+  socials?: SocialRec[];
   flashcards?: Flashcard[];
   quiz?: QuizQuestion[];
 };
@@ -102,7 +138,13 @@ type Milestone = {
   added?: boolean; // true when the learner added this step themselves
 };
 type IncomingMilestone = { title: string; detail?: string; checkpoint?: boolean };
-type EventKind = "exam" | "final" | "quiz" | "assignment" | "other";
+type EventKind =
+  | "exam"
+  | "final"
+  | "quiz"
+  | "assignment"
+  | "project"
+  | "other";
 type StudyEvent = { id: string; title: string; date: string; kind?: EventKind };
 type Assignment = {
   id: string;
@@ -225,6 +267,33 @@ const FOCUS_TIME_OPTIONS = [
   "Late night",
 ];
 
+// Schedule-setup survey answers → the hour the learner is free and today's
+// study-minute budget. Keys are the option labels shown in the survey.
+const HOME_TIME_OPTIONS = [
+  "Right after school (~3 PM)",
+  "Late afternoon (~4–5 PM)",
+  "Early evening (~6 PM)",
+  "Later (~7 PM or after)",
+];
+const HOME_TIME_HOUR: Record<string, number> = {
+  "Right after school (~3 PM)": 15,
+  "Late afternoon (~4–5 PM)": 16,
+  "Early evening (~6 PM)": 18,
+  "Later (~7 PM or after)": 19,
+};
+const STUDY_BUDGET_OPTIONS = [
+  "About 30 minutes",
+  "About 1 hour",
+  "About 2 hours",
+  "As much as fits",
+];
+const STUDY_BUDGET_MIN: Record<string, number | undefined> = {
+  "About 30 minutes": 30,
+  "About 1 hour": 60,
+  "About 2 hours": 120,
+  "As much as fits": undefined,
+};
+
 // Sent when the learner taps "Build/Rebuild plan from our chat".
 const PLAN_FROM_CHAT_PROMPT =
   "Look back over our whole conversation so far and create or update my " +
@@ -239,12 +308,20 @@ const MONTHS = [
   "Jan", "Feb", "Mar", "Apr", "May", "Jun",
   "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
 ];
-const KINDS: EventKind[] = ["exam", "final", "quiz", "assignment", "other"];
+const KINDS: EventKind[] = [
+  "exam",
+  "final",
+  "quiz",
+  "assignment",
+  "project",
+  "other",
+];
 const KIND_COLOR: Record<EventKind, string> = {
   exam: "#b8742a",
   final: "#c0392b",
   quiz: "#2f6f8f",
   assignment: "#5b6660",
+  project: "#7a5c9e",
   other: "#5b6660",
 };
 
@@ -366,6 +443,41 @@ function VideoCards({ videos }: { videos: Video[] }) {
           </View>
         </TouchableOpacity>
       ))}
+    </View>
+  );
+}
+
+// Short-form recs (TikTok / YouTube Shorts / Instagram Reels). Each card opens
+// a search on that platform rather than playing a specific clip.
+function SocialCards({ socials }: { socials: SocialRec[] }) {
+  return (
+    <View style={styles.socialWrap}>
+      {socials.map((s, i) => {
+        const meta = SOCIAL_META[s.platform] ?? SOCIAL_META.youtube;
+        return (
+          <TouchableOpacity
+            key={`${s.platform}-${i}`}
+            style={styles.socialCard}
+            onPress={() => Linking.openURL(s.url)}
+            accessibilityLabel={`Open ${meta.label} search: ${s.title}`}
+          >
+            <View style={[styles.socialBadge, { backgroundColor: meta.color }]}>
+              <Text style={styles.socialBadgeText}>
+                {meta.emoji} {meta.label}
+              </Text>
+            </View>
+            <Text style={styles.socialTitle} numberOfLines={2}>
+              {s.title}
+            </Text>
+            {!!s.note && (
+              <Text style={styles.socialNote} numberOfLines={2}>
+                {s.note}
+              </Text>
+            )}
+            <Text style={styles.socialOpen}>Open on {meta.label} →</Text>
+          </TouchableOpacity>
+        );
+      })}
     </View>
   );
 }
@@ -1013,6 +1125,257 @@ function PlanStrip({
   );
 }
 
+// A Duolingo-style winding "snake path" of the study plan. Milestones become
+// nodes on an alternating path connected by segments that fill green as you
+// progress; the first unfinished step is the highlighted "current" node and
+// checkpoints fly a flag. Tapping a node toggles that step (same as the list).
+// No SVG dependency — the path segments are thin rotated Views.
+function PlanPathMap({
+  plan,
+  onToggle,
+}: {
+  plan: Milestone[];
+  onToggle: (i: number) => void;
+}) {
+  const [w, setW] = useState(0);
+  const n = plan.length;
+  const rowH = 92;
+  const topPad = 44;
+  const botPad = 86;
+  const nodeSize = 46;
+  const height = topPad + Math.max(0, n - 1) * rowH + botPad;
+  const done = plan.filter((m) => m.done).length;
+  const pct = n ? Math.round((done / n) * 100) : 0;
+  const currentIdx = plan.findIndex((m) => !m.done);
+
+  // Node centres (plus a trailing "finish" point) once we know the width.
+  const amp = w > 0 ? Math.max(20, w / 2 - nodeSize) : 0;
+  const cx = (i: number) => w / 2 + amp * Math.sin(i * 0.85 + 0.4);
+  const pts = [] as { x: number; y: number }[];
+  for (let i = 0; i < n; i++) pts.push({ x: cx(i), y: topPad + i * rowH });
+  pts.push({ x: cx(n), y: topPad + Math.max(0, n - 1) * rowH + 60 });
+  // How many points are "walked" (green): through the current node, or all done.
+  const walked = currentIdx === -1 ? n + 1 : currentIdx + 1;
+
+  return (
+    <View style={styles.card}>
+      <View style={styles.planHead}>
+        <Text style={styles.planTitle}>Your path</Text>
+        <Text style={styles.planCount}>
+          {done}/{n} · {pct}%
+        </Text>
+      </View>
+      <View style={styles.progressTrack}>
+        <View style={[styles.progressFill, { width: `${pct}%` }]} />
+      </View>
+      <View
+        style={{ width: "100%", height, marginTop: 8, position: "relative" }}
+        onLayout={(e) => setW(e.nativeEvent.layout.width)}
+      >
+        {w > 0 && (
+          <>
+            {/* Connector segments between consecutive points. */}
+            {pts.slice(0, -1).map((a, i) => {
+              const b = pts[i + 1];
+              const dx = b.x - a.x;
+              const dy = b.y - a.y;
+              const len = Math.sqrt(dx * dx + dy * dy);
+              const angle = (Math.atan2(dy, dx) * 180) / Math.PI;
+              const walkedSeg = i + 1 < walked;
+              return (
+                <View
+                  key={`seg${i}`}
+                  style={{
+                    position: "absolute",
+                    left: (a.x + b.x) / 2 - len / 2,
+                    top: (a.y + b.y) / 2 - 2,
+                    width: len,
+                    height: 4,
+                    borderRadius: 2,
+                    backgroundColor: walkedSeg ? "#2f6f4f" : "#e2e6e0",
+                    transform: [{ rotate: `${angle}deg` }],
+                  }}
+                />
+              );
+            })}
+            {/* Milestone nodes. */}
+            {plan.map((m, i) => {
+              const p = pts[i];
+              const isDone = m.done;
+              const isCurrent = i === currentIdx;
+              const cp = m.checkpoint;
+              const size = isCurrent ? 56 : nodeSize;
+              const bg = isDone
+                ? cp
+                  ? "#b8742a"
+                  : "#2f6f4f"
+                : isCurrent
+                  ? "#fff"
+                  : cp
+                    ? "#f3e7d7"
+                    : "#eef1ee";
+              const borderColor = cp ? "#b8742a" : "#2f6f4f";
+              const borderW = isCurrent ? 3 : isDone ? 0 : 2;
+              const fg = isDone
+                ? "#fff"
+                : isCurrent
+                  ? cp
+                    ? "#b8742a"
+                    : "#2f6f4f"
+                  : "#5b6660";
+              return (
+                <View key={`node${i}`}>
+                  {isCurrent && (
+                    <View
+                      style={{
+                        position: "absolute",
+                        left: p.x - 46,
+                        top: p.y - size / 2 - 24,
+                        width: 92,
+                        alignItems: "center",
+                      }}
+                    >
+                      <Text style={styles.pathHerePill}>▶ You're here</Text>
+                    </View>
+                  )}
+                  <TouchableOpacity
+                    onPress={() => onToggle(i)}
+                    activeOpacity={0.7}
+                    style={{
+                      position: "absolute",
+                      left: p.x - size / 2,
+                      top: p.y - size / 2,
+                      width: size,
+                      height: size,
+                      borderRadius: size / 2,
+                      backgroundColor: bg,
+                      borderWidth: borderW,
+                      borderColor,
+                      alignItems: "center",
+                      justifyContent: "center",
+                      ...(isDone
+                        ? {
+                            shadowColor: "#000",
+                            shadowOpacity: 0.12,
+                            shadowRadius: 4,
+                            shadowOffset: { width: 0, height: 2 },
+                            elevation: 2,
+                          }
+                        : {}),
+                    }}
+                  >
+                    <Text
+                      style={{
+                        color: fg,
+                        fontWeight: "800",
+                        fontSize: cp && !isDone ? 20 : 18,
+                      }}
+                    >
+                      {isDone ? "✓" : cp ? "🚩" : String(i + 1)}
+                    </Text>
+                  </TouchableOpacity>
+                  <Text
+                    numberOfLines={2}
+                    style={{
+                      position: "absolute",
+                      left: p.x - 70,
+                      top: p.y + size / 2 + 4,
+                      width: 140,
+                      textAlign: "center",
+                      fontSize: 12,
+                      lineHeight: 15,
+                      fontWeight: isCurrent ? "700" : "500",
+                      color: isDone ? "#5b6660" : "#1c2421",
+                    }}
+                  >
+                    {m.title}
+                  </Text>
+                </View>
+              );
+            })}
+            {/* Finish trophy. */}
+            <View
+              style={{
+                position: "absolute",
+                left: pts[n].x - 27,
+                top: pts[n].y - 27,
+                width: 54,
+                height: 54,
+                borderRadius: 27,
+                alignItems: "center",
+                justifyContent: "center",
+                backgroundColor: pct === 100 ? "#eef1ee" : "#f7f5f0",
+                borderWidth: 2,
+                borderStyle: pct === 100 ? "solid" : "dashed",
+                borderColor: pct === 100 ? "#2f6f4f" : "#d9ddd8",
+              }}
+            >
+              <Text style={{ fontSize: 24 }}>🏆</Text>
+            </View>
+            <Text
+              style={{
+                position: "absolute",
+                left: pts[n].x - 60,
+                top: pts[n].y + 30,
+                width: 120,
+                textAlign: "center",
+                fontSize: 12,
+                fontWeight: "700",
+                color: pct === 100 ? "#2f6f4f" : "#5b6660",
+              }}
+            >
+              {pct === 100 ? "Plan complete!" : "Finish"}
+            </Text>
+          </>
+        )}
+      </View>
+    </View>
+  );
+}
+
+// Path / List view switch for the study plan. Path is the default; the list
+// keeps the add/remove controls.
+function PlanBoard({
+  plan,
+  onToggle,
+  onAdd,
+  onRemove,
+}: {
+  plan: Milestone[];
+  onToggle: (i: number) => void;
+  onAdd?: (title: string) => void;
+  onRemove?: (i: number) => void;
+}) {
+  const [view, setView] = useState<"path" | "list">("path");
+  return (
+    <View>
+      <View style={styles.pathToggleRow}>
+        <TouchableOpacity
+          style={[styles.pathToggleBtn, view === "path" && styles.pathToggleBtnActive]}
+          onPress={() => setView("path")}
+        >
+          <Text style={[styles.pathToggleText, view === "path" && styles.pathToggleTextActive]}>
+            🗺️ Path
+          </Text>
+        </TouchableOpacity>
+        <TouchableOpacity
+          style={[styles.pathToggleBtn, view === "list" && styles.pathToggleBtnActive]}
+          onPress={() => setView("list")}
+        >
+          <Text style={[styles.pathToggleText, view === "list" && styles.pathToggleTextActive]}>
+            📋 List
+          </Text>
+        </TouchableOpacity>
+      </View>
+      {view === "path" ? (
+        <PlanPathMap plan={plan} onToggle={onToggle} />
+      ) : (
+        <PlanPanel plan={plan} onToggle={onToggle} onAdd={onAdd} onRemove={onRemove} />
+      )}
+    </View>
+  );
+}
+
 function PlanPanel({
   plan,
   onToggle,
@@ -1184,6 +1547,175 @@ function MonthGrid({
   );
 }
 
+// Urgency colour for a countdown — hotter the closer the deadline is.
+function urgencyColor(days: number): string {
+  if (days <= 1) return "#c0392b";
+  if (days <= 3) return "#b8742a";
+  if (days <= 7) return "#2f6f8f";
+  return "#3f7d5a";
+}
+function countdownBig(days: number): string {
+  if (days < 0) return `${-days}d overdue`;
+  if (days === 0) return "Today";
+  if (days === 1) return "Tomorrow";
+  return `${days} days`;
+}
+
+const KIND_EMOJI: Record<string, string> = {
+  exam: "📝",
+  final: "🎓",
+  quiz: "❓",
+  assignment: "📌",
+  project: "📊",
+  other: "📅",
+};
+const KIND_LABEL: Record<string, string> = {
+  exam: "Exam",
+  final: "Final",
+  quiz: "Quiz",
+  assignment: "Assignment",
+  project: "Project",
+  other: "Event",
+};
+
+// A single glanceable countdown to the learner's biggest upcoming deadlines,
+// merged live from calendar events, assignments with a due date, and SMART goals
+// with a target date. Soonest first, with the very next one highlighted big.
+function DeadlineCountdown({
+  events,
+  assignments = [],
+  goals = [],
+}: {
+  events: StudyEvent[];
+  assignments?: Assignment[];
+  goals?: SmartGoal[];
+}) {
+  type Item = {
+    id: string;
+    title: string;
+    days: number;
+    emoji: string;
+    tag: string;
+  };
+  const items: Item[] = [];
+  for (const e of events)
+    items.push({
+      id: `e:${e.id}`,
+      title: e.title,
+      days: daysUntil(e.date),
+      emoji: KIND_EMOJI[e.kind ?? "other"] ?? "📅",
+      tag: KIND_LABEL[e.kind ?? "other"] ?? "Event",
+    });
+  for (const a of assignments)
+    if (!a.done && a.due)
+      items.push({
+        id: `a:${a.id}`,
+        title: a.title,
+        days: daysUntil(a.due),
+        emoji: "📌",
+        tag: a.subject ? a.subject : "Assignment",
+      });
+  for (const g of goals)
+    if (!g.done && g.timeBound)
+      items.push({
+        id: `g:${g.id}`,
+        title: g.statement || g.specific,
+        days: daysUntil(g.timeBound),
+        emoji: "🎯",
+        tag: "Goal",
+      });
+  const upcoming = items
+    .filter((it) => it.days >= -7)
+    .sort((a, b) => a.days - b.days)
+    .slice(0, 5);
+  if (!upcoming.length) return null;
+  const next = upcoming[0];
+  const rest = upcoming.slice(1);
+
+  return (
+    <View style={styles.card}>
+      <View style={styles.cardHead}>
+        <Text style={styles.cardClass}>⏳ Countdown</Text>
+      </View>
+      <View
+        style={{
+          flexDirection: "row",
+          alignItems: "center",
+          gap: 12,
+          borderWidth: 1,
+          borderColor: urgencyColor(next.days),
+          borderLeftWidth: 5,
+          borderRadius: 12,
+          padding: 12,
+          marginTop: 8,
+        }}
+      >
+        <View style={{ alignItems: "center", minWidth: 66 }}>
+          <Text
+            style={{
+              fontSize: 24,
+              fontWeight: "800",
+              color: urgencyColor(next.days),
+            }}
+          >
+            {next.days > 1 ? String(next.days) : next.emoji}
+          </Text>
+          <Text
+            style={{
+              fontSize: 11,
+              fontWeight: "600",
+              color: urgencyColor(next.days),
+              marginTop: 2,
+            }}
+          >
+            {next.days > 1 ? "days left" : countdownBig(next.days)}
+          </Text>
+        </View>
+        <View style={{ flex: 1 }}>
+          <Text
+            style={{ fontSize: 15, fontWeight: "700", color: "#1c2421" }}
+            numberOfLines={1}
+          >
+            {next.emoji} {next.title}
+          </Text>
+          <Text style={{ fontSize: 12, color: "#5b6660", marginTop: 2 }}>
+            {next.tag} · {countdownBig(next.days)}
+          </Text>
+        </View>
+      </View>
+      {rest.map((it) => (
+        <View
+          key={it.id}
+          style={{
+            flexDirection: "row",
+            alignItems: "center",
+            gap: 8,
+            paddingVertical: 6,
+          }}
+        >
+          <Text
+            style={{
+              fontSize: 12,
+              fontWeight: "700",
+              color: urgencyColor(it.days),
+              minWidth: 60,
+            }}
+          >
+            {countdownBig(it.days)}
+          </Text>
+          <Text
+            style={{ flex: 1, fontSize: 13, color: "#1c2421" }}
+            numberOfLines={1}
+          >
+            {it.emoji} {it.title}
+          </Text>
+          <Text style={{ fontSize: 11, color: "#8a938d" }}>{it.tag}</Text>
+        </View>
+      ))}
+    </View>
+  );
+}
+
 function CalendarPanel({
   events,
   assignments = [],
@@ -1332,6 +1864,8 @@ function Summarizer({
   const [output, setOutput] = useState<
     "summary" | "studyguide" | "flashcards" | "quiz"
   >("summary");
+  // Which flashcard format to generate (only used when output = "flashcards").
+  const [flashStyle, setFlashStyle] = useState<FlashcardStyle>("basic");
   const [text, setText] = useState("");
   const [url, setUrl] = useState("");
   const [file, setFile] = useState<{
@@ -1400,7 +1934,12 @@ function Summarizer({
       const res = await expoFetch(`${API_BASE_URL}/api/summarize`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ ...src, output, profile }),
+        body: JSON.stringify({
+          ...src,
+          output,
+          profile,
+          ...(output === "flashcards" ? { flashcardStyle: flashStyle } : {}),
+        }),
       });
       if (output === "flashcards" || output === "quiz") {
         const data = await res.json();
@@ -1511,6 +2050,30 @@ function Summarizer({
             ))}
           </View>
 
+          {output === "flashcards" && (
+            <>
+              <Text style={styles.calEmpty}>Flashcard style:</Text>
+              <View style={styles.outputRow}>
+                {FLASHCARD_STYLES.map((s) => (
+                  <TouchableOpacity
+                    key={s.key}
+                    onPress={() => setFlashStyle(s.key)}
+                    style={[styles.outChip, flashStyle === s.key && styles.outChipActive]}
+                  >
+                    <Text
+                      style={[
+                        styles.outChipText,
+                        flashStyle === s.key && styles.outChipTextActive,
+                      ]}
+                    >
+                      {s.emoji} {s.label}
+                    </Text>
+                  </TouchableOpacity>
+                ))}
+              </View>
+            </>
+          )}
+
           <TouchableOpacity
             onPress={run}
             disabled={!canRun || busy}
@@ -1570,6 +2133,618 @@ function Summarizer({
   );
 }
 
+type NotesMode = "clean" | "handwriting" | "highlight";
+type PolishedNotes = {
+  cleaned: string;
+  keyIdeas: string[];
+  keyTerms: { term: string; definition: string }[];
+  note?: string;
+};
+
+// Strip markdown markers for plain-text display (mobile has no md renderer):
+// ==highlight== / **bold** → inner text, and leading #/- bullet markers dropped.
+function stripMd(s: string): string {
+  return s
+    .replace(/==([^=]+)==/g, "$1")
+    .replace(/\*\*([^*]+)\*\*/g, "$1")
+    .replace(/^\s{0,3}#{1,6}\s+/gm, "")
+    .replace(/^\s*[-*]\s+/gm, "• ")
+    .trim();
+}
+
+// Smart-notes study tool: paste messy notes or upload a photo of handwriting,
+// and get them cleaned up, transcribed, and with the key ideas pulled out.
+// Three modes map to the three AI note features; all hit /api/notes-polish.
+function SmartNotes({ profile }: { profile: LearnerProfile }) {
+  const [mode, setMode] = useState<NotesMode>("clean");
+  const [text, setText] = useState("");
+  const [file, setFile] = useState<{
+    name: string;
+    base64?: string;
+    mediaType?: string;
+    text?: string;
+  } | null>(null);
+  const [loading, setLoading] = useState(false);
+  const [out, setOut] = useState<PolishedNotes | null>(null);
+  const [err, setErr] = useState("");
+  const canSubmit = (text.trim().length >= 10 || !!file) && !loading;
+
+  async function pickFile() {
+    const res = await DocumentPicker.getDocumentAsync({
+      type: ["application/pdf", "text/*", "image/*"],
+      copyToCacheDirectory: true,
+    });
+    if (res.canceled || !res.assets?.length) return;
+    const asset = res.assets[0];
+    const mime = asset.mimeType ?? "";
+    const isText =
+      mime.startsWith("text/") || /\.(txt|md|markdown)$/i.test(asset.name);
+    try {
+      if (isText) {
+        const content = await FileSystem.readAsStringAsync(asset.uri);
+        setFile({ name: asset.name, text: content });
+      } else {
+        const base64 = await FileSystem.readAsStringAsync(asset.uri, {
+          encoding: FileSystem.EncodingType.Base64,
+        });
+        setFile({ name: asset.name, base64, mediaType: mime });
+        // A photo almost always means handwriting → switch to that mode.
+        if (mime.startsWith("image/")) setMode("handwriting");
+      }
+    } catch {
+      setFile({ name: asset.name });
+    }
+  }
+
+  async function polish() {
+    if (!canSubmit) return;
+    setLoading(true);
+    setErr("");
+    setOut(null);
+    // A pasted-text file just becomes the text; a pdf/image goes as base64.
+    const body = {
+      mode,
+      text: (file?.text ?? text).trim() || undefined,
+      fileBase64: file?.base64,
+      fileMediaType: file?.mediaType,
+      fileName: file?.base64 ? file?.name : undefined,
+      profile,
+    };
+    try {
+      const res = await expoFetch(`${API_BASE_URL}/api/notes-polish`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+      });
+      const data = await res.json();
+      if (data.result) setOut(data.result as PolishedNotes);
+      else setErr(data.error || "Couldn't tidy those notes — try again.");
+    } catch {
+      setErr("Couldn't reach the server. Please try again.");
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  const modes = [
+    ["clean", "🧹 Clean up"],
+    ["handwriting", "✍️ Handwriting"],
+    ["highlight", "🖍️ Highlight"],
+  ] as const;
+
+  return (
+    <View style={styles.card}>
+      <View style={styles.cardHead}>
+        <Text style={styles.cardClass}>📝 Summarize</Text>
+      </View>
+      <Text style={styles.calEmpty}>
+        Paste messy notes or upload a photo of your handwriting. I'll clean them
+        up, turn handwriting into text, and highlight the key ideas.
+      </Text>
+      <View style={[styles.outputRow, { marginTop: 8 }]}>
+        {modes.map(([k, label]) => (
+          <TouchableOpacity
+            key={k}
+            onPress={() => setMode(k)}
+            style={[styles.outChip, mode === k && styles.outChipActive]}
+          >
+            <Text style={[styles.outChipText, mode === k && styles.outChipTextActive]}>
+              {label}
+            </Text>
+          </TouchableOpacity>
+        ))}
+      </View>
+      <TextInput
+        style={[styles.formInput, styles.formTextarea, { minHeight: 120, marginTop: 8 }]}
+        value={text}
+        onChangeText={setText}
+        placeholder={
+          mode === "handwriting"
+            ? "Upload a photo below — or type any notes to tidy up…"
+            : "Paste your messy notes here…"
+        }
+        placeholderTextColor="#8a938d"
+        multiline
+      />
+      <TouchableOpacity style={[styles.secondaryBtn, { marginTop: 8 }]} onPress={pickFile}>
+        <Text style={styles.secondaryBtnText}>
+          {file
+            ? `Selected: ${file.name}`
+            : mode === "handwriting"
+              ? "Upload a photo of your notes"
+              : "Choose a file (photo, PDF, or text)"}
+        </Text>
+      </TouchableOpacity>
+      <TouchableOpacity
+        onPress={polish}
+        disabled={!canSubmit}
+        style={[styles.primaryBtn, { marginTop: 10 }, !canSubmit && styles.primaryBtnDisabled]}
+      >
+        <Text style={styles.primaryBtnText}>
+          {loading
+            ? "Tidying your notes…"
+            : mode === "handwriting"
+              ? "✍️ Convert to text"
+              : mode === "highlight"
+                ? "🖍️ Highlight key ideas"
+                : "🧹 Clean up notes"}
+        </Text>
+      </TouchableOpacity>
+      {!!err && <Text style={[styles.resultText, { color: "#c0392b" }]}>{err}</Text>}
+      {out && (
+        <View style={styles.resultBox}>
+          {!!out.note && <Text style={styles.resultText}>{out.note}</Text>}
+          {!!out.cleaned && (
+            <>
+              <Text style={styles.cardClass}>📝 Clean notes</Text>
+              <Text style={styles.resultText}>{stripMd(out.cleaned)}</Text>
+            </>
+          )}
+          {out.keyIdeas.length > 0 && (
+            <>
+              <Text style={[styles.cardClass, { marginTop: 10 }]}>💡 Key ideas</Text>
+              {out.keyIdeas.map((idea, i) => (
+                <Text key={i} style={styles.resultText}>
+                  • {idea}
+                </Text>
+              ))}
+            </>
+          )}
+          {out.keyTerms.length > 0 && (
+            <>
+              <Text style={[styles.cardClass, { marginTop: 10 }]}>📚 Key terms</Text>
+              {out.keyTerms.map((t, i) => (
+                <Text key={i} style={styles.resultText}>
+                  • {t.term} — {t.definition}
+                </Text>
+              ))}
+            </>
+          )}
+        </View>
+      )}
+    </View>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Notes workspace (mobile) — persistent notebook: free-form or Cornell notes,
+// color-coded concept highlights, and wiki-style [[links]] between notes. Saved
+// to AsyncStorage. (Infinite canvas / mind maps and voice dictation are web-only
+// for now — they need native libs not in the mobile build.)
+// ---------------------------------------------------------------------------
+
+type NoteColor = "yellow" | "green" | "blue" | "pink" | "orange";
+type NBStickyNote = { id: string; text: string; color: NoteColor };
+type NBDoc = {
+  id: string;
+  title: string;
+  template: "free" | "cornell";
+  body: string;
+  cue: string;
+  summary: string;
+  stickies: NBStickyNote[];
+  updatedAt: number;
+};
+const NB_KEY = "eliora-notebook";
+const NB_HIGHLIGHTS: Record<NoteColor, string> = {
+  yellow: "#fdf0a6",
+  green: "#c3e8cb",
+  blue: "#c2dcf7",
+  pink: "#f8c9dd",
+  orange: "#ffd9ac",
+};
+const NB_COLORS: NoteColor[] = ["yellow", "green", "blue", "pink", "orange"];
+function nbId(): string {
+  return Math.random().toString(36).slice(2, 10) + Date.now().toString(36);
+}
+
+// Render one line of note markdown to RN <Text> spans: **bold**, ==highlight==
+// (optionally ==color:text==), and [[links]] (tap to open that note).
+function nbRenderLine(
+  line: string,
+  onLink: (title: string) => void,
+  keyBase: string,
+): React.ReactNode[] {
+  const out: React.ReactNode[] = [];
+  line
+    .split(/(\*\*[^*]+\*\*|==[^=]+==|\[\[[^\]]+\]\])/g)
+    .forEach((part, i) => {
+      if (!part) return;
+      let m: RegExpMatchArray | null;
+      if ((m = part.match(/^\*\*([^*]+)\*\*$/))) {
+        out.push(
+          <Text key={`${keyBase}-${i}`} style={{ fontWeight: "700" }}>
+            {m[1]}
+          </Text>,
+        );
+      } else if ((m = part.match(/^==([^=]+)==$/))) {
+        const inner = m[1];
+        const cm = inner.match(/^(yellow|green|blue|pink|orange):([\s\S]+)$/);
+        const color = (cm ? cm[1] : "yellow") as NoteColor;
+        const label = cm ? cm[2] : inner;
+        out.push(
+          <Text
+            key={`${keyBase}-${i}`}
+            style={{ backgroundColor: NB_HIGHLIGHTS[color], color: "#1f2a24" }}
+          >
+            {label}
+          </Text>,
+        );
+      } else if ((m = part.match(/^\[\[([^\]]+)\]\]$/))) {
+        const title = m[1].trim();
+        out.push(
+          <Text
+            key={`${keyBase}-${i}`}
+            onPress={() => onLink(title)}
+            style={{ color: "#2f6f4f", fontWeight: "600", textDecorationLine: "underline" }}
+          >
+            {title}
+          </Text>,
+        );
+      } else {
+        out.push(<Text key={`${keyBase}-${i}`}>{part}</Text>);
+      }
+    });
+  return out;
+}
+
+function NBPreview({
+  text,
+  onLink,
+}: {
+  text: string;
+  onLink: (title: string) => void;
+}) {
+  const lines = text.split("\n");
+  return (
+    <View>
+      {lines.map((raw, i) => {
+        const line = raw.replace(/\s+$/, "");
+        if (!line.trim()) return <View key={i} style={{ height: 6 }} />;
+        let m: RegExpMatchArray | null;
+        if ((m = line.match(/^(#{1,3})\s+(.*)$/))) {
+          const lvl = m[1].length;
+          return (
+            <Text
+              key={i}
+              style={{
+                fontWeight: "800",
+                fontSize: lvl === 1 ? 18 : lvl === 2 ? 16 : 14.5,
+                color: "#2f6f4f",
+                marginTop: 8,
+                marginBottom: 2,
+              }}
+            >
+              {nbRenderLine(m[2], onLink, String(i))}
+            </Text>
+          );
+        }
+        if ((m = line.match(/^\s*[-*]\s+(.*)$/))) {
+          return (
+            <Text key={i} style={{ fontSize: 14.5, color: "#25332c", lineHeight: 21 }}>
+              {"•  "}
+              {nbRenderLine(m[1], onLink, String(i))}
+            </Text>
+          );
+        }
+        return (
+          <Text key={i} style={{ fontSize: 14.5, color: "#25332c", lineHeight: 21 }}>
+            {nbRenderLine(line, onLink, String(i))}
+          </Text>
+        );
+      })}
+    </View>
+  );
+}
+
+function NotesWorkspace() {
+  const [docs, setDocs] = useState<NBDoc[]>([]);
+  const [activeId, setActiveId] = useState<string | null>(null);
+  const [loaded, setLoaded] = useState(false);
+  const [sel, setSel] = useState({ start: 0, end: 0 });
+
+  useEffect(() => {
+    (async () => {
+      try {
+        const raw = await AsyncStorage.getItem(NB_KEY);
+        const saved = raw ? (JSON.parse(raw) as NBDoc[]) : null;
+        if (Array.isArray(saved) && saved.length) {
+          const norm = saved.map((d) => ({ ...d, stickies: d.stickies ?? [] }));
+          setDocs(norm);
+          setActiveId(norm[0].id);
+        }
+      } catch {
+        /* ignore */
+      }
+      setLoaded(true);
+    })();
+  }, []);
+
+  useEffect(() => {
+    if (!loaded) return;
+    AsyncStorage.setItem(NB_KEY, JSON.stringify(docs)).catch(() => {});
+  }, [docs, loaded]);
+
+  const active = docs.find((d) => d.id === activeId) ?? null;
+
+  function createDoc(template: "free" | "cornell") {
+    const doc: NBDoc = {
+      id: nbId(),
+      title: template === "cornell" ? "Cornell notes" : "Untitled note",
+      template,
+      body: "",
+      cue: "",
+      summary: "",
+      stickies: [],
+      updatedAt: Date.now(),
+    };
+    setDocs((prev) => [doc, ...prev]);
+    setActiveId(doc.id);
+  }
+  function patch(id: string, p: Partial<NBDoc>) {
+    setDocs((prev) =>
+      prev.map((d) => (d.id === id ? { ...d, ...p, updatedAt: Date.now() } : d)),
+    );
+  }
+  function removeDoc(id: string) {
+    setDocs((prev) => {
+      const next = prev.filter((d) => d.id !== id);
+      if (id === activeId) setActiveId(next[0]?.id ?? null);
+      return next;
+    });
+  }
+  function openByTitle(title: string) {
+    const found = docs.find(
+      (d) => d.title.trim().toLowerCase() === title.trim().toLowerCase(),
+    );
+    if (found) {
+      setActiveId(found.id);
+    } else {
+      const doc: NBDoc = {
+        id: nbId(),
+        title,
+        template: "free",
+        body: "",
+        cue: "",
+        summary: "",
+        stickies: [],
+        updatedAt: Date.now(),
+      };
+      setDocs((prev) => [doc, ...prev]);
+      setActiveId(doc.id);
+    }
+  }
+  function wrapSelection(before: string, after: string) {
+    if (!active) return;
+    const val = active.body;
+    const start = Math.min(sel.start, sel.end);
+    const end = Math.max(sel.start, sel.end);
+    const chosen = val.slice(start, end) || "concept";
+    patch(active.id, {
+      body: val.slice(0, start) + before + chosen + after + val.slice(end),
+    });
+  }
+
+  return (
+    <ScrollView contentContainerStyle={styles.studyScroll}>
+      <View style={styles.card}>
+        <View style={styles.cardHead}>
+          <Text style={styles.cardClass}>📓 Smart Notes</Text>
+        </View>
+        <Text style={styles.calEmpty}>
+          Free-form or Cornell notes, color-code key concepts, and link notes with
+          [[title]].
+        </Text>
+        <View style={{ flexDirection: "row", gap: 8, marginTop: 8 }}>
+          <TouchableOpacity
+            style={[styles.primaryBtn, { flex: 1 }]}
+            onPress={() => createDoc("free")}
+          >
+            <Text style={styles.primaryBtnText}>＋ New note</Text>
+          </TouchableOpacity>
+          <TouchableOpacity
+            style={[styles.secondaryBtn, { flex: 1 }]}
+            onPress={() => createDoc("cornell")}
+          >
+            <Text style={styles.secondaryBtnText}>📐 Cornell</Text>
+          </TouchableOpacity>
+        </View>
+
+        {docs.length > 0 && (
+          <View style={{ marginTop: 10, gap: 4 }}>
+            {docs.map((d) => (
+              <TouchableOpacity
+                key={d.id}
+                onPress={() => setActiveId(d.id)}
+                style={{
+                  flexDirection: "row",
+                  alignItems: "center",
+                  paddingVertical: 8,
+                  paddingHorizontal: 10,
+                  borderRadius: 10,
+                  backgroundColor: d.id === activeId ? "#eef4ef" : "transparent",
+                }}
+              >
+                <Text style={{ flex: 1, fontSize: 15, color: "#25332c", fontWeight: d.id === activeId ? "700" : "500" }}>
+                  {d.template === "cornell" ? "📐 " : "📝 "}
+                  {d.title || "Untitled"}
+                </Text>
+                <Text onPress={() => removeDoc(d.id)} style={{ color: "#8a938d", fontSize: 18, paddingHorizontal: 6 }}>
+                  ×
+                </Text>
+              </TouchableOpacity>
+            ))}
+          </View>
+        )}
+      </View>
+
+      {active && (
+        <View style={styles.card}>
+          <TextInput
+            value={active.title}
+            onChangeText={(t) => patch(active.id, { title: t })}
+            placeholder="Note title"
+            placeholderTextColor="#8a938d"
+            style={{ fontSize: 19, fontWeight: "800", color: "#2f6f4f", paddingVertical: 4, borderBottomWidth: 1, borderBottomColor: "#e2e8e4" }}
+          />
+
+          {/* Color-code toolbar (wraps the current selection in the notes field) */}
+          <View style={{ flexDirection: "row", alignItems: "center", gap: 8, marginTop: 10, flexWrap: "wrap" }}>
+            <Text style={{ fontSize: 12.5, color: "#6b7770", fontWeight: "600" }}>Color:</Text>
+            {NB_COLORS.map((c) => (
+              <TouchableOpacity
+                key={c}
+                onPress={() => wrapSelection(`==${c}:`, "==")}
+                style={{ width: 24, height: 24, borderRadius: 12, backgroundColor: NB_HIGHLIGHTS[c], borderWidth: 1, borderColor: "rgba(0,0,0,0.15)" }}
+              />
+            ))}
+            <TouchableOpacity
+              onPress={() => wrapSelection("**", "**")}
+              style={{ paddingHorizontal: 10, paddingVertical: 3, borderRadius: 8, borderWidth: 1, borderColor: "#e2e8e4" }}
+            >
+              <Text style={{ fontWeight: "800", color: "#25332c" }}>B</Text>
+            </TouchableOpacity>
+          </View>
+
+          {active.template === "cornell" ? (
+            <View style={{ marginTop: 10 }}>
+              <Text style={styles.nbLabel}>Cues / questions</Text>
+              <TextInput
+                value={active.cue}
+                onChangeText={(t) => patch(active.id, { cue: t })}
+                placeholder="Key questions, cues, keywords…"
+                placeholderTextColor="#8a938d"
+                multiline
+                style={[styles.formInput, styles.formTextarea, { minHeight: 90 }]}
+              />
+              <Text style={styles.nbLabel}>Notes</Text>
+              <TextInput
+                value={active.body}
+                onChangeText={(t) => patch(active.id, { body: t })}
+                onSelectionChange={(e) => setSel(e.nativeEvent.selection)}
+                placeholder="Main notes from class or reading…"
+                placeholderTextColor="#8a938d"
+                multiline
+                style={[styles.formInput, styles.formTextarea, { minHeight: 140 }]}
+              />
+              <Text style={styles.nbLabel}>Summary</Text>
+              <TextInput
+                value={active.summary}
+                onChangeText={(t) => patch(active.id, { summary: t })}
+                placeholder="Sum it up in a sentence or two…"
+                placeholderTextColor="#8a938d"
+                multiline
+                style={[styles.formInput, styles.formTextarea, { minHeight: 70 }]}
+              />
+            </View>
+          ) : (
+            <TextInput
+              value={active.body}
+              onChangeText={(t) => patch(active.id, { body: t })}
+              onSelectionChange={(e) => setSel(e.nativeEvent.selection)}
+              placeholder="Write your notes… use ## headings, - bullets, and [[links]]."
+              placeholderTextColor="#8a938d"
+              multiline
+              style={[styles.formInput, styles.formTextarea, { minHeight: 160, marginTop: 10 }]}
+            />
+          )}
+
+          {(active.body.trim() || active.cue.trim() || active.summary.trim()) && (
+            <View style={{ marginTop: 12, padding: 12, borderRadius: 12, backgroundColor: "#f3f7f4" }}>
+              <Text style={{ fontSize: 11.5, fontWeight: "800", color: "#6b7770", marginBottom: 6 }}>
+                PREVIEW
+              </Text>
+              {active.template === "cornell" && !!active.cue.trim() && (
+                <View style={{ marginBottom: 6 }}>
+                  <Text style={{ fontWeight: "800", color: "#2f6f4f", fontSize: 13 }}>Cues</Text>
+                  <NBPreview text={active.cue} onLink={openByTitle} />
+                </View>
+              )}
+              <NBPreview text={active.body} onLink={openByTitle} />
+              {active.template === "cornell" && !!active.summary.trim() && (
+                <View style={{ marginTop: 6, paddingTop: 6, borderTopWidth: 1, borderTopColor: "#e2e8e4" }}>
+                  <Text style={{ fontWeight: "800", color: "#2f6f4f", fontSize: 13 }}>Summary</Text>
+                  <NBPreview text={active.summary} onLink={openByTitle} />
+                </View>
+              )}
+            </View>
+          )}
+
+          {/* Sticky notes (mobile: colored cards; drag is web-only) */}
+          <View style={{ marginTop: 12 }}>
+            <View style={{ flexDirection: "row", justifyContent: "space-between", alignItems: "center", marginBottom: 6 }}>
+              <Text style={{ fontWeight: "700", fontSize: 14, color: "#25332c" }}>🗒️ Sticky notes</Text>
+              <TouchableOpacity
+                onPress={() =>
+                  patch(active.id, {
+                    stickies: [
+                      ...active.stickies,
+                      { id: nbId(), text: "", color: NB_COLORS[active.stickies.length % NB_COLORS.length] },
+                    ],
+                  })
+                }
+              >
+                <Text style={{ color: "#2f6f4f", fontWeight: "700", fontSize: 13 }}>＋ Add</Text>
+              </TouchableOpacity>
+            </View>
+            <View style={{ flexDirection: "row", flexWrap: "wrap", gap: 8 }}>
+              {active.stickies.map((s) => (
+                <View
+                  key={s.id}
+                  style={{ width: "47%", minHeight: 80, borderRadius: 8, padding: 8, backgroundColor: NB_HIGHLIGHTS[s.color] }}
+                >
+                  <View style={{ flexDirection: "row", justifyContent: "flex-end" }}>
+                    <Text
+                      onPress={() =>
+                        patch(active.id, { stickies: active.stickies.filter((x) => x.id !== s.id) })
+                      }
+                      style={{ fontSize: 15, color: "#1f2a24" }}
+                    >
+                      ×
+                    </Text>
+                  </View>
+                  <TextInput
+                    value={s.text}
+                    onChangeText={(t) =>
+                      patch(active.id, {
+                        stickies: active.stickies.map((x) => (x.id === s.id ? { ...x, text: t } : x)),
+                      })
+                    }
+                    placeholder="Note…"
+                    placeholderTextColor="#6b7770"
+                    multiline
+                    style={{ fontSize: 13, color: "#1f2a24", minHeight: 44 }}
+                  />
+                </View>
+              ))}
+            </View>
+          </View>
+        </View>
+      )}
+    </ScrollView>
+  );
+}
+
 function FlashcardDeck({
   cards,
   onMissed,
@@ -1581,6 +2756,7 @@ function FlashcardDeck({
   const [flipped, setFlipped] = useState(false);
   const card = cards[i];
   if (!card) return null;
+  const meta = flashcardStyleMeta(card.style);
 
   function go(delta: number) {
     setFlipped(false);
@@ -1600,9 +2776,11 @@ function FlashcardDeck({
         onPress={() => setFlipped((f) => !f)}
         accessibilityLabel="Flip card"
       >
-        <Text style={styles.flashcardLabel}>{flipped ? "ANSWER" : "TERM"}</Text>
+        <Text style={styles.flashcardLabel}>{flipped ? meta.back : meta.front}</Text>
         <Text style={styles.flashcardText}>{flipped ? card.back : card.front}</Text>
-        <Text style={styles.flashcardHint}>tap to flip</Text>
+        <Text style={styles.flashcardHint}>
+          {meta.emoji} {meta.label} · tap to flip
+        </Text>
       </TouchableOpacity>
       <View style={styles.flashNav}>
         <TouchableOpacity
@@ -1658,13 +2836,21 @@ function QuizView({
   }
 
   function studyGuide() {
-    const detail = wrong
-      .map(
-        (q) =>
-          `- ${q.topic || q.question}: correct answer is "${
-            q.options[q.answerIndex]
-          }"${q.explanation ? ` — ${q.explanation}` : ""}`,
-      )
+    // Pass BOTH what the learner picked and the correct answer so the study
+    // guide can walk through WHY their choice was wrong, not just state the fix.
+    const detail = quiz
+      .map((q, i) => {
+        const picked = answers[i];
+        if (picked === q.answerIndex) return null;
+        const mine = picked != null ? `"${q.options[picked]}"` : "left it blank";
+        return (
+          `- Question: ${q.question}\n` +
+          `  I answered ${mine}, but the correct answer is ` +
+          `"${q.options[q.answerIndex]}"` +
+          (q.explanation ? ` — ${q.explanation}` : "")
+        );
+      })
+      .filter(Boolean)
       .join("\n");
     onStudyGuide?.(detail);
   }
@@ -2375,6 +3561,156 @@ function SignUp({
   );
 }
 
+// Short intake survey that gathers what Eliora needs to build a good after-school
+// schedule — when the learner is free, how much time they have, when/how they
+// focus, and what to prioritize — then hands the answers to the schedule builder.
+function ScheduleSetupSurvey({
+  visible,
+  onClose,
+  initial,
+  onSubmit,
+}: {
+  visible: boolean;
+  onClose: () => void;
+  initial?: {
+    homeTime?: string;
+    focusTime?: string;
+    sessionLength?: string;
+    focusHelp?: string;
+  };
+  onSubmit: (a: {
+    homeTime: string;
+    budget: string;
+    focusTime: string;
+    sessionLength: string;
+    focusHelp: string;
+    focusNote: string;
+  }) => void;
+}) {
+  const [homeTime, setHomeTime] = useState(initial?.homeTime ?? "");
+  const [budget, setBudget] = useState("");
+  const [focusTime, setFocusTime] = useState(initial?.focusTime ?? "");
+  const [sessionLength, setSessionLength] = useState(
+    initial?.sessionLength ?? "",
+  );
+  const [focusHelp, setFocusHelp] = useState(initial?.focusHelp ?? "");
+  const [focusNote, setFocusNote] = useState("");
+
+  const canSubmit = homeTime.length > 0;
+
+  const choiceGroup = (
+    question: string,
+    options: string[],
+    value: string,
+    setValue: (s: string) => void,
+  ) => (
+    <View style={styles.field}>
+      <Text style={styles.fieldLabel}>{question}</Text>
+      {options.map((opt) => {
+        const selected = value === opt;
+        return (
+          <TouchableOpacity
+            key={opt}
+            style={[styles.choiceBtn, selected && styles.choiceBtnSelected]}
+            onPress={() => setValue(selected ? "" : opt)}
+          >
+            <View
+              style={[
+                styles.choiceRadio,
+                selected && styles.choiceRadioSelected,
+              ]}
+            />
+            <Text style={styles.choiceText}>{opt}</Text>
+          </TouchableOpacity>
+        );
+      })}
+    </View>
+  );
+
+  return (
+    <Modal visible={visible} animationType="slide" onRequestClose={onClose}>
+      <View style={styles.container}>
+        <ScrollView contentContainerStyle={styles.formScroll}>
+          <View style={styles.modalHead}>
+            <Text style={styles.formTitle}>Set up my schedule</Text>
+            <Text style={styles.linkBtn} onPress={onClose}>
+              Close
+            </Text>
+          </View>
+          <Text style={styles.schedHint}>
+            A few quick questions so I can build today&apos;s study plan around
+            you. You can tweak the blocks after.
+          </Text>
+
+          {choiceGroup(
+            "When are you usually free to study?",
+            HOME_TIME_OPTIONS,
+            homeTime,
+            setHomeTime,
+          )}
+          {choiceGroup(
+            "How much study time do you want today?",
+            STUDY_BUDGET_OPTIONS,
+            budget,
+            setBudget,
+          )}
+          {choiceGroup(
+            "When do you focus best?",
+            FOCUS_TIME_OPTIONS,
+            focusTime,
+            setFocusTime,
+          )}
+          {choiceGroup(
+            "How long can you focus in one sitting?",
+            SESSION_LENGTH_OPTIONS,
+            sessionLength,
+            setSessionLength,
+          )}
+          {choiceGroup(
+            "What helps you focus?",
+            FOCUS_HELP_OPTIONS,
+            focusHelp,
+            setFocusHelp,
+          )}
+
+          <View style={styles.field}>
+            <Text style={styles.fieldLabel}>
+              Anything today&apos;s schedule should prioritize? (optional)
+            </Text>
+            <TextInput
+              style={[styles.formInput, styles.formTextarea]}
+              value={focusNote}
+              onChangeText={setFocusNote}
+              placeholder="e.g. Bio exam Friday, catch up on algebra"
+              placeholderTextColor="#9aa39c"
+              multiline
+            />
+          </View>
+
+          <TouchableOpacity
+            style={[styles.primaryBtn, !canSubmit && styles.primaryBtnDisabled]}
+            disabled={!canSubmit}
+            onPress={() => {
+              if (!canSubmit) return;
+              onSubmit({
+                homeTime,
+                budget,
+                focusTime,
+                sessionLength,
+                focusHelp,
+                focusNote: focusNote.trim(),
+              });
+              onClose();
+            }}
+          >
+            <Text style={styles.primaryBtnText}>✨ Build my schedule</Text>
+          </TouchableOpacity>
+        </ScrollView>
+      </View>
+    </Modal>
+  );
+}
+
 // Today's 9am–9pm day plan with an editable text block per hour, a block-type
 // tag (study/break/class/other), an AI "build" button, and a per-task focus
 // countdown timer. One timer runs at a time.
@@ -2385,6 +3721,7 @@ function ScheduleCard({
   homeHour,
   onSetHomeHour,
   onGenerate,
+  onSetup,
   generating,
 }: {
   schedule: DaySchedule | null;
@@ -2393,6 +3730,7 @@ function ScheduleCard({
   homeHour: number;
   onSetHomeHour: (h: number) => void;
   onGenerate: () => void;
+  onSetup: () => void;
   generating: boolean;
 }) {
   const today = todayISO();
@@ -2452,6 +3790,9 @@ function ScheduleCard({
         block&apos;s tag to change study / break / class, and ⏱ to run a{" "}
         {TIMER_DEFAULT_MIN}-min focus timer.
       </Text>
+      <TouchableOpacity style={styles.schedSetupBtn} onPress={onSetup}>
+        <Text style={styles.schedSetupBtnText}>📝 Set up my schedule</Text>
+      </TouchableOpacity>
       <View style={styles.schedBuildRow}>
         <Text style={styles.schedBuildLabel}>I get home at</Text>
         <View style={styles.schedStepper}>
@@ -2719,6 +4060,12 @@ export default function App() {
   const [goals, setGoals] = useState<SmartGoal[]>([]);
   const [schedule, setSchedule] = useState<DaySchedule | null>(null);
   const [homeHour, setHomeHour] = useState(16); // default 4 PM
+  const [scheduleSurveyOpen, setScheduleSurveyOpen] = useState(false);
+  // Latest schedule-survey answers: today's study-minute cap and what to focus on.
+  const [scheduleBudgetMin, setScheduleBudgetMin] = useState<number | undefined>(
+    undefined,
+  );
+  const [scheduleFocusNote, setScheduleFocusNote] = useState("");
   // Daily check-in push notification prefs (enabled + local time "HH:MM").
   const [checkIn, setCheckIn] = useState<CheckInPrefs>({
     enabled: true,
@@ -2732,7 +4079,7 @@ export default function App() {
   const [editing, setEditing] = useState(false);
   const [summarizing, setSummarizing] = useState(false);
   const [tab, setTab] = useState<
-    "chat" | "study" | "practice" | "calendar" | "plan"
+    "chat" | "study" | "practice" | "calendar" | "plan" | "notebook"
   >("chat");
   const [input, setInput] = useState("");
   const [busy, setBusy] = useState(false);
@@ -3018,16 +4365,24 @@ export default function App() {
 
   // Ask Eliora to fill the day around the learner's home time, plan, goals and
   // assignments — mirrors the web "Build my study schedule" button.
-  const generateStudySchedule = async () => {
+  const generateStudySchedule = async (opts?: {
+    homeHour?: number;
+    budgetMin?: number;
+    focusNote?: string;
+  }) => {
     if (generatingSchedule) return;
     setGeneratingSchedule(true);
     try {
+      const budgetMin = opts?.budgetMin ?? scheduleBudgetMin;
+      const focusNote = (opts?.focusNote ?? scheduleFocusNote).trim();
       const res = await fetch(`${API_BASE_URL}/api/suggest`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           kind: "schedule",
-          homeHour,
+          homeHour: opts?.homeHour ?? homeHour,
+          budgetMin: budgetMin || undefined,
+          focusNote: focusNote || undefined,
           profile: profile ?? undefined,
           plan: plan.filter((m) => !m.done).map((m) => m.title),
           assignments: assignments
@@ -3065,6 +4420,39 @@ export default function App() {
     } finally {
       setGeneratingSchedule(false);
     }
+  };
+
+  // Take the schedule-setup survey answers, remember the learner's study prefs
+  // on their profile, then build today's schedule from the fresh answers.
+  const handleScheduleSurvey = (a: {
+    homeTime: string;
+    budget: string;
+    focusTime: string;
+    sessionLength: string;
+    focusHelp: string;
+    focusNote: string;
+  }) => {
+    const nextHomeHour = HOME_TIME_HOUR[a.homeTime] ?? homeHour;
+    const budgetMin = a.budget ? STUDY_BUDGET_MIN[a.budget] : undefined;
+    setHomeHour(nextHomeHour);
+    setScheduleBudgetMin(budgetMin);
+    setScheduleFocusNote(a.focusNote);
+    // Persist the study-style answers so the coach reuses them everywhere.
+    if (profile && (a.focusTime || a.sessionLength || a.focusHelp)) {
+      const next: LearnerProfile = {
+        ...profile,
+        focusTime: a.focusTime || profile.focusTime,
+        sessionLength: a.sessionLength || profile.sessionLength,
+        focusHelp: a.focusHelp || profile.focusHelp,
+      };
+      setProfile(next);
+      AsyncStorage.setItem(PROFILE_KEY, JSON.stringify(next)).catch(() => {});
+    }
+    generateStudySchedule({
+      homeHour: nextHomeHour,
+      budgetMin,
+      focusNote: a.focusNote,
+    });
   };
 
   // The learner (or Eliora) adds a SMART goal.
@@ -3274,9 +4662,12 @@ export default function App() {
   function studyGuideFromQuiz(detail: string) {
     setTab("chat");
     send(
-      "I just took a quiz and got some questions wrong. Make me a short, simple " +
-        "study guide focused ONLY on these — re-teach each one in a fresh way, " +
-        "then give me 2 quick practice questions:\n" +
+      "I just took a quiz and missed some questions. Make me a focused study " +
+        "guide on ONLY these. For each one: first show me what I got wrong (my " +
+        "answer vs. the correct answer), then gently walk me through WHY my " +
+        "answer was wrong and re-teach the right idea in a fresh, simple way. " +
+        "Once you've covered them all, give me 2–3 quick practice questions on " +
+        "just these so I can check it stuck:\n" +
         detail,
     );
   }
@@ -3455,6 +4846,7 @@ export default function App() {
       let buffer = "";
       let acc = "";
       const videos: Video[] = [];
+      const socials: SocialRec[] = [];
       let flashcards: Flashcard[] | undefined;
       let quiz: QuizQuestion[] | undefined;
 
@@ -3463,7 +4855,12 @@ export default function App() {
         let evt: {
           type: string;
           value?: string;
-          items?: Video[] | IncomingMilestone[] | Flashcard[] | QuizQuestion[];
+          items?:
+            | Video[]
+            | SocialRec[]
+            | IncomingMilestone[]
+            | Flashcard[]
+            | QuizQuestion[];
           item?: StudyEvent;
           name?: string;
         };
@@ -3505,6 +4902,8 @@ export default function App() {
         if (evt.type === "text" && evt.value) acc += evt.value;
         else if (evt.type === "videos" && evt.items)
           videos.push(...(evt.items as Video[]));
+        else if (evt.type === "socials" && evt.items)
+          socials.push(...(evt.items as SocialRec[]));
         else if (evt.type === "flashcards")
           flashcards = (evt.items as Flashcard[]) ?? [];
         else if (evt.type === "quiz") quiz = (evt.items as QuizQuestion[]) ?? [];
@@ -3514,6 +4913,7 @@ export default function App() {
             role: "assistant",
             content: acc,
             videos: videos.length ? [...videos] : undefined,
+            socials: socials.length ? [...socials] : undefined,
             flashcards,
             quiz,
           };
@@ -3611,7 +5011,7 @@ export default function App() {
           </Text>
         </TouchableOpacity>
         <TouchableOpacity style={styles.viewTab} onPress={() => setSummarizing(true)}>
-          <Text style={styles.viewTabText}>📝 Notes</Text>
+          <Text style={styles.viewTabText}>📝 Summarize</Text>
         </TouchableOpacity>
         <TouchableOpacity
           style={[styles.viewTab, tab === "calendar" && styles.viewTabActive]}
@@ -3637,6 +5037,14 @@ export default function App() {
         >
           <Text style={[styles.viewTabText, tab === "study" && styles.viewTabTextActive]}>
             📋 Study
+          </Text>
+        </TouchableOpacity>
+        <TouchableOpacity
+          style={[styles.viewTab, tab === "notebook" && styles.viewTabActive]}
+          onPress={() => setTab("notebook")}
+        >
+          <Text style={[styles.viewTabText, tab === "notebook" && styles.viewTabTextActive]}>
+            📓 Smart Notes
           </Text>
         </TouchableOpacity>
         <TouchableOpacity
@@ -3708,8 +5116,19 @@ export default function App() {
             onClear={clearSchedule}
             homeHour={homeHour}
             onSetHomeHour={setHomeHour}
-            onGenerate={generateStudySchedule}
+            onGenerate={() => generateStudySchedule()}
+            onSetup={() => setScheduleSurveyOpen(true)}
             generating={generatingSchedule}
+          />
+          <ScheduleSetupSurvey
+            visible={scheduleSurveyOpen}
+            onClose={() => setScheduleSurveyOpen(false)}
+            initial={{
+              focusTime: profile?.focusTime,
+              sessionLength: profile?.sessionLength,
+              focusHelp: profile?.focusHelp,
+            }}
+            onSubmit={handleScheduleSurvey}
           />
           <CheckInCard prefs={checkIn} onChange={setCheckIn} />
           <View style={styles.card}>
@@ -3736,7 +5155,7 @@ export default function App() {
                   ↻ Rebuild from our chat
                 </Text>
               </TouchableOpacity>
-              <PlanPanel
+              <PlanBoard
                 plan={plan}
                 onToggle={togglePlan}
                 onAdd={addMilestone}
@@ -3815,6 +5234,8 @@ export default function App() {
                   ["📝 Quiz me", "Quiz me on what I'm learning."],
                   ["📚 Study guide", "Make me a study guide for what I should review."],
                   ["🎬 Study videos", "Recommend me a few study videos for my class."],
+                  ["📱 Short-form recs", "Recommend TikTok, YouTube Shorts, and Instagram accounts or searches for what I'm studying."],
+                  ["🧠 Study tip", "Give me ONE quick, practical study tip I can use right now — a proven technique matched to how I learn and what I struggle with. Keep it to a sentence or two."],
                   ["💡 Suggestions", "Give me a couple of study suggestions."],
                 ] as const
               ).map(([label, msg]) => (
@@ -3832,7 +5253,10 @@ export default function App() {
               ))}
             </View>
           </View>
+          <SmartNotes profile={profile} />
         </ScrollView>
+      ) : tab === "notebook" ? (
+        <NotesWorkspace />
       ) : tab === "practice" ? (
         <ScrollView contentContainerStyle={styles.studyScroll}>
           <PracticeQuiz
@@ -3845,6 +5269,11 @@ export default function App() {
         </ScrollView>
       ) : tab === "calendar" ? (
         <ScrollView contentContainerStyle={styles.studyScroll}>
+          <DeadlineCountdown
+            events={events}
+            assignments={assignments}
+            goals={goals}
+          />
           <CalendarPanel
             events={events}
             assignments={assignments}
@@ -4076,6 +5505,9 @@ export default function App() {
             )}
             {item.videos && item.videos.length > 0 && (
               <VideoCards videos={item.videos} />
+            )}
+            {item.socials && item.socials.length > 0 && (
+              <SocialCards socials={item.socials} />
             )}
             {item.flashcards && item.flashcards.length > 0 && (
               <FlashcardDeck cards={item.flashcards} onMissed={addMissed} />
@@ -4774,6 +6206,26 @@ const styles = StyleSheet.create({
   videoMeta: { padding: 8 },
   videoTitle: { fontSize: 13, fontWeight: "600", color: "#1c2421", lineHeight: 17 },
   videoChannel: { fontSize: 11, color: "#5b6660", marginTop: 4 },
+  socialWrap: { flexDirection: "row", flexWrap: "wrap", gap: 10, maxWidth: "90%" },
+  socialCard: {
+    width: 170,
+    backgroundColor: "#fff",
+    borderRadius: 12,
+    borderWidth: 1,
+    borderColor: "#d9ddd8",
+    padding: 10,
+    gap: 6,
+  },
+  socialBadge: {
+    alignSelf: "flex-start",
+    borderRadius: 999,
+    paddingVertical: 3,
+    paddingHorizontal: 8,
+  },
+  socialBadgeText: { color: "#fff", fontSize: 11, fontWeight: "700" },
+  socialTitle: { fontSize: 13, fontWeight: "600", color: "#1c2421", lineHeight: 17 },
+  socialNote: { fontSize: 11, color: "#5b6660", lineHeight: 15 },
+  socialOpen: { fontSize: 12, fontWeight: "600", color: "#2f6f4f" },
   // Study tools (flashcards + quiz)
   toolBox: {
     maxWidth: "90%",
@@ -4917,6 +6369,14 @@ const styles = StyleSheet.create({
     marginBottom: 12,
   },
   schedBuildBtnText: { color: "#2f6f4f", fontWeight: "700", fontSize: 14 },
+  schedSetupBtn: {
+    backgroundColor: "#2f6f4f",
+    borderRadius: 12,
+    paddingVertical: 11,
+    alignItems: "center",
+    marginBottom: 10,
+  },
+  schedSetupBtnText: { color: "#fff", fontWeight: "700", fontSize: 14 },
   schedList: { gap: 6 },
   schedRow: {
     flexDirection: "row",
@@ -5167,6 +6627,14 @@ const styles = StyleSheet.create({
     backgroundColor: "#fff",
   },
   studyToolBtnText: { color: "#2f6f4f", fontSize: 15, fontWeight: "600" },
+  nbLabel: {
+    fontSize: 12.5,
+    fontWeight: "800",
+    color: "#2f6f4f",
+    textTransform: "uppercase",
+    marginTop: 8,
+    marginBottom: 4,
+  },
   planBuildBtn: {
     borderWidth: 1,
     borderColor: "#2f6f4f",

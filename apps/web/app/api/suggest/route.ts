@@ -39,6 +39,7 @@ type SuggestRequest = {
   tasks?: string[]; // today's open daily tasks (~10–20 min each), in priority order
   homeHour?: number; // hour (24h) the learner gets home / is free to study
   budgetMin?: number; // scheduled study minutes today — cap for the tasks' estMin total
+  focusNote?: string; // free-form "what today's schedule should prioritize" (from the setup survey)
   missed?: string[];
   existing?: string[];
   profile?: LearnerProfile;
@@ -334,6 +335,9 @@ export async function POST(req: Request) {
       : "",
     budgetMin != null
       ? `Scheduled study time today: ${budgetMin} minutes (from their schedule). Size the tasks so their estMin together come close to this but never exceed it.`
+      : "",
+    str(body.focusNote)
+      ? `What the learner wants today's schedule to PRIORITIZE (from their setup survey): ${body.focusNote!.trim()}. Weight the study blocks toward this.`
       : "",
     str(body.career) ? `Career goal: ${body.career!.trim()}` : "",
     str(body.classes) || str(body.profile?.klass)

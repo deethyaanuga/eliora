@@ -1,6 +1,7 @@
 import OpenAI from "openai";
 import {
   ELIORA_SUMMARY_MODEL,
+  normalizeFlashcardStyle,
   outputSystemPrompt,
   type SummarizeRequest,
 } from "@eliora/shared";
@@ -21,7 +22,14 @@ const FLASHCARDS_TOOL: OpenAI.Chat.Completions.ChatCompletionTool = {
           type: "array",
           items: {
             type: "object",
-            properties: { front: { type: "string" }, back: { type: "string" } },
+            properties: {
+              front: { type: "string" },
+              back: { type: "string" },
+              style: {
+                type: "string",
+                enum: ["basic", "reversed", "qa", "cloze", "example"],
+              },
+            },
             required: ["front", "back"],
           },
         },
@@ -279,7 +287,14 @@ export async function POST(req: Request) {
         model: ELIORA_SUMMARY_MODEL,
         max_completion_tokens: 1800,
         messages: [
-          { role: "system", content: outputSystemPrompt(output, body.profile) },
+          {
+            role: "system",
+            content: outputSystemPrompt(
+              output,
+              body.profile,
+              normalizeFlashcardStyle(body.flashcardStyle),
+            ),
+          },
           { role: "user", content },
         ],
         tools: [tool],
@@ -296,10 +311,14 @@ export async function POST(req: Request) {
       );
       if (output === "flashcards") {
         const cards = (args.cards ?? [])
-          .filter((c: { front?: string; back?: string }) => c?.front?.trim() && c?.back?.trim())
-          .map((c: { front: string; back: string }) => ({
+          .filter(
+            (c: { front?: string; back?: string }) =>
+              c?.front?.trim() && c?.back?.trim(),
+          )
+          .map((c: { front: string; back: string; style?: string }) => ({
             front: c.front.trim(),
             back: c.back.trim(),
+            style: normalizeFlashcardStyle(c.style),
           }));
         return Response.json({ flashcards: cards });
       }

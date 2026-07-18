@@ -19,3 +19,12 @@ apps/web/.auth-users.json
 # Local push-notification subscription store (dev only)
 .notif-subs.json
 apps/web/.notif-subs.json
+
+# Local Study Together rooms store (dev only)
+.study-rooms.json
+apps/web/.study-rooms.json
+apps/web/.study-rooms.json.*.tmp
+
+# Local anonymized peer-example bank (dev only)
+.student-examples.json
+apps/web/.student-examples.json

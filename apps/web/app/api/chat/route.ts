@@ -7,14 +7,17 @@ import {
   fourYearPlanContext,
   goalsContext,
   mistakesContext,
+  normalizeFlashcardStyle,
   planContext,
   profileContext,
   revisionContext,
   subjectsContext,
+  type ChatAttachment,
   type ChatMessage,
   type ChatRequest,
   type FourYearCourse,
 } from "@eliora/shared";
+import { findExamples, saveExample } from "@/lib/examples";
 
 // Streams newline-delimited JSON events to the client:
 //   {"type":"text","value":"..."}      incremental reply text
@@ -27,6 +30,7 @@ import {
 //   {"type":"goal","item":{...}}        a SMART goal to add
 //   {"type":"mistake","item":{...}}     a concept for the mistake tracker
 //   {"type":"fourYearPlan","item":{...}} the long-term academic roadmap
+//   {"type":"examples","items":[...]}  anonymized peer examples (how others solved it)
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 
@@ -38,6 +42,7 @@ const MAX_HISTORY = 40;
 // Friendly one-liners shown in the chat bubble while a tool runs.
 const TOOL_STATUS: Record<string, string> = {
   search_youtube: "Searching YouTube for real videos…",
+  recommend_socials: "Finding creators on TikTok, YouTube & Instagram…",
   fetch_link: "Reading that link…",
   save_plan: "Updating your plan…",
   add_event: "Adding it to your calendar…",
@@ -48,6 +53,8 @@ const TOOL_STATUS: Record<string, string> = {
   add_goal: "Saving your goal…",
   log_mistake: "Noting that for your review list…",
   save_four_year_plan: "Updating your roadmap…",
+  find_student_examples: "Looking at how other students solved this…",
+  save_student_example: "Saving this to help other students…",
 };
 
 const EVENT_KINDS = ["exam", "final", "quiz", "assignment", "other"] as const;
@@ -71,6 +78,55 @@ const TOOLS: OpenAI.Chat.Completions.ChatCompletionTool[] = [
           },
         },
         required: ["query"],
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "recommend_socials",
+      description:
+        "Recommend short-form study content across TikTok, YouTube (Shorts), " +
+        "and Instagram Reels for a topic. Use this when the learner wants quick, " +
+        "bite-sized explainers or asks about TikTok/Instagram/short videos, or " +
+        "alongside longer YouTube videos for variety. You do NOT get real clips " +
+        "back — instead, for each item give the platform and a specific thing to " +
+        "search for (a search phrase, a well-known educational creator, or a " +
+        "hashtag); the app turns each into a card that opens that platform's " +
+        "search. Return 3–6 items spread across at least two platforms. Keep " +
+        "each 'query' concrete (e.g. 'photosynthesis explained', '@mathsorcerer', " +
+        "'#apbiology'). Favor reputable, school-appropriate creators.",
+      parameters: {
+        type: "object",
+        properties: {
+          topic: {
+            type: "string",
+            description: "The subject/topic these recommendations are for",
+          },
+          items: {
+            type: "array",
+            items: {
+              type: "object",
+              properties: {
+                platform: {
+                  type: "string",
+                  enum: ["youtube", "tiktok", "instagram"],
+                },
+                query: {
+                  type: "string",
+                  description:
+                    "What to search for on that platform: a phrase, @creator, or #hashtag",
+                },
+                note: {
+                  type: "string",
+                  description: "Short reason it helps (one line)",
+                },
+              },
+              required: ["platform", "query"],
+            },
+          },
+        },
+        required: ["items"],
       },
     },
   },
@@ -152,7 +208,13 @@ const TOOLS: OpenAI.Chat.Completions.ChatCompletionTool[] = [
       name: "make_flashcards",
       description:
         "Create a deck of flashcards. The app shows them as flip cards. Keep " +
-        "fronts short (a term or question) and backs simple.",
+        "fronts short and backs simple. Each card has a \"style\": \"basic\" " +
+        "(front=term, back=definition), \"reversed\" (front=definition, " +
+        "back=term), \"qa\" (front=question, back=answer), \"cloze\" (front=a " +
+        'sentence with the key word blanked as "____", back=the missing word), ' +
+        "or \"example\" (front=concept, back=a worked example). If the learner " +
+        "asked for a specific style, use it for every card; otherwise pick what " +
+        "fits each fact — mixing styles is good.",
       parameters: {
         type: "object",
         properties: {
@@ -163,6 +225,10 @@ const TOOLS: OpenAI.Chat.Completions.ChatCompletionTool[] = [
               properties: {
                 front: { type: "string" },
                 back: { type: "string" },
+                style: {
+                  type: "string",
+                  enum: ["basic", "reversed", "qa", "cloze", "example"],
+                },
               },
               required: ["front", "back"],
             },
@@ -435,9 +501,106 @@ const TOOLS: OpenAI.Chat.Completions.ChatCompletionTool[] = [
       },
     },
   },
+  {
+    type: "function",
+    function: {
+      name: "find_student_examples",
+      description:
+        "Search the bank of ANONYMIZED examples from other students for how peers " +
+        "worked through a similar problem or concept. Call this when the learner " +
+        "is stuck on a specific problem/topic and a parallel example would help. " +
+        "Returns up to a few matches; the app shows them to the learner as small " +
+        "'how another student tackled this' cards, so don't re-list them as text — " +
+        "weave the useful idea into your next hint. These are anonymous parallel " +
+        "examples to spark the learner's OWN next step, never the finished answer " +
+        "to copy. If it returns no matches, just coach them normally.",
+      parameters: {
+        type: "object",
+        properties: {
+          topic: {
+            type: "string",
+            description:
+              "The problem or concept to find peer examples for, e.g. 'solving two-step equations' or 'balancing chemical equations'.",
+          },
+          subject: {
+            type: "string",
+            description: "The class/subject to scope the search to, if known.",
+          },
+        },
+        required: ["topic"],
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "save_student_example",
+      description:
+        "After you've helped THIS learner genuinely work through a problem, save a " +
+        "short, FULLY ANONYMIZED write-up of it so the next student stuck on the " +
+        "same thing can benefit. Strip anything identifying — no names, no personal " +
+        "details, no specifics that point back to one person. Capture the subject, " +
+        "the topic, the kind of problem, and the approach/steps that helped.",
+      parameters: {
+        type: "object",
+        properties: {
+          topic: {
+            type: "string",
+            description: "What it's about, e.g. 'solving two-step equations'.",
+          },
+          problem: {
+            type: "string",
+            description:
+              "The kind of problem the student was stuck on (generalized, not their exact personal wording).",
+          },
+          approach: {
+            type: "string",
+            description:
+              "The approach or steps that helped them work through it, in a sentence or two.",
+          },
+          subject: { type: "string", description: "Class/subject, if known." },
+          tags: {
+            type: "array",
+            items: { type: "string" },
+            description: "A few keywords to help match this example later.",
+          },
+        },
+        required: ["topic", "problem", "approach"],
+      },
+    },
+  },
 ];
 
 type Video = { videoId: string; title: string; channel: string; url: string };
+
+// Short-form recommendations across platforms. TikTok and Instagram have no
+// free public search API, so — unlike YouTube — we don't fetch real clips.
+// Instead the model recommends WHAT to look up (a search phrase, creator, or
+// hashtag) per platform and we hand back a native deep-link the learner can
+// open. This mirrors the YouTube "fallback search link" behavior below.
+type SocialPlatform = "youtube" | "tiktok" | "instagram";
+type SocialRec = {
+  platform: SocialPlatform;
+  title: string; // what to search for / creator / hashtag
+  note?: string; // one line on why it helps
+  url: string;
+};
+
+function buildSocialUrl(platform: SocialPlatform, query: string): string {
+  const q = encodeURIComponent(query.trim());
+  switch (platform) {
+    case "tiktok":
+      return `https://www.tiktok.com/search?q=${q}`;
+    case "instagram":
+      return `https://www.instagram.com/explore/search/keyword/?q=${q}`;
+    case "youtube":
+    default:
+      // Bias toward short-form study clips.
+      return `https://www.youtube.com/results?search_query=${encodeURIComponent(
+        query.trim() + " shorts",
+      )}`;
+  }
+}
 
 async function searchYouTube(
   query: string,
@@ -567,6 +730,19 @@ async function fetchLink(
   }
 }
 
+function isValidAttachment(a: unknown): a is ChatAttachment {
+  if (!a || typeof a !== "object") return false;
+  const at = a as Record<string, unknown>;
+  return (
+    (at.kind === "image" || at.kind === "video" || at.kind === "file") &&
+    typeof at.name === "string" &&
+    typeof at.mime === "string" &&
+    (at.dataUrl === undefined || typeof at.dataUrl === "string") &&
+    (at.text === undefined || typeof at.text === "string") &&
+    (at.note === undefined || typeof at.note === "string")
+  );
+}
+
 function isValid(messages: unknown): messages is ChatMessage[] {
   return (
     Array.isArray(messages) &&
@@ -578,9 +754,64 @@ function isValid(messages: unknown): messages is ChatMessage[] {
         // "system" (or other privileged) message.
         ((m as ChatMessage).role === "user" ||
           (m as ChatMessage).role === "assistant") &&
-        typeof (m as ChatMessage).content === "string",
+        typeof (m as ChatMessage).content === "string" &&
+        ((m as ChatMessage).attachments === undefined ||
+          (Array.isArray((m as ChatMessage).attachments) &&
+            (m as ChatMessage).attachments!.every(isValidAttachment))),
     )
   );
+}
+
+// How much extracted file text the model gets per attachment.
+const ATTACH_TEXT_MAX = 12_000;
+// Data URLs must be real base64 images — reject anything a client might smuggle
+// in (e.g. an SVG with script, or a non-image scheme) before it reaches vision.
+const SAFE_IMAGE_DATA_URL = /^data:image\/(png|jpe?g|webp|gif);base64,[A-Za-z0-9+/=\s]+$/;
+
+// Turn a chat message into an OpenAI content value. Plain messages stay a
+// string; a user message that carries attachments becomes a multi-part content
+// array (text + image parts) so the vision model can see photos and video
+// frames. `withImages` is false for older turns so we don't resend heavy image
+// payloads on every follow-up.
+function toContent(
+  m: ChatMessage,
+  withImages: boolean,
+): OpenAI.Chat.Completions.ChatCompletionUserMessageParam["content"] {
+  const atts = m.attachments ?? [];
+  if (m.role !== "user" || atts.length === 0) return m.content;
+
+  const parts: OpenAI.Chat.Completions.ChatCompletionContentPart[] = [];
+  if (m.content.trim()) parts.push({ type: "text", text: m.content });
+
+  for (const a of atts) {
+    const isImage = a.kind === "image" || a.kind === "video";
+    if (isImage && withImages && a.dataUrl && SAFE_IMAGE_DATA_URL.test(a.dataUrl)) {
+      if (a.kind === "video") {
+        parts.push({
+          type: "text",
+          text: `[Still frame from the video "${a.name}"${a.note ? ` — ${a.note}` : ""}]`,
+        });
+      }
+      parts.push({ type: "image_url", image_url: { url: a.dataUrl, detail: "auto" } });
+    } else if (a.kind === "file" && a.text && a.text.trim()) {
+      const body = a.text.slice(0, ATTACH_TEXT_MAX);
+      parts.push({
+        type: "text",
+        text:
+          `[Attached file "${a.name}"${a.text.length > ATTACH_TEXT_MAX ? " (truncated)" : ""}]\n` +
+          body,
+      });
+    } else {
+      // Something the model can't read (an old image dropped to save tokens, a
+      // PDF, a raw video) — leave a short note so it can respond sensibly.
+      parts.push({
+        type: "text",
+        text: `[Attached ${a.kind}: "${a.name}"${a.note ? ` — ${a.note}` : ""}]`,
+      });
+    }
+  }
+
+  return parts.length ? parts : m.content;
 }
 
 // Run one tool call, emit any UI event, and return the tool-result text.
@@ -605,6 +836,39 @@ async function runTool(
         "Video lookup is unavailable, but do NOT tell the learner there was " +
         `an error — just share this YouTube search link instead: ${link}`,
     });
+  }
+  if (name === "recommend_socials") {
+    const raw = (input.items as
+      | { platform?: string; query?: string; note?: string }[]
+      | undefined) ?? [];
+    const valid = new Set<SocialPlatform>(["youtube", "tiktok", "instagram"]);
+    const seen = new Set<string>();
+    const items: SocialRec[] = [];
+    for (const it of raw) {
+      const platform = String(it?.platform ?? "").trim() as SocialPlatform;
+      const query = String(it?.query ?? "").trim();
+      if (!valid.has(platform) || !query) continue;
+      const dedupe = `${platform}:${query.toLowerCase()}`;
+      if (seen.has(dedupe)) continue;
+      seen.add(dedupe);
+      items.push({
+        platform,
+        title: query,
+        note: it?.note ? String(it.note).trim() : undefined,
+        url: buildSocialUrl(platform, query),
+      });
+    }
+    if (items.length) send({ type: "socials", items });
+    return JSON.stringify(
+      items.length
+        ? { recommendations: items }
+        : {
+            error: "no_recommendations",
+            note:
+              "Give the learner a few concrete things to search for on TikTok, " +
+              "YouTube Shorts, or Instagram instead.",
+          },
+    );
   }
   if (name === "fetch_link") {
     const result = await fetchLink(String(input.url ?? "").trim());
@@ -657,10 +921,17 @@ async function runTool(
     return "Could not save — need a title and a date in YYYY-MM-DD format.";
   }
   if (name === "make_flashcards") {
-    const raw = (input.cards as { front?: string; back?: string }[] | undefined) ?? [];
+    const raw =
+      (input.cards as
+        | { front?: string; back?: string; style?: string }[]
+        | undefined) ?? [];
     const items = raw
       .filter((c) => c?.front?.trim() && c?.back?.trim())
-      .map((c) => ({ front: c.front!.trim(), back: c.back!.trim() }));
+      .map((c) => ({
+        front: c.front!.trim(),
+        back: c.back!.trim(),
+        style: normalizeFlashcardStyle(c.style),
+      }));
     send({ type: "flashcards", items });
     return `Made ${items.length} flashcards.`;
   }
@@ -833,6 +1104,42 @@ async function runTool(
       destination || "their goal"
     }".`;
   }
+  if (name === "find_student_examples") {
+    const topic = String(input.topic ?? "").trim();
+    const subject =
+      typeof input.subject === "string" ? input.subject.trim() : undefined;
+    if (!topic) return "No topic was given.";
+    const examples = await findExamples(topic, subject || undefined);
+    if (!examples.length) {
+      return JSON.stringify({
+        examples: [],
+        note:
+          "No peer examples matched — don't mention a lookup happened, just " +
+          "coach the learner normally with your own hint or a parallel example.",
+      });
+    }
+    send({ type: "examples", items: examples });
+    return JSON.stringify({
+      examples,
+      note:
+        "The app is showing these anonymized peer examples to the learner as " +
+        "cards. Do NOT re-list them as text — weave one helpful idea into your " +
+        "next hint, and keep it a nudge, not the finished answer.",
+    });
+  }
+  if (name === "save_student_example") {
+    const saved = await saveExample({
+      topic: input.topic,
+      problem: input.problem,
+      approach: input.approach,
+      subject: input.subject,
+      tags: input.tags,
+    });
+    if (!saved) {
+      return "Not saved — need a topic, the kind of problem, and the approach that helped.";
+    }
+    return `Saved an anonymized example on "${saved.topic}" for other students.`;
+  }
   return "Unknown tool.";
 }
 
@@ -858,6 +1165,12 @@ export async function POST(req: Request) {
     `\n\n## Today's date\nToday is ${todayName}, ${today}. Use this to resolve ` +
     `relative dates yourself (e.g. "next Friday", "in 3 days", "tomorrow") into a ` +
     `YYYY-MM-DD date — do NOT ask the learner for the exact date.` +
+    `\n\n## Attachments\nThe learner can attach photos, files, and videos. Photos ` +
+    `(and a still frame pulled from a video) are given to you as images — read them ` +
+    `carefully: they're usually a worksheet, textbook page, notes, or a problem they ` +
+    `need help with. Text files arrive as "[Attached file …]" blocks. For anything ` +
+    `marked as unreadable (e.g. a PDF or raw video), don't pretend to see it — say ` +
+    `what you'd need (a photo/screenshot, or the pasted text) to help.` +
     profileContext(body.profile) +
     planContext(body.plan) +
     eventsContext(body.events, today) +
@@ -868,11 +1181,20 @@ export async function POST(req: Request) {
     mistakesContext(body.mistakes) +
     subjectsContext(body.subjects);
 
+  // Attach image data only for the most recent turns — resending heavy base64
+  // photos on every follow-up would balloon cost and hit context limits.
+  const IMAGE_TURNS = 6;
+  const recent = body.messages.slice(-MAX_HISTORY);
   const messages: OpenAI.Chat.Completions.ChatCompletionMessageParam[] = [
     { role: "system", content: system },
-    ...body.messages
-      .slice(-MAX_HISTORY)
-      .map((m) => ({ role: m.role, content: m.content })),
+    ...recent.map((m, i) =>
+      m.role === "user"
+        ? {
+            role: "user" as const,
+            content: toContent(m, i >= recent.length - IMAGE_TURNS),
+          }
+        : { role: m.role, content: m.content },
+    ),
   ];
 
   // Create a (streaming) completion, retrying once on transient failures

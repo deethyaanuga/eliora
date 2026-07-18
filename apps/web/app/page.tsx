@@ -14,7 +14,53 @@ import {
 } from "@/components/ui/card";
 
 type Video = { videoId: string; title: string; channel: string; url: string };
-type Flashcard = { front: string; back: string };
+// Short-form study recs that open a search on TikTok / YouTube / Instagram.
+type SocialPlatform = "youtube" | "tiktok" | "instagram";
+type SocialRec = {
+  platform: SocialPlatform;
+  title: string;
+  note?: string;
+  url: string;
+};
+const SOCIAL_META: Record<
+  SocialPlatform,
+  { label: string; emoji: string; color: string }
+> = {
+  youtube: { label: "YouTube", emoji: "▶️", color: "#ff0000" },
+  tiktok: { label: "TikTok", emoji: "🎵", color: "#111111" },
+  instagram: { label: "Instagram", emoji: "📸", color: "#c13584" },
+};
+// An anonymized peer example (mirrors StudentExample in @eliora/shared) — how
+// another student worked through a similar problem, shown as a card in chat.
+type StudentExample = {
+  id: string;
+  subject?: string;
+  topic: string;
+  problem: string;
+  approach: string;
+  tags?: string[];
+  createdAt?: string;
+};
+// A flashcard's learning format (mirrors FlashcardStyle in @eliora/shared).
+type FlashcardStyle = "basic" | "reversed" | "qa" | "cloze" | "example";
+type Flashcard = { front: string; back: string; style?: FlashcardStyle };
+// UI labels per style: what to call each side of the card, plus a picker label.
+const FLASHCARD_STYLES: {
+  key: FlashcardStyle;
+  label: string;
+  emoji: string;
+  front: string;
+  back: string;
+}[] = [
+  { key: "basic", label: "Term → Definition", emoji: "🃏", front: "Term", back: "Definition" },
+  { key: "reversed", label: "Definition → Term", emoji: "🔄", front: "Definition", back: "Term" },
+  { key: "qa", label: "Question & Answer", emoji: "❓", front: "Question", back: "Answer" },
+  { key: "cloze", label: "Fill in the blank", emoji: "✏️", front: "Fill in the blank", back: "Answer" },
+  { key: "example", label: "Concept → Example", emoji: "💡", front: "Concept", back: "Example" },
+];
+function flashcardStyleMeta(style?: FlashcardStyle) {
+  return FLASHCARD_STYLES.find((s) => s.key === style) ?? FLASHCARD_STYLES[0];
+}
 type QuizQuestion = {
   question: string;
   options: string[];
@@ -22,12 +68,25 @@ type QuizQuestion = {
   explanation?: string;
   topic?: string;
 };
+// A file/photo/video the learner attached to a message (mirrors ChatAttachment
+// in @eliora/shared — page.tsx keeps its own client-side copies of shared types).
+type Attachment = {
+  kind: "image" | "video" | "file";
+  name: string;
+  mime: string;
+  dataUrl?: string; // base64 data URL — an image, or a frame grabbed from a video
+  text?: string; // extracted text, for text-based files
+  note?: string; // extra context, e.g. "video · 0:42"
+};
 type Message = {
   role: "user" | "assistant";
   content: string;
   videos?: Video[];
+  socials?: SocialRec[];
+  examples?: StudentExample[];
   flashcards?: Flashcard[];
   quiz?: QuizQuestion[];
+  attachments?: Attachment[];
 };
 type Chat = {
   id: string;
@@ -62,6 +121,185 @@ function makeShareUrl(payload: SharePayload): string {
   const enc = b64urlEncode(JSON.stringify(payload));
   const { origin, pathname } = window.location;
   return `${origin}${pathname}?share=${enc}`;
+}
+
+// --- Chat attachments (photos / files / videos) ----------------------------
+// The learner can attach things to a chat message. Photos and a still frame
+// grabbed from a video become base64 images the vision model can actually see;
+// text-based files are read inline; anything else travels as a labelled note.
+const MAX_ATTACHMENTS = 6;
+const IMG_MAX_DIM = 1024; // longest edge, px — keeps the base64 payload small
+const FILE_TEXT_MAX = 12_000; // chars of a text file we send
+const TEXT_LIKE =
+  /\.(txt|md|markdown|csv|tsv|json|log|html?|xml|tex|srt|vtt|rtf|yml|yaml|ini|conf)$/i;
+
+function fmtBytes(n: number): string {
+  if (n < 1024) return `${n} B`;
+  if (n < 1024 * 1024) return `${Math.round(n / 1024)} KB`;
+  return `${(n / (1024 * 1024)).toFixed(1)} MB`;
+}
+function fmtDuration(sec: number): string {
+  if (!isFinite(sec) || sec <= 0) return "";
+  const m = Math.floor(sec / 60);
+  const s = Math.round(sec % 60);
+  return `${m}:${String(s).padStart(2, "0")}`;
+}
+
+function loadImageEl(src: string): Promise<HTMLImageElement> {
+  return new Promise((resolve, reject) => {
+    const img = new Image();
+    img.onload = () => resolve(img);
+    img.onerror = () => reject(new Error("image decode failed"));
+    img.src = src;
+  });
+}
+
+// Draw a source (image or video element) onto a canvas, scaled so its longest
+// edge is at most IMG_MAX_DIM, and return a JPEG data URL.
+function drawToJpeg(
+  src: CanvasImageSource,
+  w: number,
+  h: number,
+  quality = 0.85,
+): string {
+  const scale = Math.min(1, IMG_MAX_DIM / Math.max(w, h));
+  const cw = Math.max(1, Math.round(w * scale));
+  const ch = Math.max(1, Math.round(h * scale));
+  const canvas = document.createElement("canvas");
+  canvas.width = cw;
+  canvas.height = ch;
+  const ctx = canvas.getContext("2d");
+  if (!ctx) throw new Error("no 2d context");
+  ctx.drawImage(src, 0, 0, cw, ch);
+  return canvas.toDataURL("image/jpeg", quality);
+}
+
+function readAsDataUrl(file: File): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const fr = new FileReader();
+    fr.onload = () => resolve(fr.result as string);
+    fr.onerror = () => reject(new Error("file read failed"));
+    fr.readAsDataURL(file);
+  });
+}
+
+async function imageAttachment(file: File): Promise<Attachment> {
+  const raw = await readAsDataUrl(file);
+  try {
+    const img = await loadImageEl(raw);
+    const dataUrl = drawToJpeg(img, img.naturalWidth, img.naturalHeight);
+    return { kind: "image", name: file.name, mime: "image/jpeg", dataUrl };
+  } catch {
+    // Couldn't re-encode (rare) — fall back to the original if it's a format
+    // the vision model accepts; otherwise keep it as a note only.
+    const ok = /^data:image\/(png|jpe?g|webp|gif);base64,/.test(raw);
+    return ok
+      ? { kind: "image", name: file.name, mime: file.type || "image/*", dataUrl: raw }
+      : { kind: "image", name: file.name, mime: file.type || "image/*",
+          note: "couldn't prepare this image" };
+  }
+}
+
+// Grab a representative still frame from a video so Eliora has something to look
+// at (the model can't watch video). Seeks a little in to skip black intro frames.
+function grabVideoFrame(
+  url: string,
+): Promise<{ frame: string; duration: number }> {
+  return new Promise((resolve, reject) => {
+    const video = document.createElement("video");
+    video.muted = true;
+    video.preload = "metadata";
+    video.playsInline = true;
+    let done = false;
+    const fail = () => {
+      if (done) return;
+      done = true;
+      reject(new Error("video frame grab failed"));
+    };
+    video.onloadedmetadata = () => {
+      const t = Math.min(1, (video.duration || 2) / 4);
+      try {
+        video.currentTime = isFinite(t) ? t : 0;
+      } catch {
+        fail();
+      }
+    };
+    video.onseeked = () => {
+      if (done) return;
+      try {
+        const frame = drawToJpeg(
+          video,
+          video.videoWidth || 320,
+          video.videoHeight || 240,
+          0.8,
+        );
+        done = true;
+        resolve({ frame, duration: video.duration || 0 });
+      } catch {
+        fail();
+      }
+    };
+    video.onerror = fail;
+    video.src = url;
+  });
+}
+
+async function videoAttachment(file: File): Promise<Attachment> {
+  const url = URL.createObjectURL(file);
+  try {
+    const { frame, duration } = await grabVideoFrame(url);
+    const len = fmtDuration(duration);
+    return {
+      kind: "video",
+      name: file.name,
+      mime: "image/jpeg",
+      dataUrl: frame,
+      note: len ? `${len} long` : undefined,
+    };
+  } catch {
+    return {
+      kind: "video",
+      name: file.name,
+      mime: file.type || "video/*",
+      note: "couldn't grab a preview frame",
+    };
+  } finally {
+    URL.revokeObjectURL(url);
+  }
+}
+
+async function fileAttachment(file: File): Promise<Attachment> {
+  const looksText =
+    /^text\//i.test(file.type) ||
+    /json|xml|csv/i.test(file.type) ||
+    TEXT_LIKE.test(file.name);
+  if (looksText && file.size < 2_000_000) {
+    try {
+      const text = await file.text();
+      if (text.trim()) {
+        return {
+          kind: "file",
+          name: file.name,
+          mime: file.type || "text/plain",
+          text: text.slice(0, FILE_TEXT_MAX),
+        };
+      }
+    } catch {
+      /* fall through to a note */
+    }
+  }
+  return {
+    kind: "file",
+    name: file.name,
+    mime: file.type || "application/octet-stream",
+    note: `${fmtBytes(file.size)} — I can't read this file type directly`,
+  };
+}
+
+async function fileToAttachment(file: File): Promise<Attachment> {
+  if (file.type.startsWith("image/")) return imageAttachment(file);
+  if (file.type.startsWith("video/")) return videoAttachment(file);
+  return fileAttachment(file);
 }
 
 // Read an incoming share from the URL (?share=…). Returns null if absent/bad.
@@ -351,7 +589,13 @@ function playTimerChime(): void {
     /* audio not available — silent */
   }
 }
-type EventKind = "exam" | "final" | "quiz" | "assignment" | "other";
+type EventKind =
+  | "exam"
+  | "final"
+  | "quiz"
+  | "assignment"
+  | "project"
+  | "other";
 type StudyEvent = {
   id: string;
   title: string;
@@ -614,6 +858,33 @@ const FOCUS_TIME_OPTIONS = [
   "Late night",
 ];
 
+// Schedule-setup survey answers → the hour the learner is free and today's
+// study-minute budget. Keys are the option labels shown in the survey.
+const HOME_TIME_OPTIONS = [
+  "Right after school (~3 PM)",
+  "Late afternoon (~4–5 PM)",
+  "Early evening (~6 PM)",
+  "Later (~7 PM or after)",
+];
+const HOME_TIME_HOUR: Record<string, number> = {
+  "Right after school (~3 PM)": 15,
+  "Late afternoon (~4–5 PM)": 16,
+  "Early evening (~6 PM)": 18,
+  "Later (~7 PM or after)": 19,
+};
+const STUDY_BUDGET_OPTIONS = [
+  "About 30 minutes",
+  "About 1 hour",
+  "About 2 hours",
+  "As much as fits",
+];
+const STUDY_BUDGET_MIN: Record<string, number | undefined> = {
+  "About 30 minutes": 30,
+  "About 1 hour": 60,
+  "About 2 hours": 120,
+  "As much as fits": undefined,
+};
+
 // Sent when the learner taps "Build/Rebuild plan from our chat".
 const PLAN_FROM_CHAT_PROMPT =
   "Look back over our whole conversation so far and create or update my " +
@@ -628,12 +899,20 @@ const MONTHS = [
   "Jan", "Feb", "Mar", "Apr", "May", "Jun",
   "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
 ];
-const KINDS: EventKind[] = ["exam", "final", "quiz", "assignment", "other"];
+const KINDS: EventKind[] = [
+  "exam",
+  "final",
+  "quiz",
+  "assignment",
+  "project",
+  "other",
+];
 const KIND_COLOR: Record<EventKind, string> = {
   exam: "#b8742a",
   final: "#c0392b",
   quiz: "#2f6f8f",
   assignment: "#5b6660",
+  project: "#7a5c9e",
   other: "#5b6660",
 };
 
@@ -1003,12 +1282,113 @@ const DEFAULT_A11Y: A11y = {
   theme: "light",
 };
 
-function speak(text: string) {
+// OpenAI voices offered in Settings (mirrors ELIORA_TTS_VOICES in
+// @eliora/shared). "nova" is the warm default the API uses when none is set.
+const TTS_VOICE_KEY = "eliora-tts-voice";
+const TTS_VOICES: { id: string; label: string }[] = [
+  { id: "nova", label: "Nova · warm (default)" },
+  { id: "alloy", label: "Alloy · neutral" },
+  { id: "shimmer", label: "Shimmer · bright" },
+  { id: "echo", label: "Echo · calm" },
+  { id: "fable", label: "Fable · expressive" },
+  { id: "onyx", label: "Onyx · deep" },
+  { id: "coral", label: "Coral · friendly" },
+  { id: "sage", label: "Sage · gentle" },
+];
+
+// Robotic browser voice — the fallback when OpenAI TTS is unavailable.
+function speakFallback(text: string) {
   if (typeof window === "undefined" || !window.speechSynthesis) return;
   window.speechSynthesis.cancel();
   const u = new SpeechSynthesisUtterance(text);
   u.rate = 0.95;
   window.speechSynthesis.speak(u);
+}
+
+// One shared player so a second "Read aloud" (or a click elsewhere) stops
+// whatever is currently talking instead of overlapping voices.
+let ttsAudio: HTMLAudioElement | null = null;
+
+function stopSpeaking() {
+  if (typeof window !== "undefined" && window.speechSynthesis)
+    window.speechSynthesis.cancel();
+  if (ttsAudio) {
+    ttsAudio.pause();
+    if (ttsAudio.src.startsWith("blob:")) URL.revokeObjectURL(ttsAudio.src);
+    ttsAudio = null;
+  }
+}
+
+// Natural OpenAI voice via /api/tts, with the browser voice as a fallback.
+// Returns once playback has started (or the fallback fires). Clicking again
+// while the same text is playing toggles it off.
+async function speak(text: string, onState?: (s: "loading" | "playing" | "idle") => void) {
+  const clean = text.trim();
+  if (!clean || typeof window === "undefined") return;
+
+  // Toggle off if this exact clip is already playing.
+  if (ttsAudio && ttsAudio.dataset.text === clean && !ttsAudio.paused) {
+    stopSpeaking();
+    onState?.("idle");
+    return;
+  }
+  stopSpeaking();
+  onState?.("loading");
+
+  try {
+    const res = await fetch("/api/tts", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        text: clean,
+        voice: window.localStorage.getItem(TTS_VOICE_KEY) || undefined,
+      }),
+    });
+    if (!res.ok) throw new Error(`TTS ${res.status}`);
+    const blob = await res.blob();
+    const url = URL.createObjectURL(blob);
+    const audio = new Audio(url);
+    audio.dataset.text = clean;
+    ttsAudio = audio;
+    audio.onended = () => {
+      URL.revokeObjectURL(url);
+      if (ttsAudio === audio) ttsAudio = null;
+      onState?.("idle");
+    };
+    audio.onerror = () => {
+      URL.revokeObjectURL(url);
+      if (ttsAudio === audio) ttsAudio = null;
+      onState?.("idle");
+    };
+    await audio.play();
+    onState?.("playing");
+  } catch {
+    // Network/API trouble → still read it aloud with the built-in voice.
+    speakFallback(clean);
+    onState?.("idle");
+  }
+}
+
+// "Read aloud" control with live loading / playing state.
+function SpeakButton({ text }: { text: string }) {
+  const [state, setState] = useState<"loading" | "playing" | "idle">("idle");
+  useEffect(() => () => stopSpeaking(), []);
+  return (
+    <button
+      style={styles.speakBtn}
+      onClick={() => void speak(text, setState)}
+      aria-label={
+        state === "playing" ? "Stop reading aloud" : "Read this message aloud"
+      }
+      aria-busy={state === "loading"}
+    >
+      {state === "loading"
+        ? "⏳ Loading…"
+        : state === "playing"
+          ? "⏹ Stop"
+          : "🔊 Read aloud"}
+    </button>
+  );
 }
 
 function AccessibilityPanel({
@@ -1148,7 +1528,50 @@ function AccessibilityPanel({
             </span>
           </button>
         ))}
+        {value.readAloud && <VoicePicker />}
         <ChangePasswordSection />
+      </div>
+    </div>
+  );
+}
+
+// Picks the OpenAI voice used for "Read aloud" and previews it. Stored on its
+// own in localStorage, so it survives without touching the A11y schema.
+function VoicePicker() {
+  const [voice, setVoice] = useState("nova");
+  const [previewing, setPreviewing] = useState(false);
+  useEffect(() => {
+    setVoice(window.localStorage.getItem(TTS_VOICE_KEY) || "nova");
+  }, []);
+  function choose(id: string) {
+    setVoice(id);
+    window.localStorage.setItem(TTS_VOICE_KEY, id);
+    setPreviewing(true);
+    void speak(
+      "Hi, I'm Eliora. This is how I'll sound when I read your answers aloud.",
+      (s) => setPreviewing(s !== "idle"),
+    );
+  }
+  return (
+    <div style={{ marginTop: 8, marginBottom: 4 }}>
+      <div style={styles.toggleLabel}>Voice</div>
+      <div style={styles.toggleDesc}>
+        {previewing ? "Playing a preview…" : "Tap a voice to hear it"}
+      </div>
+      <div style={styles.themeGrid}>
+        {TTS_VOICES.map((v) => (
+          <button
+            key={v.id}
+            onClick={() => choose(v.id)}
+            aria-pressed={voice === v.id}
+            style={{
+              ...styles.themeChip,
+              ...(voice === v.id ? styles.themeChipActive : {}),
+            }}
+          >
+            🔊 {v.label}
+          </button>
+        ))}
       </div>
     </div>
   );
@@ -1405,6 +1828,64 @@ function VideoCards({ videos }: { videos: Video[] }) {
             <span style={styles.videoChannel}>{v.channel}</span>
           </div>
         </a>
+      ))}
+    </div>
+  );
+}
+
+// Short-form recommendations (TikTok / YouTube Shorts / Instagram Reels). Unlike
+// VideoCards these carry no real clip — each opens a search on that platform.
+function SocialCards({ socials }: { socials: SocialRec[] }) {
+  return (
+    <div style={styles.socialWrap}>
+      {socials.map((s, i) => {
+        const meta = SOCIAL_META[s.platform] ?? SOCIAL_META.youtube;
+        return (
+          <a
+            key={`${s.platform}-${i}`}
+            href={s.url}
+            target="_blank"
+            rel="noopener noreferrer"
+            style={styles.socialCard}
+          >
+            <span style={{ ...styles.socialBadge, background: meta.color }}>
+              {meta.emoji} {meta.label}
+            </span>
+            <span style={styles.socialTitle}>{s.title}</span>
+            {s.note && <span style={styles.socialNote}>{s.note}</span>}
+            <span style={styles.socialOpen}>Open on {meta.label} →</span>
+          </a>
+        );
+      })}
+    </div>
+  );
+}
+
+// Shows a few ANONYMIZED examples of how OTHER students worked through a similar
+// problem, so the learner can feed off the approach. Rendered from the chat
+// stream's {type:"examples"} event (see the chat route's find_student_examples).
+function ExampleCards({ examples }: { examples: StudentExample[] }) {
+  return (
+    <div style={styles.exampleWrap}>
+      <div style={styles.exampleHeader}>
+        🧑‍🤝‍🧑 How other students tackled this
+      </div>
+      {examples.map((ex, i) => (
+        <div key={ex.id ?? i} style={styles.exampleCard}>
+          <div style={styles.exampleTopRow}>
+            <span style={styles.exampleBadge}>Another student</span>
+            {ex.subject && (
+              <span style={styles.exampleSubject}>{ex.subject}</span>
+            )}
+          </div>
+          <span style={styles.exampleTopic}>{ex.topic}</span>
+          <span style={styles.exampleProblem}>
+            <strong>Got stuck on:</strong> {ex.problem}
+          </span>
+          <span style={styles.exampleApproach}>
+            <strong>What helped:</strong> {ex.approach}
+          </span>
+        </div>
       ))}
     </div>
   );
@@ -3465,6 +3946,38 @@ function lessonPromptsFor(
   return [...LESSON_PROMPTS_BY_SUBJECT[kind], ...LESSON_PROMPTS_GENERIC];
 }
 
+// Prompted chat responses driven by the weak-topic algorithm: the `missed`
+// tracker (topics the learner got wrong on quizzes/flashcards). We surface the
+// MOST RECENTLY missed topics first (they're appended, so the tail is freshest)
+// and turn each into a ready-to-send message, rotating the ask so the learner
+// gets variety — re-teach one, get quizzed on the next, diagnose the gap on the
+// third. Tapping a chip sends the prompt as if the learner typed it.
+type WeakPrompt = { label: string; prompt: string };
+const WEAK_PROMPT_TEMPLATES: ((t: string) => WeakPrompt)[] = [
+  (t) => ({
+    label: `Re-explain ${clipTopic(t)}`,
+    prompt: `I keep getting "${t}" wrong. Re-teach it to me from scratch, simply and step by step, then check I've really got it.`,
+  }),
+  (t) => ({
+    label: `Quiz me on ${clipTopic(t)}`,
+    prompt: `Quiz me on "${t}" — it's a weak spot for me. Ask a few questions one at a time and tell me exactly where I'm going wrong.`,
+  }),
+  (t) => ({
+    label: `Why I miss ${clipTopic(t)}`,
+    prompt: `Help me figure out why I keep missing "${t}". Ask me a question or two to find the gap in my understanding, then fix it.`,
+  }),
+];
+function clipTopic(t: string): string {
+  const s = t.trim();
+  return s.length > 22 ? `${s.slice(0, 21)}…` : s;
+}
+function weakTopicPrompts(missed: string[]): WeakPrompt[] {
+  const topics = Array.from(new Set(missed.map((m) => m.trim()).filter(Boolean)))
+    .reverse() // freshest misses first
+    .slice(0, 3);
+  return topics.map((t, i) => WEAK_PROMPT_TEMPLATES[i % WEAK_PROMPT_TEMPLATES.length](t));
+}
+
 // Home-dashboard card: one topic input with two ways to work it — "Learn"
 // opens a lesson that flows into a teach-back on the same topic, and "Teach
 // back" jumps straight to the Feynman exercise on what you already know. Tapping
@@ -3476,7 +3989,6 @@ function LearnStarter({
   missed,
   busy,
   level,
-  onLevel,
   onLearn,
   onTeachBack,
 }: {
@@ -3485,7 +3997,6 @@ function LearnStarter({
   missed: string[];
   busy: boolean;
   level: TeachLevel;
-  onLevel: (level: TeachLevel) => void;
   onLearn: (topic: string) => void;
   onTeachBack: (concept: string, level: TeachLevel) => void;
 }) {
@@ -3547,29 +4058,6 @@ function LearnStarter({
         >
           Teach back →
         </button>
-      </div>
-      <div
-        style={styles.teachLevelGroup}
-        role="group"
-        aria-label="Teach-back difficulty"
-      >
-        <span style={styles.teachLevelLabel}>Level</span>
-        {TEACH_LEVELS.map((lvl) => (
-          <button
-            key={lvl.id}
-            type="button"
-            onClick={() => onLevel(lvl.id)}
-            disabled={busy}
-            title={lvl.hint}
-            aria-pressed={level === lvl.id}
-            style={{
-              ...styles.teachLevelBtn,
-              ...(level === lvl.id ? styles.teachLevelBtnActive : null),
-            }}
-          >
-            {lvl.emoji} {lvl.label}
-          </button>
-        ))}
       </div>
       {suggestions.length > 0 && (
         <div style={styles.topicChips}>
@@ -3787,6 +4275,226 @@ function StudyNextCard({
           </div>
         )}
       />
+    </div>
+  );
+}
+
+// Urgency colour for a countdown: the fewer days left, the hotter it reads.
+// Overdue and same-day items are red; a comfortable runway stays calm green.
+function urgencyColor(days: number): string {
+  if (days <= 1) return "#c0392b"; // today / tomorrow / overdue — act now
+  if (days <= 3) return "#b8742a"; // this is close
+  if (days <= 7) return "#2f6f8f"; // within the week
+  return "#3f7d5a"; // plenty of runway
+}
+function countdownBig(days: number): string {
+  if (days < 0) return `${-days}d overdue`;
+  if (days === 0) return "Today";
+  if (days === 1) return "Tomorrow";
+  return `${days} days`;
+}
+
+// Home-dashboard card: a single, prominent countdown to the learner's biggest
+// upcoming deadlines. It pulls from every dated source the app already tracks —
+// calendar events (exams/finals/projects), assignments with a due date, and
+// SMART goals with a target date — merges them, sorts by soonest, and highlights
+// the very next one with a big number. No new storage: it's a live view over
+// existing state, so anything the learner adds elsewhere shows up here.
+function DeadlineCountdownCard({
+  events,
+  assignments,
+  goals,
+  onOpen,
+}: {
+  events: StudyEvent[];
+  assignments: Assignment[];
+  goals: SmartGoal[];
+  onOpen: () => void;
+}) {
+  const kindEmoji: Record<string, string> = {
+    exam: "📝",
+    final: "🎓",
+    quiz: "❓",
+    assignment: "📌",
+    project: "📊",
+    other: "📅",
+  };
+  const kindLabel: Record<string, string> = {
+    exam: "Exam",
+    final: "Final",
+    quiz: "Quiz",
+    assignment: "Assignment",
+    project: "Project",
+    other: "Event",
+  };
+  type Item = {
+    id: string;
+    title: string;
+    date: string;
+    days: number;
+    emoji: string;
+    tag: string;
+  };
+  const items: Item[] = [];
+  for (const e of events)
+    items.push({
+      id: `e:${e.id}`,
+      title: e.title,
+      date: e.date,
+      days: daysUntil(e.date),
+      emoji: kindEmoji[e.kind ?? "other"] ?? "📅",
+      tag: kindLabel[e.kind ?? "other"] ?? "Event",
+    });
+  for (const a of assignments)
+    if (!a.done && a.due)
+      items.push({
+        id: `a:${a.id}`,
+        title: a.title,
+        date: a.due,
+        days: daysUntil(a.due),
+        emoji: "📌",
+        tag: a.subject ? a.subject : "Assignment",
+      });
+  for (const g of goals)
+    if (!g.done && g.timeBound)
+      items.push({
+        id: `g:${g.id}`,
+        title: g.statement || g.specific,
+        date: g.timeBound,
+        days: daysUntil(g.timeBound),
+        emoji: "🎯",
+        tag: "Goal",
+      });
+  // Keep what's still ahead (or overdue but unfinished by no more than a week —
+  // those are the ones still worth chasing), soonest first, and cap the list so
+  // the card stays a glanceable summary rather than a full calendar.
+  const upcoming = items
+    .filter((it) => it.days >= -7)
+    .sort((a, b) => a.days - b.days)
+    .slice(0, 5);
+  if (!upcoming.length) return null;
+  const next = upcoming[0];
+  const rest = upcoming.slice(1);
+
+  return (
+    <div style={styles.card}>
+      <div style={styles.cardHead}>
+        <span style={styles.cardClass}>⏳ Countdown</span>
+        <button style={styles.linkBtn} onClick={onOpen}>
+          Calendar →
+        </button>
+      </div>
+      <button
+        className="eliora-row-btn"
+        onClick={onOpen}
+        style={{
+          display: "flex",
+          alignItems: "center",
+          gap: 14,
+          width: "100%",
+          textAlign: "left",
+          background: "var(--surface)",
+          border: `1px solid ${urgencyColor(next.days)}`,
+          borderLeft: `5px solid ${urgencyColor(next.days)}`,
+          borderRadius: 12,
+          padding: "12px 14px",
+          cursor: "pointer",
+        }}
+      >
+        <div
+          style={{
+            display: "flex",
+            flexDirection: "column",
+            alignItems: "center",
+            minWidth: 76,
+          }}
+        >
+          <span
+            style={{
+              fontSize: 26,
+              fontWeight: 800,
+              lineHeight: 1,
+              color: urgencyColor(next.days),
+            }}
+          >
+            {next.days > 1 ? next.days : next.emoji}
+          </span>
+          <span
+            style={{
+              fontSize: 11,
+              fontWeight: 600,
+              color: urgencyColor(next.days),
+              marginTop: 3,
+            }}
+          >
+            {next.days > 1 ? "days left" : countdownBig(next.days)}
+          </span>
+        </div>
+        <div style={{ flex: 1, minWidth: 0 }}>
+          <div
+            style={{
+              fontSize: 15,
+              fontWeight: 700,
+              color: "var(--text)",
+              overflow: "hidden",
+              textOverflow: "ellipsis",
+              whiteSpace: "nowrap",
+            }}
+          >
+            {next.emoji} {next.title}
+          </div>
+          <div style={{ fontSize: 12, color: "var(--muted)", marginTop: 2 }}>
+            {next.tag} · {countdownBig(next.days)}
+          </div>
+        </div>
+      </button>
+      {rest.length > 0 && (
+        <div style={{ marginTop: 8, display: "flex", flexDirection: "column", gap: 4 }}>
+          {rest.map((it) => (
+            <button
+              key={it.id}
+              className="eliora-row-btn"
+              onClick={onOpen}
+              style={{
+                display: "flex",
+                alignItems: "center",
+                gap: 8,
+                width: "100%",
+                textAlign: "left",
+                background: "transparent",
+                border: "none",
+                padding: "6px 4px",
+                cursor: "pointer",
+              }}
+            >
+              <span
+                style={{
+                  fontSize: 12,
+                  fontWeight: 700,
+                  color: urgencyColor(it.days),
+                  minWidth: 62,
+                }}
+              >
+                {countdownBig(it.days)}
+              </span>
+              <span
+                style={{
+                  flex: 1,
+                  minWidth: 0,
+                  fontSize: 13,
+                  color: "var(--text)",
+                  overflow: "hidden",
+                  textOverflow: "ellipsis",
+                  whiteSpace: "nowrap",
+                }}
+              >
+                {it.emoji} {it.title}
+              </span>
+              <span style={{ fontSize: 11, color: "var(--muted)" }}>{it.tag}</span>
+            </button>
+          ))}
+        </div>
+      )}
     </div>
   );
 }
@@ -8304,6 +9012,8 @@ function ScheduleGrid({
   homeHour,
   onSetHomeHour,
   onGenerate,
+  onSetupSubmit,
+  setupInitial,
   generating,
   onStudyMinutes,
 }: {
@@ -8313,6 +9023,19 @@ function ScheduleGrid({
   homeHour: number;
   onSetHomeHour: (h: number) => void;
   onGenerate: () => void;
+  onSetupSubmit: (a: {
+    homeTime: string;
+    budget: string;
+    focusTime: string;
+    sessionLength: string;
+    focusHelp: string;
+    focusNote: string;
+  }) => void;
+  setupInitial?: {
+    focusTime?: string;
+    sessionLength?: string;
+    focusHelp?: string;
+  };
   generating: boolean;
   onStudyMinutes: (mins: number) => void;
 }) {
@@ -8333,6 +9056,48 @@ function ScheduleGrid({
     const idx = SCHEDULE_KINDS.findIndex((k) => k.key === cur);
     onSet(h, { kind: SCHEDULE_KINDS[(idx + 1) % SCHEDULE_KINDS.length].key });
   };
+
+  // Schedule-setup survey: a short intake shown when "Set up my schedule" is
+  // tapped. Answers feed the schedule builder (when free, how long, what to focus
+  // on) and are remembered on the learner's profile.
+  const [setupOpen, setSetupOpen] = useState(false);
+  const [suHomeTime, setSuHomeTime] = useState("");
+  const [suBudget, setSuBudget] = useState("");
+  const [suFocusTime, setSuFocusTime] = useState(setupInitial?.focusTime ?? "");
+  const [suSessionLength, setSuSessionLength] = useState(
+    setupInitial?.sessionLength ?? "",
+  );
+  const [suFocusHelp, setSuFocusHelp] = useState(setupInitial?.focusHelp ?? "");
+  const [suFocusNote, setSuFocusNote] = useState("");
+  const setupChoice = (
+    question: string,
+    options: string[],
+    value: string,
+    setValue: (s: string) => void,
+  ) => (
+    <div style={styles.label}>
+      {question}
+      <div style={styles.choiceList}>
+        {options.map((opt) => {
+          const selected = value === opt;
+          return (
+            <button
+              key={opt}
+              type="button"
+              onClick={() => setValue(selected ? "" : opt)}
+              style={{
+                ...styles.choiceBtn,
+                ...(selected ? styles.choiceBtnSelected : {}),
+              }}
+            >
+              <span style={styles.choiceRadio}>{selected ? "●" : ""}</span>
+              {opt}
+            </button>
+          );
+        })}
+      </div>
+    </div>
+  );
 
   // Per-task countdown timer. One block runs at a time. `total`/`study` let us
   // credit the finished session's minutes toward "hours studied" (study blocks
@@ -8395,6 +9160,81 @@ function ScheduleGrid({
         Plan your day from 9 AM to 9 PM, or let me build your study time around
         when you get home. Tap a block&apos;s tag to change study / break / class.
       </p>
+      <button
+        type="button"
+        style={styles.schedSetupBtn}
+        onClick={() => setSetupOpen((v) => !v)}
+      >
+        📝 {setupOpen ? "Hide setup" : "Set up my schedule"}
+      </button>
+      {setupOpen && (
+        <div style={styles.schedSetupPanel}>
+          <p style={{ color: "var(--muted)", margin: "0 0 6px", fontSize: 13 }}>
+            A few quick questions so I can build today&apos;s plan around you.
+          </p>
+          {setupChoice(
+            "When are you usually free to study?",
+            HOME_TIME_OPTIONS,
+            suHomeTime,
+            setSuHomeTime,
+          )}
+          {setupChoice(
+            "How much study time do you want today?",
+            STUDY_BUDGET_OPTIONS,
+            suBudget,
+            setSuBudget,
+          )}
+          {setupChoice(
+            "When do you focus best?",
+            FOCUS_TIME_OPTIONS,
+            suFocusTime,
+            setSuFocusTime,
+          )}
+          {setupChoice(
+            "How long can you focus in one sitting?",
+            SESSION_LENGTH_OPTIONS,
+            suSessionLength,
+            setSuSessionLength,
+          )}
+          {setupChoice(
+            "What helps you focus?",
+            FOCUS_HELP_OPTIONS,
+            suFocusHelp,
+            setSuFocusHelp,
+          )}
+          <label style={styles.label}>
+            Anything today&apos;s schedule should prioritize? (optional)
+            <textarea
+              style={{ ...styles.input, minHeight: 56, resize: "vertical" }}
+              value={suFocusNote}
+              onChange={(e) => setSuFocusNote(e.target.value)}
+              placeholder="e.g. Bio exam Friday, catch up on algebra"
+            />
+          </label>
+          <button
+            type="button"
+            style={{
+              ...styles.schedBuildBtn,
+              opacity: !suHomeTime || generating ? 0.5 : 1,
+              width: "100%",
+            }}
+            disabled={!suHomeTime || generating}
+            onClick={() => {
+              onSetupSubmit({
+                homeTime: suHomeTime,
+                budget: suBudget,
+                focusTime: suFocusTime,
+                sessionLength: suSessionLength,
+                focusHelp: suFocusHelp,
+                focusNote: suFocusNote.trim(),
+              });
+              setSetupOpen(false);
+            }}
+          >
+            {generating ? "Building…" : "✨ Build my schedule"}
+          </button>
+        </div>
+      )}
       <div style={styles.schedBuildRow}>
         <label style={styles.schedBuildLabel}>
           I get home at
@@ -8518,6 +9358,282 @@ function ScheduleGrid({
         </div>
       )}
     </div>
+  );
+}
+
+// A Duolingo-style winding "snake path" view of the study plan. Each milestone
+// is a node on an alternating left/right path: completed steps are filled, the
+// first unfinished step is the highlighted "current" node, and checkpoints fly a
+// flag. Clicking a node toggles that step's done state (same as the list view).
+function PlanPathMap({
+  plan,
+  onToggle,
+}: {
+  plan: Milestone[];
+  onToggle: (i: number) => void;
+}) {
+  const n = plan.length;
+  const rowH = 96;
+  const topPad = 52;
+  const botPad = 88;
+  const height = topPad + Math.max(0, n - 1) * rowH + botPad;
+  // x in a 0..100 coordinate space (percent of width); alternate around the
+  // centre in a sine wave so the path snakes down the screen.
+  const nodes = plan.map((m, i) => ({
+    m,
+    i,
+    x: 50 + 34 * Math.sin(i * 0.85 + 0.4),
+    y: topPad + i * rowH,
+  }));
+  const currentIdx = plan.findIndex((m) => !m.done);
+  const done = plan.filter((m) => m.done).length;
+  const pct = n ? Math.round((done / n) * 100) : 0;
+  const finishY = topPad + Math.max(0, n - 1) * rowH + 64;
+  const finishX = n > 0 ? 50 + 34 * Math.sin(n * 0.85 + 0.4) : 50;
+
+  // Smooth S-curve path string through a list of {x,y} points.
+  const curve = (pts: { x: number; y: number }[]) => {
+    let d = "";
+    pts.forEach((p, i) => {
+      if (i === 0) d += `M ${p.x} ${p.y}`;
+      else {
+        const prev = pts[i - 1];
+        const midY = (prev.y + p.y) / 2;
+        d += ` C ${prev.x} ${midY}, ${p.x} ${midY}, ${p.x} ${p.y}`;
+      }
+    });
+    return d;
+  };
+  const allPts = [...nodes.map((p) => ({ x: p.x, y: p.y })), { x: finishX, y: finishY }];
+  // How far along the path is "walked" (solid) — through the current node.
+  const walkCount = currentIdx === -1 ? allPts.length : currentIdx + 1;
+  const trackD = curve(allPts);
+  const doneD = walkCount >= 2 ? curve(allPts.slice(0, walkCount)) : "";
+
+  return (
+    <div style={styles.card}>
+      <style>{
+        "@keyframes elioraPathPulse{0%{box-shadow:0 0 0 0 rgba(44,107,76,0.45)}70%{box-shadow:0 0 0 12px rgba(44,107,76,0)}100%{box-shadow:0 0 0 0 rgba(44,107,76,0)}}"
+      }</style>
+      <div style={styles.planHead}>
+        <span style={styles.planTitle}>Your path</span>
+        <span style={styles.planCount}>
+          {done}/{n} · {pct}%
+        </span>
+      </div>
+      <div style={styles.progressTrack}>
+        <div style={{ ...styles.progressFill, width: `${pct}%` }} />
+      </div>
+      <div style={{ position: "relative", width: "100%", height, marginTop: 8 }}>
+        <svg
+          viewBox={`0 0 100 ${height}`}
+          preserveAspectRatio="none"
+          width="100%"
+          height={height}
+          style={{ position: "absolute", inset: 0, pointerEvents: "none" }}
+        >
+          <path
+            d={trackD}
+            fill="none"
+            stroke="var(--border)"
+            strokeWidth={4}
+            strokeLinecap="round"
+            strokeDasharray="1 9"
+            vectorEffect="non-scaling-stroke"
+          />
+          {doneD && (
+            <path
+              d={doneD}
+              fill="none"
+              stroke="var(--accent)"
+              strokeWidth={4}
+              strokeLinecap="round"
+              vectorEffect="non-scaling-stroke"
+            />
+          )}
+        </svg>
+        {nodes.map(({ m, i, x, y }) => {
+          const isDone = m.done;
+          const isCurrent = i === currentIdx;
+          const cp = m.checkpoint;
+          const size = isCurrent ? 58 : 50;
+          const bg = isDone
+            ? cp
+              ? "#b8742a"
+              : "var(--accent)"
+            : isCurrent
+              ? "var(--surface)"
+              : cp
+                ? "#f3e7d7"
+                : "var(--accent-soft)";
+          const border = cp ? "#b8742a" : "var(--accent)";
+          const borderW = isCurrent ? 3 : isDone ? 0 : 2;
+          const content = isDone ? "✓" : cp ? "🚩" : String(i + 1);
+          const fg = isDone
+            ? "#fff"
+            : isCurrent
+              ? cp
+                ? "#b8742a"
+                : "var(--accent)"
+              : "var(--muted)";
+          return (
+            <div
+              key={i}
+              style={{
+                position: "absolute",
+                left: `${x}%`,
+                top: y,
+                transform: "translate(-50%, -50%)",
+                display: "flex",
+                flexDirection: "column",
+                alignItems: "center",
+                width: 148,
+              }}
+            >
+              {isCurrent && (
+                <span
+                  style={{
+                    position: "absolute",
+                    top: -26,
+                    fontSize: 11,
+                    fontWeight: 800,
+                    color: cp ? "#b8742a" : "var(--accent)",
+                    background: "var(--surface)",
+                    border: `1px solid ${cp ? "#b8742a" : "var(--accent)"}`,
+                    borderRadius: 999,
+                    padding: "2px 8px",
+                    whiteSpace: "nowrap",
+                  }}
+                >
+                  ▶ You're here
+                </span>
+              )}
+              <button
+                onClick={() => onToggle(i)}
+                title={`${cp ? "🚩 Checkpoint — " : ""}${m.title}${m.detail ? ` — ${m.detail}` : ""}`}
+                aria-label={`${isDone ? "Completed" : "Not done"}: ${m.title}. Click to toggle.`}
+                style={{
+                  width: size,
+                  height: size,
+                  borderRadius: "50%",
+                  border: borderW ? `${borderW}px solid ${border}` : "none",
+                  background: bg,
+                  color: fg,
+                  fontSize: cp && !isDone ? 22 : 20,
+                  fontWeight: 800,
+                  cursor: "pointer",
+                  display: "flex",
+                  alignItems: "center",
+                  justifyContent: "center",
+                  boxShadow: isDone ? "0 2px 6px rgba(0,0,0,0.12)" : "none",
+                  animation: isCurrent ? "elioraPathPulse 2s infinite" : "none",
+                  transition: "transform 0.12s ease",
+                }}
+              >
+                {content}
+              </button>
+              <span
+                style={{
+                  marginTop: 6,
+                  fontSize: 12,
+                  lineHeight: 1.25,
+                  textAlign: "center",
+                  color: isDone ? "var(--muted)" : "var(--assistant-text)",
+                  fontWeight: isCurrent ? 700 : 500,
+                  display: "-webkit-box",
+                  WebkitLineClamp: 2,
+                  WebkitBoxOrient: "vertical",
+                  overflow: "hidden",
+                }}
+              >
+                {m.title}
+              </span>
+            </div>
+          );
+        })}
+        {/* Finish trophy at the end of the path. */}
+        <div
+          style={{
+            position: "absolute",
+            left: `${finishX}%`,
+            top: finishY,
+            transform: "translate(-50%, -50%)",
+            display: "flex",
+            flexDirection: "column",
+            alignItems: "center",
+          }}
+        >
+          <div
+            style={{
+              width: 54,
+              height: 54,
+              borderRadius: "50%",
+              display: "flex",
+              alignItems: "center",
+              justifyContent: "center",
+              fontSize: 26,
+              background: pct === 100 ? "var(--accent-soft)" : "var(--elevated)",
+              border: `2px ${pct === 100 ? "solid" : "dashed"} ${pct === 100 ? "var(--accent)" : "var(--border)"}`,
+            }}
+          >
+            🏆
+          </div>
+          <span
+            style={{
+              marginTop: 6,
+              fontSize: 12,
+              fontWeight: 700,
+              color: pct === 100 ? "var(--accent)" : "var(--muted)",
+            }}
+          >
+            {pct === 100 ? "Plan complete!" : "Finish"}
+          </span>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// Wraps the study plan in a Path / List view switch. The snake path is the
+// default; the list keeps the full add/edit/remove controls.
+function PlanBoard(props: {
+  plan: Milestone[];
+  onToggle: (i: number) => void;
+  onAdd?: (title: string) => void;
+  onRemove?: (i: number) => void;
+  onEdit?: (
+    i: number,
+    patch: { title?: string; detail?: string; checkpoint?: boolean },
+  ) => void;
+}) {
+  const [view, setView] = useState<"path" | "list">("path");
+  const tabStyle = (active: boolean) => ({
+    flex: 1,
+    padding: "8px 10px",
+    borderRadius: 10,
+    border: `1px solid ${active ? "var(--accent)" : "var(--border)"}`,
+    background: active ? "var(--accent)" : "var(--surface)",
+    color: active ? "#fff" : "var(--muted)",
+    fontWeight: 700 as const,
+    fontSize: 13,
+    cursor: "pointer",
+  });
+  return (
+    <>
+      <div style={{ display: "flex", gap: 8, marginBottom: 10 }}>
+        <button style={tabStyle(view === "path")} onClick={() => setView("path")}>
+          🗺️ Path
+        </button>
+        <button style={tabStyle(view === "list")} onClick={() => setView("list")}>
+          📋 List
+        </button>
+      </div>
+      {view === "path" ? (
+        <PlanPathMap plan={props.plan} onToggle={props.onToggle} />
+      ) : (
+        <PlanPanel {...props} />
+      )}
+    </>
   );
 }
 
@@ -9758,6 +10874,533 @@ function PresentationPractice() {
   );
 }
 
+// The shape the /api/school-import route returns (mirrors SchoolImport in
+// @eliora/shared; page.tsx keeps its own client-side copies of these types).
+type SchoolImportItem = {
+  type: "assignment" | "event";
+  title: string;
+  date?: string;
+  subject?: string;
+  kind?: "exam" | "final" | "quiz" | "assignment" | "other";
+};
+type SchoolCourseGrade = { course: string; grade: string };
+type SchoolImportResult = {
+  items: SchoolImportItem[];
+  classes: string[];
+  grades: SchoolCourseGrade[];
+};
+
+// "Connect your school" — pull assignments, due dates, classes, and grades in
+// from ANY school app (Google Classroom, Canvas, Schoology, PowerSchool…)
+// WITHOUT accounts or OAuth. Two paths, both reviewed before anything is added:
+//   • a calendar feed — paste an .ics link or drop the .ics file
+//   • paste — copy the portal / a CSV / a grade report; the AI route pulls it apart
+// Everything imported lands in the app's existing assignments / calendar /
+// subjects stores (all still client-side). Grades have no store of their own, so
+// they're handed to Eliora in chat instead.
+function SchoolConnect({
+  profile,
+  onAddAssignment,
+  onAddEvent,
+  onAddSubject,
+  onShareGrades,
+}: {
+  profile: LearnerProfile | null;
+  onAddAssignment: (a: { title: string; subject?: string; due?: string }) => void;
+  onAddEvent: (e: StudyEvent) => void;
+  onAddSubject: (name: string) => void;
+  onShareGrades: (grades: SchoolCourseGrade[]) => void;
+}) {
+  const [mode, setMode] = useState<"link" | "paste">("link");
+  const [icsUrl, setIcsUrl] = useState("");
+  const [paste, setPaste] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [note, setNote] = useState<string | null>(null);
+  const [result, setResult] = useState<SchoolImportResult | null>(null);
+  const [pickedItems, setPickedItems] = useState<Set<number>>(new Set());
+  const [pickedClasses, setPickedClasses] = useState<Set<string>>(new Set());
+  const [imported, setImported] = useState<string | null>(null);
+  const fileRef = useRef<HTMLInputElement | null>(null);
+
+  function receive(data: {
+    import?: SchoolImportResult;
+    error?: string;
+    note?: string;
+  }) {
+    if (data.error) {
+      setError(data.error);
+      setResult(null);
+      return;
+    }
+    const r = data.import ?? { items: [], classes: [], grades: [] };
+    setResult(r);
+    setNote(data.note ?? null);
+    // Everything is pre-selected — the learner unchecks what they don't want.
+    setPickedItems(new Set(r.items.map((_, i) => i)));
+    setPickedClasses(new Set(r.classes));
+    setImported(null);
+  }
+
+  async function run(body: Record<string, unknown>) {
+    setBusy(true);
+    setError(null);
+    setNote(null);
+    setImported(null);
+    try {
+      const res = await fetch("/api/school-import", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ ...body, profile: profile ?? undefined }),
+      });
+      receive(await res.json());
+    } catch {
+      setError("Something went wrong — try again.");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  function importLink() {
+    if (!icsUrl.trim() || busy) return;
+    run({ mode: "ics", icsUrl: icsUrl.trim() });
+  }
+  function importPaste() {
+    if (paste.trim().length < 4 || busy) return;
+    run({ mode: "paste", text: paste.trim() });
+  }
+  function onFile(e: React.ChangeEvent<HTMLInputElement>) {
+    const f = e.target.files?.[0];
+    if (!f) return;
+    const reader = new FileReader();
+    reader.onload = () => run({ mode: "ics", icsText: String(reader.result ?? "") });
+    reader.readAsText(f);
+    if (fileRef.current) fileRef.current.value = "";
+  }
+
+  function toggleItem(i: number) {
+    setPickedItems((prev) => {
+      const next = new Set(prev);
+      if (next.has(i)) next.delete(i);
+      else next.add(i);
+      return next;
+    });
+  }
+  function toggleClass(name: string) {
+    setPickedClasses((prev) => {
+      const next = new Set(prev);
+      if (next.has(name)) next.delete(name);
+      else next.add(name);
+      return next;
+    });
+  }
+
+  function doImport() {
+    if (!result) return;
+    let added = 0;
+    result.classes.forEach((c) => {
+      if (pickedClasses.has(c)) {
+        onAddSubject(c);
+        added++;
+      }
+    });
+    result.items.forEach((it, i) => {
+      if (!pickedItems.has(i)) return;
+      if (it.type === "assignment") {
+        onAddAssignment({ title: it.title, subject: it.subject, due: it.date });
+      } else {
+        onAddEvent({
+          id: `ev${Date.now().toString(36)}${i}`,
+          title: it.title,
+          date: it.date ?? "",
+          kind: (it.kind as StudyEvent["kind"]) ?? "other",
+        });
+      }
+      added++;
+    });
+    setImported(
+      added > 0
+        ? `Added ${added} item${added === 1 ? "" : "s"} to your planner ✓`
+        : "Nothing selected.",
+    );
+  }
+
+  const kindEmoji: Record<string, string> = {
+    exam: "📝",
+    final: "🎓",
+    quiz: "❓",
+    assignment: "📌",
+    project: "📊",
+    other: "📅",
+  };
+  const dateLabel = (d?: string) => {
+    if (!d) return "no date";
+    const [y, m, day] = d.split("-");
+    return `${m}/${day}/${y.slice(2)}`;
+  };
+
+  const box: React.CSSProperties = {
+    background: "var(--surface)",
+    border: "1px solid var(--border)",
+    borderRadius: 16,
+    padding: 18,
+    marginBottom: 16,
+  };
+  const inputStyle: React.CSSProperties = {
+    width: "100%",
+    padding: "11px 13px",
+    borderRadius: 10,
+    border: "1px solid var(--border)",
+    background: "var(--bg)",
+    color: "var(--text)",
+    fontSize: 15,
+  };
+
+  const assignments = (result?.items ?? []).filter((i) => i.type === "assignment");
+  const events = (result?.items ?? []).filter((i) => i.type === "event");
+  const hasResult =
+    result &&
+    (result.items.length > 0 ||
+      result.classes.length > 0 ||
+      result.grades.length > 0);
+
+  return (
+    <div style={{ maxWidth: 720, margin: "0 auto", padding: "8px 4px 40px" }}>
+      <h2 style={{ fontSize: 24, fontWeight: 800, margin: "4px 0 6px" }}>
+        🏫 Connect your school
+      </h2>
+      <p style={{ color: "var(--muted)", margin: "0 0 18px", lineHeight: 1.5 }}>
+        Bring your assignments, due dates, classes, and grades in from Google
+        Classroom, Canvas, Schoology, PowerSchool, or any school app — no login
+        needed. Import your class calendar, or just paste from your portal.
+      </p>
+
+      <div style={{ display: "flex", gap: 8, marginBottom: 16 }}>
+        {(
+          [
+            ["link", "🔗 Calendar link / file"],
+            ["paste", "📋 Paste from portal"],
+          ] as const
+        ).map(([key, label]) => (
+          <button
+            key={key}
+            onClick={() => setMode(key)}
+            style={{
+              padding: "9px 14px",
+              borderRadius: 999,
+              border: "1px solid var(--border)",
+              background: mode === key ? "var(--accent)" : "transparent",
+              color: mode === key ? "#fff" : "var(--text)",
+              fontWeight: 600,
+              cursor: "pointer",
+            }}
+          >
+            {label}
+          </button>
+        ))}
+      </div>
+
+      {mode === "link" && (
+        <div style={box}>
+          <label
+            style={{ display: "block", fontWeight: 600, marginBottom: 8 }}
+          >
+            Paste your class calendar link
+          </label>
+          <input
+            style={inputStyle}
+            placeholder="webcal://…  or  https://…/calendar.ics"
+            value={icsUrl}
+            onChange={(e) => setIcsUrl(e.target.value)}
+            onKeyDown={(e) => e.key === "Enter" && importLink()}
+          />
+          <div
+            style={{
+              display: "flex",
+              gap: 10,
+              marginTop: 12,
+              flexWrap: "wrap",
+            }}
+          >
+            <button
+              onClick={importLink}
+              disabled={busy || !icsUrl.trim()}
+              style={{
+                padding: "10px 18px",
+                borderRadius: 10,
+                border: "none",
+                background: "var(--accent)",
+                color: "#fff",
+                fontWeight: 700,
+                cursor: busy ? "default" : "pointer",
+                opacity: busy || !icsUrl.trim() ? 0.6 : 1,
+              }}
+            >
+              {busy ? "Reading…" : "Import calendar"}
+            </button>
+            <button
+              onClick={() => fileRef.current?.click()}
+              disabled={busy}
+              style={{
+                padding: "10px 18px",
+                borderRadius: 10,
+                border: "1px solid var(--border)",
+                background: "transparent",
+                color: "var(--text)",
+                fontWeight: 600,
+                cursor: "pointer",
+              }}
+            >
+              …or upload an .ics file
+            </button>
+            <input
+              ref={fileRef}
+              type="file"
+              accept=".ics,text/calendar"
+              onChange={onFile}
+              style={{ display: "none" }}
+            />
+          </div>
+          <details style={{ marginTop: 14, color: "var(--muted)", fontSize: 14 }}>
+            <summary style={{ cursor: "pointer" }}>
+              Where do I find my calendar link?
+            </summary>
+            <ul style={{ margin: "8px 0 0", paddingLeft: 18, lineHeight: 1.6 }}>
+              <li>
+                <b>Google Classroom:</b> open Classroom → Calendar → in Google
+                Calendar, Settings → your class calendar → “Secret address in
+                iCal format”.
+              </li>
+              <li>
+                <b>Canvas:</b> Calendar → “Calendar Feed” (bottom-right) → copy
+                the webcal link.
+              </li>
+              <li>
+                <b>Schoology:</b> Calendar → gear/settings → “iCal Feed”.
+              </li>
+              <li>
+                <b>PowerSchool:</b> Grades / Class Registration → look for a
+                calendar / iCal export, or just paste from the portal instead.
+              </li>
+            </ul>
+          </details>
+        </div>
+      )}
+
+      {mode === "paste" && (
+        <div style={box}>
+          <label
+            style={{ display: "block", fontWeight: 600, marginBottom: 8 }}
+          >
+            Paste anything from your school portal
+          </label>
+          <textarea
+            style={{ ...inputStyle, minHeight: 150, resize: "vertical" }}
+            placeholder={
+              "Copy your assignment list, class schedule, or grade report and paste it here.\n\ne.g.\nAP Biology — Lab report due Sep 18\nAlgebra II quiz Friday\nEnglish: A-, Chemistry: 88%"
+            }
+            value={paste}
+            onChange={(e) => setPaste(e.target.value)}
+          />
+          <button
+            onClick={importPaste}
+            disabled={busy || paste.trim().length < 4}
+            style={{
+              marginTop: 12,
+              padding: "10px 18px",
+              borderRadius: 10,
+              border: "none",
+              background: "var(--accent)",
+              color: "#fff",
+              fontWeight: 700,
+              cursor: busy ? "default" : "pointer",
+              opacity: busy || paste.trim().length < 4 ? 0.6 : 1,
+            }}
+          >
+            {busy ? "Reading…" : "Find my school stuff"}
+          </button>
+        </div>
+      )}
+
+      {error && (
+        <div
+          style={{
+            ...box,
+            borderColor: "var(--accent)",
+            color: "var(--text)",
+          }}
+        >
+          {error}
+        </div>
+      )}
+
+      {hasResult && (
+        <div style={box}>
+          {note && (
+            <p style={{ color: "var(--muted)", marginTop: 0 }}>{note}</p>
+          )}
+
+          {result!.classes.length > 0 && (
+            <div style={{ marginBottom: 18 }}>
+              <div style={{ fontWeight: 700, marginBottom: 8 }}>
+                Classes ({result!.classes.length})
+              </div>
+              <div style={{ display: "flex", flexWrap: "wrap", gap: 8 }}>
+                {result!.classes.map((c) => {
+                  const on = pickedClasses.has(c);
+                  return (
+                    <button
+                      key={c}
+                      onClick={() => toggleClass(c)}
+                      style={{
+                        padding: "6px 12px",
+                        borderRadius: 999,
+                        border: "1px solid var(--border)",
+                        background: on ? "var(--accent)" : "transparent",
+                        color: on ? "#fff" : "var(--text)",
+                        cursor: "pointer",
+                        fontSize: 14,
+                      }}
+                    >
+                      {on ? "✓ " : ""}
+                      {c}
+                    </button>
+                  );
+                })}
+              </div>
+            </div>
+          )}
+
+          {[
+            ["📌 Assignments", assignments],
+            ["📅 Calendar events", events],
+          ].map(([heading, list]) => {
+            const items = list as SchoolImportItem[];
+            if (!items.length) return null;
+            return (
+              <div key={heading as string} style={{ marginBottom: 18 }}>
+                <div style={{ fontWeight: 700, marginBottom: 8 }}>
+                  {heading as string} ({items.length})
+                </div>
+                <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+                  {items.map((it) => {
+                    const idx = result!.items.indexOf(it);
+                    const on = pickedItems.has(idx);
+                    return (
+                      <label
+                        key={idx}
+                        style={{
+                          display: "flex",
+                          alignItems: "center",
+                          gap: 10,
+                          padding: "8px 10px",
+                          borderRadius: 10,
+                          border: "1px solid var(--border)",
+                          background: on ? "var(--bg)" : "transparent",
+                          opacity: on ? 1 : 0.55,
+                          cursor: "pointer",
+                        }}
+                      >
+                        <input
+                          type="checkbox"
+                          checked={on}
+                          onChange={() => toggleItem(idx)}
+                        />
+                        <span style={{ fontSize: 16 }}>
+                          {kindEmoji[it.kind ?? "other"] ?? "📌"}
+                        </span>
+                        <span style={{ flex: 1 }}>{it.title}</span>
+                        {it.subject && (
+                          <span
+                            style={{
+                              fontSize: 12,
+                              color: "var(--muted)",
+                              whiteSpace: "nowrap",
+                            }}
+                          >
+                            {it.subject}
+                          </span>
+                        )}
+                        <span
+                          style={{
+                            fontSize: 13,
+                            color: "var(--muted)",
+                            whiteSpace: "nowrap",
+                          }}
+                        >
+                          {dateLabel(it.date)}
+                        </span>
+                      </label>
+                    );
+                  })}
+                </div>
+              </div>
+            );
+          })}
+
+          <button
+            onClick={doImport}
+            style={{
+              padding: "11px 20px",
+              borderRadius: 10,
+              border: "none",
+              background: "var(--accent)",
+              color: "#fff",
+              fontWeight: 700,
+              cursor: "pointer",
+            }}
+          >
+            ＋ Add selected to my planner
+          </button>
+          {imported && (
+            <span style={{ marginLeft: 12, color: "var(--accent)", fontWeight: 600 }}>
+              {imported}
+            </span>
+          )}
+
+          {result!.grades.length > 0 && (
+            <div style={{ marginTop: 20, paddingTop: 16, borderTop: "1px solid var(--border)" }}>
+              <div style={{ fontWeight: 700, marginBottom: 8 }}>
+                Grades ({result!.grades.length})
+              </div>
+              <div style={{ display: "flex", flexWrap: "wrap", gap: 8, marginBottom: 12 }}>
+                {result!.grades.map((g, i) => (
+                  <span
+                    key={i}
+                    style={{
+                      padding: "5px 11px",
+                      borderRadius: 999,
+                      background: "var(--bg)",
+                      border: "1px solid var(--border)",
+                      fontSize: 14,
+                    }}
+                  >
+                    {g.course}: <b>{g.grade}</b>
+                  </span>
+                ))}
+              </div>
+              <button
+                onClick={() => onShareGrades(result!.grades)}
+                style={{
+                  padding: "9px 16px",
+                  borderRadius: 10,
+                  border: "1px solid var(--border)",
+                  background: "transparent",
+                  color: "var(--text)",
+                  fontWeight: 600,
+                  cursor: "pointer",
+                }}
+              >
+                💬 Share these grades with Eliora
+              </button>
+            </div>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
 // A persistent focus-music mini-player. Lives at the app shell so it keeps
 // playing while the learner moves between tabs. They paste a Spotify / Apple
 // Music / YouTube Music playlist link (auto-detected) and it plays inline via
@@ -10003,6 +11646,8 @@ function Summarizer({
   const [output, setOutput] = useState<
     "summary" | "studyguide" | "flashcards" | "quiz"
   >("summary");
+  // Which flashcard format to generate (only used when output = "flashcards").
+  const [flashStyle, setFlashStyle] = useState<FlashcardStyle>("basic");
   const [text, setText] = useState("");
   const [url, setUrl] = useState("");
   const [file, setFile] = useState<{
@@ -10078,7 +11723,12 @@ function Summarizer({
       const res = await fetch("/api/summarize", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ ...src, output, profile }),
+        body: JSON.stringify({
+          ...src,
+          output,
+          profile,
+          ...(output === "flashcards" ? { flashcardStyle: flashStyle } : {}),
+        }),
       });
       if (output === "flashcards" || output === "quiz") {
         const data = await res.json();
@@ -10250,6 +11900,27 @@ function Summarizer({
             </button>
           ))}
         </div>
+
+        {output === "flashcards" && (
+          <>
+            <div style={styles.outputLabel}>Flashcard style:</div>
+            <div style={styles.outputRow}>
+              {FLASHCARD_STYLES.map((s) => (
+                <button
+                  key={s.key}
+                  onClick={() => setFlashStyle(s.key)}
+                  title={`${s.front} → ${s.back}`}
+                  style={{
+                    ...styles.outChip,
+                    ...(flashStyle === s.key ? styles.outChipActive : {}),
+                  }}
+                >
+                  {s.emoji} {s.label}
+                </button>
+              ))}
+            </div>
+          </>
+        )}
 
         <button onClick={run} disabled={!canRun || busy} style={styles.primaryBtn}>
           {busy
@@ -10447,6 +12118,7 @@ function FlashcardDeck({
   const [flipped, setFlipped] = useState(false);
   const card = cards[i];
   if (!card) return null;
+  const meta = flashcardStyleMeta(card.style);
 
   function go(delta: number) {
     setFlipped(false);
@@ -10466,9 +12138,13 @@ function FlashcardDeck({
         onClick={() => setFlipped((f) => !f)}
         aria-label="Flip card"
       >
-        <span style={styles.flashcardLabel}>{flipped ? "Answer" : "Term"}</span>
+        <span style={styles.flashcardLabel}>
+          {flipped ? meta.back : meta.front}
+        </span>
         <span style={styles.flashcardText}>{flipped ? card.back : card.front}</span>
-        <span style={styles.flashcardHint}>tap to flip</span>
+        <span style={styles.flashcardHint}>
+          {meta.emoji} {meta.label} · tap to flip
+        </span>
       </button>
       <div style={styles.flashNav}>
         <button style={styles.secondaryBtn} disabled={i === 0} onClick={() => go(-1)}>
@@ -10548,13 +12224,21 @@ function QuizView({
   }
 
   function studyGuide() {
-    const detail = wrong
-      .map(
-        (q) =>
-          `- ${q.topic || q.question}: correct answer is "${
-            q.options[q.answerIndex]
-          }"${q.explanation ? ` — ${q.explanation}` : ""}`,
-      )
+    // Pass BOTH what the learner picked and the correct answer so the study
+    // guide can walk through WHY their choice was wrong, not just state the fix.
+    const detail = quiz
+      .map((q, i) => {
+        const picked = answers[i];
+        if (picked === q.answerIndex) return null;
+        const mine = picked != null ? `"${q.options[picked]}"` : "left it blank";
+        return (
+          `- Question: ${q.question}\n` +
+          `  I answered ${mine}, but the correct answer is ` +
+          `"${q.options[q.answerIndex]}"` +
+          (q.explanation ? ` — ${q.explanation}` : "")
+        );
+      })
+      .filter(Boolean)
       .join("\n");
     onStudyGuide?.(detail);
   }
@@ -11307,7 +12991,7 @@ function SmartNotes({ profile }: { profile: LearnerProfile | null }) {
   return (
     <div style={styles.card}>
       <div style={styles.cardHead}>
-        <span style={styles.cardClass}>📝 Smart notes</span>
+        <span style={styles.cardClass}>📝 Summarize</span>
       </div>
       <p style={{ color: "var(--muted)", margin: "4px 0 10px", fontSize: 13.5 }}>
         Paste messy notes or upload a photo of your handwriting. I'll clean them
@@ -11421,6 +13105,1065 @@ function SmartNotes({ profile }: { profile: LearnerProfile | null }) {
           )}
         </div>
       )}
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Notes workspace — a persistent notebook that lives alongside chat. Free-form
+// or Cornell-template notes, color-coded concept highlights, wiki-style [[links]]
+// between notes, draggable sticky notes, and (wired below) voice capture.
+// Everything is local-first: saved to localStorage, namespaced per learner.
+// ---------------------------------------------------------------------------
+
+type StickyNote = {
+  id: string;
+  text: string;
+  color: NoteColor;
+  x: number;
+  y: number;
+};
+type CanvasNode = { id: string; text: string; x: number; y: number; color: NoteColor };
+type CanvasEdge = { id: string; from: string; to: string };
+type NoteDoc = {
+  id: string;
+  title: string;
+  template: "free" | "cornell" | "canvas";
+  body: string; // free notes, or the Cornell "notes" column
+  cue: string; // Cornell cue/questions column
+  summary: string; // Cornell summary row
+  stickies: StickyNote[];
+  nodes: CanvasNode[]; // infinite-canvas / mind-map nodes
+  edges: CanvasEdge[]; // connections between nodes
+  updatedAt: number;
+};
+type NoteColor = "yellow" | "green" | "blue" | "pink" | "orange";
+
+const NOTE_HIGHLIGHTS: Record<NoteColor, string> = {
+  yellow: "#fdf0a6",
+  green: "#c3e8cb",
+  blue: "#c2dcf7",
+  pink: "#f8c9dd",
+  orange: "#ffd9ac",
+};
+const NOTE_STICKIES: Record<NoteColor, string> = {
+  yellow: "#fef3b0",
+  green: "#cdeed4",
+  blue: "#cfe4fb",
+  pink: "#fbd3e4",
+  orange: "#ffe2c2",
+};
+const NOTE_COLOR_ORDER: NoteColor[] = [
+  "yellow",
+  "green",
+  "blue",
+  "pink",
+  "orange",
+];
+
+function newId(): string {
+  return Math.random().toString(36).slice(2, 10) + Date.now().toString(36);
+}
+
+// Inline renderer for a note preview: **bold**, ==highlight== (optionally
+// ==color:text== for color-coded concepts), and [[wiki links]] to other notes.
+function renderNoteInline(
+  text: string,
+  onLink: (title: string) => void,
+): React.ReactNode[] {
+  const out: React.ReactNode[] = [];
+  text
+    .split(/(\*\*[^*]+\*\*|==[^=]+==|\[\[[^\]]+\]\])/g)
+    .forEach((part, i) => {
+      if (!part) return;
+      let m: RegExpMatchArray | null;
+      if ((m = part.match(/^\*\*([^*]+)\*\*$/))) {
+        out.push(<strong key={i}>{m[1]}</strong>);
+      } else if ((m = part.match(/^==([^=]+)==$/))) {
+        const inner = m[1];
+        const cm = inner.match(/^(yellow|green|blue|pink|orange):([\s\S]+)$/);
+        const color = (cm ? cm[1] : "yellow") as NoteColor;
+        const label = cm ? cm[2] : inner;
+        out.push(
+          <mark
+            key={i}
+            style={{
+              background: NOTE_HIGHLIGHTS[color],
+              color: "#1f2a24",
+              padding: "0 3px",
+              borderRadius: 4,
+            }}
+          >
+            {label}
+          </mark>,
+        );
+      } else if ((m = part.match(/^\[\[([^\]]+)\]\]$/))) {
+        const title = m[1].trim();
+        out.push(
+          <button
+            key={i}
+            onClick={() => onLink(title)}
+            style={{
+              background: "none",
+              border: "none",
+              padding: 0,
+              cursor: "pointer",
+              color: "var(--accent)",
+              fontWeight: 600,
+              textDecoration: "underline",
+            }}
+          >
+            {title}
+          </button>,
+        );
+      } else {
+        out.push(<span key={i}>{part}</span>);
+      }
+    });
+  return out;
+}
+
+// Block renderer for a note preview: #/##/### headings, - bullets, 1. lists.
+function renderNoteMarkdown(
+  text: string,
+  onLink: (title: string) => void,
+): React.ReactNode {
+  const blocks: React.ReactNode[] = [];
+  text.split("\n").forEach((raw, i) => {
+    const line = raw.replace(/\s+$/, "");
+    if (!line.trim()) {
+      blocks.push(<div key={i} style={{ height: 8 }} />);
+      return;
+    }
+    let m: RegExpMatchArray | null;
+    if ((m = line.match(/^(#{1,3})\s+(.*)$/))) {
+      const lvl = m[1].length;
+      blocks.push(
+        <div
+          key={i}
+          style={{
+            fontWeight: 800,
+            fontSize: lvl === 1 ? 19 : lvl === 2 ? 16.5 : 15,
+            color: "var(--accent)",
+            margin: "10px 0 4px",
+          }}
+        >
+          {renderNoteInline(m[2], onLink)}
+        </div>,
+      );
+    } else if ((m = line.match(/^\s*[-*]\s+(.*)$/))) {
+      blocks.push(
+        <div key={i} style={{ display: "flex", gap: 8, margin: "2px 0" }}>
+          <span style={{ color: "var(--accent)" }}>•</span>
+          <span>{renderNoteInline(m[1], onLink)}</span>
+        </div>,
+      );
+    } else if ((m = line.match(/^\s*(\d+)\.\s+(.*)$/))) {
+      blocks.push(
+        <div key={i} style={{ display: "flex", gap: 8, margin: "2px 0" }}>
+          <span style={{ color: "var(--accent)", fontWeight: 700 }}>{m[1]}.</span>
+          <span>{renderNoteInline(m[2], onLink)}</span>
+        </div>,
+      );
+    } else {
+      blocks.push(
+        <div key={i} style={{ margin: "2px 0", lineHeight: 1.55 }}>
+          {renderNoteInline(line, onLink)}
+        </div>,
+      );
+    }
+  });
+  return blocks;
+}
+
+function StickyBoard({
+  stickies,
+  onChange,
+}: {
+  stickies: StickyNote[];
+  onChange: (next: StickyNote[]) => void;
+}) {
+  const boardRef = useRef<HTMLDivElement | null>(null);
+  const drag = useRef<{ id: string; dx: number; dy: number } | null>(null);
+
+  function onPointerDown(e: React.PointerEvent, s: StickyNote) {
+    const board = boardRef.current?.getBoundingClientRect();
+    if (!board) return;
+    drag.current = {
+      id: s.id,
+      dx: e.clientX - board.left - s.x,
+      dy: e.clientY - board.top - s.y,
+    };
+    (e.target as HTMLElement).setPointerCapture(e.pointerId);
+  }
+  function onPointerMove(e: React.PointerEvent) {
+    if (!drag.current) return;
+    const board = boardRef.current?.getBoundingClientRect();
+    if (!board) return;
+    const x = Math.max(0, Math.min(board.width - 150, e.clientX - board.left - drag.current.dx));
+    const y = Math.max(0, Math.min(board.height - 60, e.clientY - board.top - drag.current.dy));
+    onChange(stickies.map((s) => (s.id === drag.current!.id ? { ...s, x, y } : s)));
+  }
+  function onPointerUp() {
+    drag.current = null;
+  }
+
+  function addSticky() {
+    const color = NOTE_COLOR_ORDER[stickies.length % NOTE_COLOR_ORDER.length];
+    onChange([
+      ...stickies,
+      { id: newId(), text: "", color, x: 12 + (stickies.length % 4) * 24, y: 12 + (stickies.length % 4) * 20 },
+    ]);
+  }
+
+  return (
+    <div>
+      <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 6 }}>
+        <span style={{ fontWeight: 700, fontSize: 14, color: "var(--assistant-text)" }}>
+          🗒️ Sticky notes
+        </span>
+        <button
+          onClick={addSticky}
+          style={{
+            padding: "5px 12px",
+            borderRadius: 999,
+            border: "1px solid var(--accent)",
+            background: "transparent",
+            color: "var(--accent)",
+            fontSize: 13,
+            fontWeight: 600,
+            cursor: "pointer",
+          }}
+        >
+          ＋ Add sticky
+        </button>
+      </div>
+      <div
+        ref={boardRef}
+        onPointerMove={onPointerMove}
+        onPointerUp={onPointerUp}
+        style={{
+          position: "relative",
+          minHeight: 220,
+          borderRadius: 12,
+          border: "1px dashed var(--border)",
+          background: "var(--assistant-bubble)",
+          overflow: "hidden",
+        }}
+      >
+        {stickies.length === 0 && (
+          <div style={{ position: "absolute", inset: 0, display: "grid", placeItems: "center", color: "var(--muted)", fontSize: 13.5 }}>
+            Add sticky notes and drag them around.
+          </div>
+        )}
+        {stickies.map((s) => (
+          <div
+            key={s.id}
+            style={{
+              position: "absolute",
+              left: s.x,
+              top: s.y,
+              width: 150,
+              minHeight: 90,
+              background: NOTE_STICKIES[s.color],
+              borderRadius: 8,
+              boxShadow: "0 2px 8px rgba(0,0,0,0.12)",
+              padding: 8,
+              display: "flex",
+              flexDirection: "column",
+              gap: 4,
+            }}
+          >
+            <div
+              onPointerDown={(e) => onPointerDown(e, s)}
+              style={{ cursor: "grab", display: "flex", justifyContent: "space-between", touchAction: "none" }}
+            >
+              <span style={{ fontSize: 12 }}>⠿</span>
+              <span style={{ display: "flex", gap: 3 }}>
+                {NOTE_COLOR_ORDER.map((c) => (
+                  <button
+                    key={c}
+                    onClick={() => onChange(stickies.map((x) => (x.id === s.id ? { ...x, color: c } : x)))}
+                    aria-label={`Color ${c}`}
+                    style={{
+                      width: 11,
+                      height: 11,
+                      borderRadius: "50%",
+                      border: s.color === c ? "1.5px solid #333" : "1px solid rgba(0,0,0,0.2)",
+                      background: NOTE_STICKIES[c],
+                      cursor: "pointer",
+                      padding: 0,
+                    }}
+                  />
+                ))}
+                <button
+                  onClick={() => onChange(stickies.filter((x) => x.id !== s.id))}
+                  aria-label="Delete sticky"
+                  style={{ background: "none", border: "none", cursor: "pointer", fontSize: 13, lineHeight: 1, padding: 0 }}
+                >
+                  ×
+                </button>
+              </span>
+            </div>
+            <textarea
+              value={s.text}
+              onChange={(e) => onChange(stickies.map((x) => (x.id === s.id ? { ...x, text: e.target.value } : x)))}
+              placeholder="Note…"
+              style={{
+                flex: 1,
+                border: "none",
+                background: "transparent",
+                resize: "none",
+                outline: "none",
+                fontSize: 13,
+                color: "#1f2a24",
+                fontFamily: "inherit",
+                minHeight: 56,
+              }}
+            />
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+// Voice notes: dictate straight into a note using the browser's speech
+// recognition (same API the teach-back recorder uses). Final phrases are
+// appended live; nothing is uploaded. Renders nothing where unsupported.
+function VoiceCapture({ onAppend }: { onAppend: (text: string) => void }) {
+  const [recording, setRecording] = useState(false);
+  const [interim, setInterim] = useState("");
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const recRef = useRef<any>(null);
+  const supported =
+    typeof window !== "undefined" &&
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    ("SpeechRecognition" in window || "webkitSpeechRecognition" in (window as any));
+
+  useEffect(
+    () => () => {
+      try {
+        recRef.current?.stop();
+      } catch {
+        /* ignore */
+      }
+      recRef.current = null;
+    },
+    [],
+  );
+
+  function start() {
+    if (!supported) return;
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const w = window as any;
+    const SR = w.SpeechRecognition || w.webkitSpeechRecognition;
+    const rec = new SR();
+    rec.lang = "en-US";
+    rec.interimResults = true;
+    rec.continuous = true;
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    rec.onresult = (e: any) => {
+      let intr = "";
+      for (let i = e.resultIndex; i < e.results.length; i++) {
+        const r = e.results[i];
+        if (r.isFinal) onAppend(r[0].transcript.trim());
+        else intr += r[0].transcript;
+      }
+      setInterim(intr);
+    };
+    // The API stops itself after a silence; restart while we're still recording.
+    rec.onend = () => {
+      if (recRef.current) {
+        try {
+          rec.start();
+        } catch {
+          /* already restarting */
+        }
+      }
+    };
+    rec.onerror = () => {};
+    recRef.current = rec;
+    try {
+      rec.start();
+      setRecording(true);
+    } catch {
+      /* ignore */
+    }
+  }
+
+  function stop() {
+    const rec = recRef.current;
+    recRef.current = null;
+    try {
+      rec?.stop();
+    } catch {
+      /* ignore */
+    }
+    setRecording(false);
+    setInterim("");
+  }
+
+  if (!supported) return null;
+
+  return (
+    <span style={{ display: "inline-flex", alignItems: "center", gap: 6 }}>
+      <button
+        onClick={recording ? stop : start}
+        title={recording ? "Stop dictation" : "Dictate a voice note"}
+        style={{
+          padding: "3px 10px",
+          borderRadius: 8,
+          border: recording ? "1px solid #c0392b" : "1px solid var(--border)",
+          background: recording ? "#c0392b" : "transparent",
+          color: recording ? "#fff" : "var(--assistant-text)",
+          fontWeight: 600,
+          fontSize: 13,
+          cursor: "pointer",
+        }}
+      >
+        {recording ? "⏹ Stop" : "🎤 Voice"}
+      </button>
+      {recording && (
+        <span style={{ fontSize: 12, color: "var(--muted)", maxWidth: 180, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+          {interim ? `“${interim}”` : "Listening…"}
+        </span>
+      )}
+    </span>
+  );
+}
+
+// Infinite canvas / mind map: pan (drag the background), zoom (scroll wheel),
+// draggable nodes, and click-to-connect edges rendered as SVG lines. Used when a
+// note's template is "canvas". All state lives on the NoteDoc so it persists.
+function CanvasBoard({
+  nodes,
+  edges,
+  onNodes,
+  onEdges,
+}: {
+  nodes: CanvasNode[];
+  edges: CanvasEdge[];
+  onNodes: (next: CanvasNode[]) => void;
+  onEdges: (next: CanvasEdge[]) => void;
+}) {
+  const wrapRef = useRef<HTMLDivElement | null>(null);
+  const [view, setView] = useState({ x: 0, y: 0, z: 1 });
+  const [connectFrom, setConnectFrom] = useState<string | null>(null);
+  const drag = useRef<
+    | { kind: "pan"; sx: number; sy: number; ox: number; oy: number }
+    | { kind: "node"; id: string; sx: number; sy: number; nx: number; ny: number }
+    | null
+  >(null);
+
+  function addNode() {
+    const wrap = wrapRef.current?.getBoundingClientRect();
+    const cx = wrap ? (wrap.width / 2 - view.x) / view.z : 200;
+    const cy = wrap ? (wrap.height / 2 - view.y) / view.z : 150;
+    const color = NOTE_COLOR_ORDER[nodes.length % NOTE_COLOR_ORDER.length];
+    // Fan new nodes out around the center so they don't stack on each other.
+    const angle = nodes.length * 0.9;
+    const radius = nodes.length === 0 ? 0 : 90 + nodes.length * 10;
+    onNodes([
+      ...nodes,
+      {
+        id: newId(),
+        text: nodes.length === 0 ? "Central idea" : "Idea",
+        x: cx - 60 + Math.cos(angle) * radius,
+        y: cy - 20 + Math.sin(angle) * radius,
+        color,
+      },
+    ]);
+  }
+
+  function onBgPointerDown(e: React.PointerEvent) {
+    if (e.target !== e.currentTarget) return; // only when hitting the background
+    drag.current = { kind: "pan", sx: e.clientX, sy: e.clientY, ox: view.x, oy: view.y };
+    (e.currentTarget as HTMLElement).setPointerCapture(e.pointerId);
+    setConnectFrom(null);
+  }
+  function onNodePointerDown(e: React.PointerEvent, n: CanvasNode) {
+    e.stopPropagation();
+    drag.current = { kind: "node", id: n.id, sx: e.clientX, sy: e.clientY, nx: n.x, ny: n.y };
+    (e.target as HTMLElement).setPointerCapture(e.pointerId);
+  }
+  function onPointerMove(e: React.PointerEvent) {
+    const d = drag.current;
+    if (!d) return;
+    if (d.kind === "pan") {
+      setView((v) => ({ ...v, x: d.ox + (e.clientX - d.sx), y: d.oy + (e.clientY - d.sy) }));
+    } else {
+      const dx = (e.clientX - d.sx) / view.z;
+      const dy = (e.clientY - d.sy) / view.z;
+      onNodes(nodes.map((n) => (n.id === d.id ? { ...n, x: d.nx + dx, y: d.ny + dy } : n)));
+    }
+  }
+  function onPointerUp() {
+    drag.current = null;
+  }
+  function onWheel(e: React.WheelEvent) {
+    const wrap = wrapRef.current?.getBoundingClientRect();
+    if (!wrap) return;
+    const px = e.clientX - wrap.left;
+    const py = e.clientY - wrap.top;
+    const factor = e.deltaY < 0 ? 1.1 : 1 / 1.1;
+    setView((v) => {
+      const z = Math.max(0.3, Math.min(2.5, v.z * factor));
+      // Keep the point under the cursor fixed while zooming.
+      const k = z / v.z;
+      return { z, x: px - (px - v.x) * k, y: py - (py - v.y) * k };
+    });
+  }
+
+  function nodeClick(n: CanvasNode) {
+    if (connectFrom && connectFrom !== n.id) {
+      const exists = edges.some(
+        (ed) =>
+          (ed.from === connectFrom && ed.to === n.id) ||
+          (ed.from === n.id && ed.to === connectFrom),
+      );
+      if (!exists) onEdges([...edges, { id: newId(), from: connectFrom, to: n.id }]);
+      setConnectFrom(null);
+    }
+  }
+
+  function removeNode(id: string) {
+    onNodes(nodes.filter((n) => n.id !== id));
+    onEdges(edges.filter((ed) => ed.from !== id && ed.to !== id));
+    if (connectFrom === id) setConnectFrom(null);
+  }
+
+  const byId = (id: string) => nodes.find((n) => n.id === id);
+
+  return (
+    <div>
+      <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 6, flexWrap: "wrap" }}>
+        <button
+          onClick={addNode}
+          style={{ padding: "5px 12px", borderRadius: 999, border: "none", background: "var(--accent)", color: "#fff", fontSize: 13, fontWeight: 700, cursor: "pointer" }}
+        >
+          ＋ Add node
+        </button>
+        <button
+          onClick={() => setView({ x: 0, y: 0, z: 1 })}
+          style={{ padding: "5px 12px", borderRadius: 999, border: "1px solid var(--border)", background: "transparent", color: "var(--assistant-text)", fontSize: 13, cursor: "pointer" }}
+        >
+          ⟲ Reset view
+        </button>
+        <span style={{ fontSize: 12, color: "var(--muted)" }}>
+          {connectFrom ? "Click another node to connect →" : "Drag background to pan · scroll to zoom · ⛓ then a node to link"}
+        </span>
+      </div>
+      <div
+        ref={wrapRef}
+        onPointerDown={onBgPointerDown}
+        onPointerMove={onPointerMove}
+        onPointerUp={onPointerUp}
+        onWheel={onWheel}
+        style={{
+          position: "relative",
+          height: 440,
+          borderRadius: 12,
+          border: "1px solid var(--border)",
+          background:
+            "var(--assistant-bubble) radial-gradient(circle, rgba(0,0,0,0.06) 1px, transparent 1px)",
+          backgroundSize: `${24 * view.z}px ${24 * view.z}px`,
+          backgroundPosition: `${view.x}px ${view.y}px`,
+          overflow: "hidden",
+          touchAction: "none",
+          cursor: drag.current?.kind === "pan" ? "grabbing" : "default",
+        }}
+      >
+        {nodes.length === 0 && (
+          <div style={{ position: "absolute", inset: 0, display: "grid", placeItems: "center", color: "var(--muted)", fontSize: 13.5, pointerEvents: "none" }}>
+            Add a node to start your mind map.
+          </div>
+        )}
+        {/* Edges */}
+        <svg style={{ position: "absolute", inset: 0, width: "100%", height: "100%", pointerEvents: "none", overflow: "visible" }}>
+          <g transform={`translate(${view.x},${view.y}) scale(${view.z})`}>
+            {edges.map((ed) => {
+              const a = byId(ed.from);
+              const b = byId(ed.to);
+              if (!a || !b) return null;
+              return (
+                <line
+                  key={ed.id}
+                  x1={a.x + 60}
+                  y1={a.y + 20}
+                  x2={b.x + 60}
+                  y2={b.y + 20}
+                  stroke="var(--accent)"
+                  strokeWidth={2}
+                  strokeOpacity={0.55}
+                />
+              );
+            })}
+          </g>
+        </svg>
+        {/* Nodes */}
+        <div style={{ position: "absolute", inset: 0, transform: `translate(${view.x}px,${view.y}px) scale(${view.z})`, transformOrigin: "0 0" }}>
+          {nodes.map((n) => (
+            <div
+              key={n.id}
+              onPointerDown={(e) => onNodePointerDown(e, n)}
+              onClick={() => nodeClick(n)}
+              style={{
+                position: "absolute",
+                left: n.x,
+                top: n.y,
+                width: 120,
+                minHeight: 40,
+                background: NOTE_STICKIES[n.color],
+                border: connectFrom === n.id ? "2px solid var(--accent)" : "1px solid rgba(0,0,0,0.15)",
+                borderRadius: 10,
+                boxShadow: "0 2px 6px rgba(0,0,0,0.12)",
+                padding: 6,
+                cursor: "grab",
+                touchAction: "none",
+              }}
+            >
+              <div style={{ display: "flex", justifyContent: "flex-end", gap: 4, marginBottom: 2 }}>
+                <button
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    setConnectFrom(connectFrom === n.id ? null : n.id);
+                  }}
+                  title="Link to another node"
+                  style={{ background: "none", border: "none", cursor: "pointer", fontSize: 12, padding: 0, lineHeight: 1 }}
+                >
+                  ⛓
+                </button>
+                <button
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    removeNode(n.id);
+                  }}
+                  title="Delete node"
+                  style={{ background: "none", border: "none", cursor: "pointer", fontSize: 13, padding: 0, lineHeight: 1 }}
+                >
+                  ×
+                </button>
+              </div>
+              <textarea
+                value={n.text}
+                onPointerDown={(e) => e.stopPropagation()}
+                onChange={(e) => onNodes(nodes.map((x) => (x.id === n.id ? { ...x, text: e.target.value } : x)))}
+                style={{
+                  width: "100%",
+                  border: "none",
+                  background: "transparent",
+                  resize: "none",
+                  outline: "none",
+                  fontSize: 13,
+                  fontWeight: 600,
+                  color: "#1f2a24",
+                  fontFamily: "inherit",
+                  textAlign: "center",
+                  minHeight: 20,
+                }}
+              />
+            </div>
+          ))}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function NotesWorkspace({ ns }: { ns: string }) {
+  const STORE_KEY = `eliora-notebook::${ns}`;
+  const [docs, setDocs] = useState<NoteDoc[]>([]);
+  const [activeId, setActiveId] = useState<string | null>(null);
+  const [loaded, setLoaded] = useState(false);
+  const bodyRef = useRef<HTMLTextAreaElement | null>(null);
+
+  // Load once per learner.
+  useEffect(() => {
+    try {
+      const raw = localStorage.getItem(STORE_KEY);
+      const saved = raw ? (JSON.parse(raw) as NoteDoc[]) : null;
+      if (Array.isArray(saved) && saved.length) {
+        // Backfill fields added in later versions so older saves keep working.
+        const norm = saved.map((d) => ({
+          ...d,
+          stickies: d.stickies ?? [],
+          nodes: d.nodes ?? [],
+          edges: d.edges ?? [],
+        }));
+        setDocs(norm);
+        setActiveId(norm[0].id);
+      }
+    } catch {
+      /* ignore */
+    }
+    setLoaded(true);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [STORE_KEY]);
+
+  // Persist on change.
+  useEffect(() => {
+    if (!loaded) return;
+    try {
+      localStorage.setItem(STORE_KEY, JSON.stringify(docs));
+    } catch {
+      /* ignore */
+    }
+  }, [docs, loaded, STORE_KEY]);
+
+  const active = docs.find((d) => d.id === activeId) ?? null;
+
+  function createDoc(template: "free" | "cornell" | "canvas") {
+    const doc: NoteDoc = {
+      id: newId(),
+      title:
+        template === "cornell"
+          ? "Cornell notes"
+          : template === "canvas"
+            ? "Mind map"
+            : "Untitled note",
+      template,
+      body: "",
+      cue: "",
+      summary: "",
+      stickies: [],
+      nodes:
+        template === "canvas"
+          ? [{ id: newId(), text: "Central idea", x: 180, y: 180, color: "yellow" }]
+          : [],
+      edges: [],
+      updatedAt: Date.now(),
+    };
+    setDocs((prev) => [doc, ...prev]);
+    setActiveId(doc.id);
+  }
+
+  function patch(id: string, p: Partial<NoteDoc>) {
+    setDocs((prev) =>
+      prev.map((d) => (d.id === id ? { ...d, ...p, updatedAt: Date.now() } : d)),
+    );
+  }
+
+  function removeDoc(id: string) {
+    setDocs((prev) => {
+      const next = prev.filter((d) => d.id !== id);
+      if (id === activeId) setActiveId(next[0]?.id ?? null);
+      return next;
+    });
+  }
+
+  // Open a [[linked]] note by title — jump to it, or create it if missing.
+  function openByTitle(title: string) {
+    const found = docs.find(
+      (d) => d.title.trim().toLowerCase() === title.trim().toLowerCase(),
+    );
+    if (found) {
+      setActiveId(found.id);
+    } else {
+      const doc: NoteDoc = {
+        id: newId(),
+        title,
+        template: "free",
+        body: "",
+        cue: "",
+        summary: "",
+        stickies: [],
+        nodes: [],
+        edges: [],
+        updatedAt: Date.now(),
+      };
+      setDocs((prev) => [doc, ...prev]);
+      setActiveId(doc.id);
+    }
+  }
+
+  // Append dictated speech to the active note's body. Uses a functional update
+  // so streamed final phrases each read the latest body (no stale closure).
+  function appendToActiveBody(text: string) {
+    if (!text.trim()) return;
+    setDocs((prev) =>
+      prev.map((d) => {
+        if (d.id !== activeId) return d;
+        const sep = !d.body || /\s$/.test(d.body) ? "" : " ";
+        return { ...d, body: d.body + sep + text, updatedAt: Date.now() };
+      }),
+    );
+  }
+
+  // Wrap the current selection in the body textarea with a marker (color/bold).
+  function wrapSelection(before: string, after: string) {
+    const ta = bodyRef.current;
+    if (!ta || !active) return;
+    const start = ta.selectionStart;
+    const end = ta.selectionEnd;
+    const val = ta.value;
+    const sel = val.slice(start, end) || "concept";
+    const next = val.slice(0, start) + before + sel + after + val.slice(end);
+    patch(active.id, { body: next });
+    requestAnimationFrame(() => {
+      ta.focus();
+      ta.setSelectionRange(start + before.length, start + before.length + sel.length);
+    });
+  }
+
+  const colorBtn = (c: NoteColor) => (
+    <button
+      key={c}
+      onClick={() => wrapSelection(`==${c}:`, "==")}
+      title={`Highlight ${c}`}
+      style={{
+        width: 22,
+        height: 22,
+        borderRadius: "50%",
+        border: "1px solid rgba(0,0,0,0.15)",
+        background: NOTE_HIGHLIGHTS[c],
+        cursor: "pointer",
+        padding: 0,
+      }}
+    />
+  );
+
+  const taStyle: React.CSSProperties = {
+    width: "100%",
+    border: "1px solid var(--border)",
+    borderRadius: 10,
+    padding: 10,
+    fontSize: 14.5,
+    fontFamily: "inherit",
+    lineHeight: 1.55,
+    color: "var(--assistant-text)",
+    background: "var(--bg)",
+    resize: "vertical",
+    outline: "none",
+  };
+
+  return (
+    <div style={{ display: "flex", gap: 14, alignItems: "flex-start", flexWrap: "wrap" }}>
+      {/* Note list */}
+      <div style={{ flex: "1 1 200px", minWidth: 190, maxWidth: 260 }}>
+        <div style={{ display: "flex", gap: 6, marginBottom: 10, flexWrap: "wrap" }}>
+          <button
+            onClick={() => createDoc("free")}
+            style={{
+              flex: 1,
+              padding: "8px 10px",
+              borderRadius: 10,
+              border: "none",
+              background: "var(--accent)",
+              color: "#fff",
+              fontWeight: 700,
+              fontSize: 13.5,
+              cursor: "pointer",
+            }}
+          >
+            ＋ New note
+          </button>
+          <button
+            onClick={() => createDoc("cornell")}
+            style={{
+              flex: 1,
+              padding: "8px 10px",
+              borderRadius: 10,
+              border: "1px solid var(--accent)",
+              background: "transparent",
+              color: "var(--accent)",
+              fontWeight: 700,
+              fontSize: 13.5,
+              cursor: "pointer",
+            }}
+          >
+            📐 Cornell
+          </button>
+          <button
+            onClick={() => createDoc("canvas")}
+            style={{
+              flex: 1,
+              padding: "8px 10px",
+              borderRadius: 10,
+              border: "1px solid var(--accent)",
+              background: "transparent",
+              color: "var(--accent)",
+              fontWeight: 700,
+              fontSize: 13.5,
+              cursor: "pointer",
+            }}
+          >
+            🕸️ Mind map
+          </button>
+        </div>
+        {docs.length === 0 && (
+          <p style={{ color: "var(--muted)", fontSize: 13.5 }}>
+            No notes yet. Start a free note or a Cornell template.
+          </p>
+        )}
+        <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
+          {docs.map((d) => (
+            <div
+              key={d.id}
+              style={{
+                display: "flex",
+                alignItems: "center",
+                gap: 4,
+                padding: "8px 10px",
+                borderRadius: 10,
+                cursor: "pointer",
+                background: d.id === activeId ? "var(--assistant-bubble)" : "transparent",
+                fontWeight: d.id === activeId ? 700 : 500,
+              }}
+              onClick={() => setActiveId(d.id)}
+            >
+              <span style={{ flex: 1, fontSize: 14, color: "var(--assistant-text)", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                {d.template === "cornell" ? "📐 " : d.template === "canvas" ? "🕸️ " : "📝 "}
+                {d.title || "Untitled"}
+              </span>
+              <button
+                onClick={(e) => {
+                  e.stopPropagation();
+                  removeDoc(d.id);
+                }}
+                aria-label="Delete note"
+                style={{ background: "none", border: "none", cursor: "pointer", color: "var(--muted)", fontSize: 16, padding: 0 }}
+              >
+                ×
+              </button>
+            </div>
+          ))}
+        </div>
+      </div>
+
+      {/* Editor */}
+      <div style={{ flex: "4 1 560px", minWidth: 340 }}>
+        {!active ? (
+          <div style={{ color: "var(--muted)", fontSize: 14, padding: "30px 0" }}>
+            Select or create a note to start writing.
+          </div>
+        ) : (
+          <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
+            <input
+              value={active.title}
+              onChange={(e) => patch(active.id, { title: e.target.value })}
+              placeholder="Note title"
+              style={{
+                width: "100%",
+                border: "none",
+                borderBottom: "1px solid var(--border)",
+                padding: "6px 2px",
+                fontSize: 20,
+                fontWeight: 800,
+                color: "var(--accent)",
+                background: "transparent",
+                outline: "none",
+              }}
+            />
+
+            {active.template === "canvas" ? (
+              <CanvasBoard
+                nodes={active.nodes}
+                edges={active.edges}
+                onNodes={(next) => patch(active.id, { nodes: next })}
+                onEdges={(next) => patch(active.id, { edges: next })}
+              />
+            ) : (
+              <>
+            {/* Concept color toolbar */}
+            <div style={{ display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap" }}>
+              <span style={{ fontSize: 12.5, color: "var(--muted)", fontWeight: 600 }}>
+                Color-code:
+              </span>
+              {NOTE_COLOR_ORDER.map(colorBtn)}
+              <button
+                onClick={() => wrapSelection("**", "**")}
+                title="Bold"
+                style={{ padding: "3px 10px", borderRadius: 8, border: "1px solid var(--border)", background: "transparent", fontWeight: 800, cursor: "pointer", color: "var(--assistant-text)" }}
+              >
+                B
+              </button>
+              <VoiceCapture onAppend={appendToActiveBody} />
+              <span style={{ fontSize: 12, color: "var(--muted)" }}>
+                Tip: link notes with [[Note title]]
+              </span>
+            </div>
+
+            {active.template === "cornell" ? (
+              <div>
+                <div style={{ display: "flex", gap: 10, flexWrap: "wrap" }}>
+                  <div style={{ flex: "1 1 140px", minWidth: 130 }}>
+                    <div style={{ fontSize: 12.5, fontWeight: 800, color: "var(--accent)", textTransform: "uppercase", marginBottom: 4 }}>
+                      Cues / questions
+                    </div>
+                    <textarea
+                      value={active.cue}
+                      onChange={(e) => patch(active.id, { cue: e.target.value })}
+                      placeholder="Key questions, cues, keywords…"
+                      style={{ ...taStyle, minHeight: 440 }}
+                    />
+                  </div>
+                  <div style={{ flex: "2 1 260px", minWidth: 220 }}>
+                    <div style={{ fontSize: 12.5, fontWeight: 800, color: "var(--accent)", textTransform: "uppercase", marginBottom: 4 }}>
+                      Notes
+                    </div>
+                    <textarea
+                      ref={bodyRef}
+                      value={active.body}
+                      onChange={(e) => patch(active.id, { body: e.target.value })}
+                      placeholder="Main notes from class or reading…"
+                      style={{ ...taStyle, minHeight: 440 }}
+                    />
+                  </div>
+                </div>
+                <div style={{ marginTop: 10 }}>
+                  <div style={{ fontSize: 12.5, fontWeight: 800, color: "var(--accent)", textTransform: "uppercase", marginBottom: 4 }}>
+                    Summary
+                  </div>
+                  <textarea
+                    value={active.summary}
+                    onChange={(e) => patch(active.id, { summary: e.target.value })}
+                    placeholder="Sum it up in a sentence or two…"
+                    style={{ ...taStyle, minHeight: 110 }}
+                  />
+                </div>
+              </div>
+            ) : (
+              <textarea
+                ref={bodyRef}
+                value={active.body}
+                onChange={(e) => patch(active.id, { body: e.target.value })}
+                placeholder="Write your notes… use ## headings, - bullets, and [[links]] to other notes."
+                style={{ ...taStyle, minHeight: 460 }}
+              />
+            )}
+
+            {/* Live preview */}
+            {(active.body.trim() || active.cue.trim() || active.summary.trim()) && (
+              <div style={{ border: "1px solid var(--border)", borderRadius: 12, padding: 14, background: "var(--assistant-bubble)" }}>
+                <div style={{ fontSize: 12, fontWeight: 800, color: "var(--muted)", textTransform: "uppercase", marginBottom: 8 }}>
+                  Preview
+                </div>
+                {active.template === "cornell" && active.cue.trim() && (
+                  <div style={{ marginBottom: 8 }}>
+                    <div style={{ fontWeight: 800, color: "var(--accent)", fontSize: 13 }}>Cues</div>
+                    {renderNoteMarkdown(active.cue, openByTitle)}
+                  </div>
+                )}
+                {renderNoteMarkdown(active.body, openByTitle)}
+                {active.template === "cornell" && active.summary.trim() && (
+                  <div style={{ marginTop: 8, paddingTop: 8, borderTop: "1px solid var(--border)" }}>
+                    <div style={{ fontWeight: 800, color: "var(--accent)", fontSize: 13 }}>Summary</div>
+                    {renderNoteMarkdown(active.summary, openByTitle)}
+                  </div>
+                )}
+              </div>
+            )}
+
+            <StickyBoard
+              stickies={active.stickies}
+              onChange={(next) => patch(active.id, { stickies: next })}
+            />
+              </>
+            )}
+          </div>
+        )}
+      </div>
     </div>
   );
 }
@@ -12521,6 +15264,585 @@ function Login() {
   );
 }
 
+// --- Study Together ----------------------------------------------------------
+// Shared study rooms: focus alongside other learners with a synced pomodoro,
+// live presence, and a lightweight room chat. Eliora has no realtime backend,
+// so the client polls /api/rooms/[code] a few times a second and derives the
+// countdown locally from the server clock (mirrors @eliora/shared TogetherRoom).
+type TogetherTimerMode = "focus" | "break" | "idle";
+type TogetherTimer = {
+  mode: TogetherTimerMode;
+  running: boolean;
+  startedAt?: number;
+  durationSec: number;
+  remainingSec?: number;
+  updatedBy?: string;
+};
+type TogetherMember = { id: string; name: string; lastSeen: number };
+type TogetherMessage = {
+  id: string;
+  memberId: string;
+  name: string;
+  text: string;
+  at: number;
+};
+type TogetherRoom = {
+  code: string;
+  name: string;
+  topic?: string;
+  createdAt: number;
+  timer: TogetherTimer;
+  members: TogetherMember[];
+  messages: TogetherMessage[];
+};
+
+const TOGETHER_FOCUS_SEC = 25 * 60;
+const TOGETHER_BREAK_SEC = 5 * 60;
+const TOGETHER_PRESENCE_MS = 20_000;
+const TOGETHER_ID_KEY = "eliora-together-id";
+const TOGETHER_LAST_KEY = "eliora-together-last";
+
+function togetherRemaining(timer: TogetherTimer, now: number): number {
+  if (timer.mode === "idle") return 0;
+  if (!timer.running) return timer.remainingSec ?? timer.durationSec;
+  if (!timer.startedAt) return timer.durationSec;
+  return Math.max(0, timer.durationSec - Math.floor((now - timer.startedAt) / 1000));
+}
+function togetherClock(sec: number): string {
+  const s = Math.max(0, Math.floor(sec));
+  return `${Math.floor(s / 60)}:${(s % 60).toString().padStart(2, "0")}`;
+}
+
+function StudyTogether({ name }: { name: string }) {
+  const [room, setRoom] = useState<TogetherRoom | null>(null);
+  const [now, setNow] = useState(() => Date.now());
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState("");
+  const [createTopic, setCreateTopic] = useState("");
+  const [joinCode, setJoinCode] = useState("");
+  const [draft, setDraft] = useState("");
+  const [copied, setCopied] = useState(false);
+  const memberIdRef = useRef<string>("");
+  const chatEndRef = useRef<HTMLDivElement | null>(null);
+
+  // Stable per-device member id + auto-rejoin the last room.
+  useEffect(() => {
+    let id = localStorage.getItem(TOGETHER_ID_KEY);
+    if (!id) {
+      id =
+        typeof crypto !== "undefined" && crypto.randomUUID
+          ? crypto.randomUUID()
+          : `m-${Date.now()}-${Math.floor(Math.random() * 1e9)}`;
+      localStorage.setItem(TOGETHER_ID_KEY, id);
+    }
+    memberIdRef.current = id;
+    const last = localStorage.getItem(TOGETHER_LAST_KEY);
+    if (last) void enter("join", { code: last }, true);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  // Local 1s tick so the countdown moves smoothly between polls.
+  useEffect(() => {
+    const t = setInterval(() => setNow(Date.now()), 1000);
+    return () => clearInterval(t);
+  }, []);
+
+  // Poll while in a room: refresh presence + pull the latest state.
+  const code = room?.code;
+  useEffect(() => {
+    if (!code) return;
+    let alive = true;
+    async function poll() {
+      try {
+        const res = await fetch(
+          `/api/rooms/${code}?memberId=${encodeURIComponent(
+            memberIdRef.current,
+          )}&name=${encodeURIComponent(name)}`,
+          { cache: "no-store" },
+        );
+        if (!alive) return;
+        if (res.status === 404) {
+          localStorage.removeItem(TOGETHER_LAST_KEY);
+          setRoom(null);
+          setErr("That room has ended.");
+          return;
+        }
+        const data = (await res.json()) as { room?: TogetherRoom };
+        if (data.room) {
+          setRoom(data.room);
+          setNow(Date.now());
+        }
+      } catch {
+        /* transient — next tick retries */
+      }
+    }
+    void poll();
+    const t = setInterval(poll, 2500);
+    return () => {
+      alive = false;
+      clearInterval(t);
+    };
+  }, [code, name]);
+
+  // Keep the chat pinned to the newest message.
+  useEffect(() => {
+    chatEndRef.current?.scrollIntoView({ block: "end" });
+  }, [room?.messages.length]);
+
+  async function enter(
+    action: "create" | "join",
+    extra: { name?: string; topic?: string; code?: string },
+    silent = false,
+  ) {
+    if (!silent) {
+      setBusy(true);
+      setErr("");
+    }
+    try {
+      const res = await fetch("/api/rooms", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          action,
+          memberId: memberIdRef.current,
+          memberName: name,
+          ...extra,
+        }),
+      });
+      const data = (await res.json()) as { room?: TogetherRoom; error?: string };
+      if (data.room) {
+        setRoom(data.room);
+        setNow(Date.now());
+        localStorage.setItem(TOGETHER_LAST_KEY, data.room.code);
+        setJoinCode("");
+        setCreateTopic("");
+      } else if (!silent) {
+        setErr(data.error || "Couldn't reach that room — try again.");
+      } else {
+        // A silent auto-rejoin that failed just means the old room is gone.
+        localStorage.removeItem(TOGETHER_LAST_KEY);
+      }
+    } catch {
+      if (!silent) setErr("Couldn't reach the server. Please try again.");
+    } finally {
+      if (!silent) setBusy(false);
+    }
+  }
+
+  // Fire a room action and adopt the returned state for a snappy response.
+  async function act(body: Record<string, unknown>) {
+    if (!room) return;
+    try {
+      const res = await fetch(`/api/rooms/${room.code}`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          memberId: memberIdRef.current,
+          name,
+          ...body,
+        }),
+      });
+      const data = (await res.json()) as { room?: TogetherRoom };
+      if (data.room) {
+        setRoom(data.room);
+        setNow(Date.now());
+      }
+    } catch {
+      /* the poll loop will reconcile */
+    }
+  }
+
+  function sendChat() {
+    const text = draft.trim();
+    if (!text) return;
+    setDraft("");
+    void act({ action: "message", text });
+  }
+
+  async function leave() {
+    const current = room;
+    localStorage.removeItem(TOGETHER_LAST_KEY);
+    setRoom(null);
+    setDraft("");
+    if (current) {
+      try {
+        await fetch(`/api/rooms/${current.code}`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ action: "leave", memberId: memberIdRef.current }),
+        });
+      } catch {
+        /* presence timeout will drop us anyway */
+      }
+    }
+  }
+
+  // ---- Landing: create or join --------------------------------------------
+  if (!room) {
+    return (
+      <div style={styles.studyScroll}>
+        <div style={styles.card}>
+          <div style={styles.cardHead}>
+            <span style={styles.cardClass}>👥 Study Together</span>
+          </div>
+          <p style={{ color: "var(--muted)", fontSize: 14.5, margin: "0 0 14px" }}>
+            Focus alongside other learners. Start a room and share the code, or
+            join one — you&apos;ll share a pomodoro timer and a room chat.
+          </p>
+          {err && <div style={tstyles.err}>{err}</div>}
+          <div style={tstyles.landingGrid}>
+            <div style={tstyles.landingCol}>
+              <div style={tstyles.colTitle}>Start a room</div>
+              <input
+                style={styles.input}
+                placeholder="What are you working on? (optional)"
+                value={createTopic}
+                maxLength={120}
+                onChange={(e) => setCreateTopic(e.target.value)}
+                onKeyDown={(e) => {
+                  if (e.key === "Enter")
+                    void enter("create", {
+                      name: `${name.split(" ")[0]}'s room`,
+                      topic: createTopic.trim() || undefined,
+                    });
+                }}
+              />
+              <button
+                style={styles.primaryBtn}
+                disabled={busy}
+                onClick={() =>
+                  void enter("create", {
+                    name: `${name.split(" ")[0]}'s room`,
+                    topic: createTopic.trim() || undefined,
+                  })
+                }
+              >
+                {busy ? "Creating…" : "Create room"}
+              </button>
+            </div>
+            <div style={tstyles.landingCol}>
+              <div style={tstyles.colTitle}>Join a room</div>
+              <input
+                style={{
+                  ...styles.input,
+                  textTransform: "uppercase",
+                  letterSpacing: 2,
+                  fontWeight: 700,
+                }}
+                placeholder="Enter code"
+                value={joinCode}
+                maxLength={6}
+                onChange={(e) =>
+                  setJoinCode(e.target.value.toUpperCase().replace(/[^A-Z0-9]/g, ""))
+                }
+                onKeyDown={(e) => {
+                  if (e.key === "Enter" && joinCode.length === 6)
+                    void enter("join", { code: joinCode });
+                }}
+              />
+              <button
+                style={styles.secondaryBtn}
+                disabled={busy || joinCode.length !== 6}
+                onClick={() => void enter("join", { code: joinCode })}
+              >
+                Join room
+              </button>
+            </div>
+          </div>
+        </div>
+      </div>
+    );
+  }
+
+  // ---- In a room -----------------------------------------------------------
+  const present = room.members
+    .filter((m) => now - m.lastSeen < TOGETHER_PRESENCE_MS)
+    .sort((a, b) => b.lastSeen - a.lastSeen);
+  const remaining = togetherRemaining(room.timer, now);
+  const running = room.timer.running && room.timer.mode !== "idle";
+  const paused = !room.timer.running && room.timer.mode !== "idle";
+  const isFocus = room.timer.mode === "focus";
+  const timeUp = running && remaining <= 0;
+
+  return (
+    <div style={styles.studyScroll}>
+      {/* Header */}
+      <div style={styles.card}>
+        <div style={{ ...styles.cardHead, marginBottom: 2 }}>
+          <span style={styles.cardClass}>👥 {room.name}</span>
+          <button style={styles.linkBtn} onClick={() => void leave()}>
+            Leave
+          </button>
+        </div>
+        {room.topic && (
+          <div style={{ color: "var(--muted)", fontSize: 14, marginBottom: 8 }}>
+            {room.topic}
+          </div>
+        )}
+        <div style={tstyles.codeRow}>
+          <span style={{ color: "var(--muted)", fontSize: 13 }}>Room code</span>
+          <button
+            style={tstyles.codeChip}
+            title="Copy code"
+            onClick={async () => {
+              try {
+                await navigator.clipboard.writeText(room.code);
+                setCopied(true);
+                window.setTimeout(() => setCopied(false), 1500);
+              } catch {
+                /* ignore */
+              }
+            }}
+          >
+            {room.code} {copied ? "✓" : "⧉"}
+          </button>
+        </div>
+      </div>
+
+      {/* Shared timer */}
+      <div style={styles.card}>
+        <div style={styles.cardHead}>
+          <span style={styles.cardClass}>⏱️ Shared timer</span>
+          {room.timer.mode !== "idle" && (
+            <span style={tstyles.phasePill(isFocus)}>
+              {isFocus ? "Focus" : "Break"}
+            </span>
+          )}
+        </div>
+        <div style={tstyles.clock(timeUp)}>
+          {timeUp ? "Time's up!" : togetherClock(remaining)}
+        </div>
+        <div style={tstyles.timerBtns}>
+          {room.timer.mode === "idle" || timeUp ? (
+            <>
+              <button
+                style={styles.primaryBtn}
+                onClick={() => void act({ action: "timer", timer: "focus" })}
+              >
+                Start focus · 25m
+              </button>
+              <button
+                style={styles.secondaryBtn}
+                onClick={() => void act({ action: "timer", timer: "break" })}
+              >
+                Break · 5m
+              </button>
+            </>
+          ) : (
+            <>
+              {running ? (
+                <button
+                  style={styles.secondaryBtn}
+                  onClick={() => void act({ action: "timer", timer: "pause" })}
+                >
+                  Pause
+                </button>
+              ) : (
+                <button
+                  style={styles.primaryBtn}
+                  onClick={() => void act({ action: "timer", timer: "resume" })}
+                >
+                  Resume
+                </button>
+              )}
+              <button
+                style={styles.secondaryBtn}
+                onClick={() => void act({ action: "timer", timer: "reset" })}
+              >
+                Reset
+              </button>
+            </>
+          )}
+        </div>
+        {room.timer.updatedBy && (
+          <div style={{ color: "var(--muted)", fontSize: 12, marginTop: 8 }}>
+            {paused ? "Paused" : "Set"} by {room.timer.updatedBy}
+          </div>
+        )}
+      </div>
+
+      {/* Presence */}
+      <div style={styles.card}>
+        <div style={styles.cardHead}>
+          <span style={styles.cardClass}>
+            🟢 Studying now · {present.length}
+          </span>
+        </div>
+        <div style={tstyles.avatars}>
+          {present.map((m) => (
+            <span key={m.id} style={tstyles.avatar} title={m.name}>
+              <span style={tstyles.avatarDot} />
+              {m.name}
+            </span>
+          ))}
+        </div>
+      </div>
+
+      {/* Chat */}
+      <div style={styles.card}>
+        <div style={styles.cardHead}>
+          <span style={styles.cardClass}>💬 Room chat</span>
+        </div>
+        <div style={tstyles.chatLog}>
+          {room.messages.length === 0 ? (
+            <div style={{ color: "var(--muted)", fontSize: 13.5, padding: "8px 2px" }}>
+              Say hi 👋 — messages are visible to everyone in the room.
+            </div>
+          ) : (
+            room.messages.map((m) => {
+              const mine = m.memberId === memberIdRef.current;
+              return (
+                <div
+                  key={m.id}
+                  style={{ ...tstyles.msg, alignItems: mine ? "flex-end" : "flex-start" }}
+                >
+                  <div style={tstyles.msgMeta}>{mine ? "You" : m.name}</div>
+                  <div style={tstyles.msgBubble(mine)}>{m.text}</div>
+                </div>
+              );
+            })
+          )}
+          <div ref={chatEndRef} />
+        </div>
+        <div style={tstyles.chatRow}>
+          <input
+            style={styles.input}
+            placeholder="Message the room…"
+            value={draft}
+            maxLength={500}
+            onChange={(e) => setDraft(e.target.value)}
+            onKeyDown={(e) => {
+              if (e.key === "Enter") sendChat();
+            }}
+          />
+          <button
+            style={styles.primaryBtn}
+            disabled={!draft.trim()}
+            onClick={sendChat}
+          >
+            Send
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// Local styles for Study Together (kept next to the component; reuse the shared
+// CSS variables so it themes with the rest of the app).
+const tstyles = {
+  err: {
+    background: "var(--assistant-bubble)",
+    color: "var(--accent)",
+    borderRadius: 10,
+    padding: "10px 12px",
+    fontSize: 14,
+    marginBottom: 12,
+  } as React.CSSProperties,
+  landingGrid: {
+    display: "grid",
+    gridTemplateColumns: "1fr 1fr",
+    gap: 14,
+  } as React.CSSProperties,
+  landingCol: {
+    display: "flex",
+    flexDirection: "column",
+    gap: 10,
+    minWidth: 0,
+  } as React.CSSProperties,
+  colTitle: {
+    fontSize: 13,
+    fontWeight: 700,
+    color: "var(--muted)",
+    textTransform: "uppercase",
+    letterSpacing: 0.5,
+  } as React.CSSProperties,
+  codeRow: {
+    display: "flex",
+    alignItems: "center",
+    justifyContent: "space-between",
+    gap: 10,
+    marginTop: 4,
+  } as React.CSSProperties,
+  codeChip: {
+    fontFamily: "ui-monospace, Menlo, monospace",
+    fontSize: 20,
+    fontWeight: 800,
+    letterSpacing: 3,
+    color: "var(--accent)",
+    background: "var(--assistant-bubble)",
+    border: "1px solid var(--border)",
+    borderRadius: 10,
+    padding: "6px 14px",
+    cursor: "pointer",
+  } as React.CSSProperties,
+  clock: (up: boolean): React.CSSProperties => ({
+    fontSize: up ? 34 : 52,
+    fontWeight: 800,
+    textAlign: "center",
+    fontVariantNumeric: "tabular-nums",
+    color: up ? "var(--accent)" : "var(--assistant-text)",
+    padding: "10px 0 14px",
+    letterSpacing: 1,
+  }),
+  phasePill: (focus: boolean): React.CSSProperties => ({
+    fontSize: 12,
+    fontWeight: 700,
+    padding: "3px 10px",
+    borderRadius: 999,
+    color: "#fff",
+    background: focus ? "var(--accent)" : "#3b9e6f",
+  }),
+  timerBtns: {
+    display: "flex",
+    gap: 10,
+    justifyContent: "center",
+    flexWrap: "wrap",
+  } as React.CSSProperties,
+  avatars: { display: "flex", flexWrap: "wrap", gap: 8 } as React.CSSProperties,
+  avatar: {
+    display: "inline-flex",
+    alignItems: "center",
+    gap: 6,
+    background: "var(--assistant-bubble)",
+    border: "1px solid var(--border)",
+    borderRadius: 999,
+    padding: "5px 12px 5px 10px",
+    fontSize: 13.5,
+    fontWeight: 600,
+    color: "var(--assistant-text)",
+  } as React.CSSProperties,
+  avatarDot: {
+    width: 8,
+    height: 8,
+    borderRadius: 999,
+    background: "#37b26b",
+    display: "inline-block",
+  } as React.CSSProperties,
+  chatLog: {
+    display: "flex",
+    flexDirection: "column",
+    gap: 10,
+    maxHeight: 300,
+    overflowY: "auto",
+    padding: "4px 2px 10px",
+  } as React.CSSProperties,
+  msg: { display: "flex", flexDirection: "column", gap: 2 } as React.CSSProperties,
+  msgMeta: { fontSize: 11, color: "var(--muted)", padding: "0 6px" } as React.CSSProperties,
+  msgBubble: (mine: boolean): React.CSSProperties => ({
+    maxWidth: "80%",
+    padding: "8px 12px",
+    borderRadius: 14,
+    fontSize: 14.5,
+    lineHeight: 1.4,
+    whiteSpace: "pre-wrap",
+    wordBreak: "break-word",
+    color: mine ? "#fff" : "var(--assistant-text)",
+    background: mine ? "var(--accent)" : "var(--assistant-bubble)",
+  }),
+  chatRow: { display: "flex", gap: 8, marginTop: 10 } as React.CSSProperties,
+};
+
 function ElioraApp() {
   const { data: session } = useSession();
   // Namespace all saved data by the signed-in user so each account gets its own
@@ -12633,6 +15955,11 @@ function ElioraApp() {
   const [schedule, setSchedule] = useState<DaySchedule | null>(null);
   const [homeHour, setHomeHour] = useState(16); // when they get home (24h)
   const [generatingSchedule, setGeneratingSchedule] = useState(false);
+  // Latest schedule-survey answers: today's study-minute cap and what to focus on.
+  const [scheduleBudgetMin, setScheduleBudgetMin] = useState<
+    number | undefined
+  >(undefined);
+  const [scheduleFocusNote, setScheduleFocusNote] = useState("");
   // Badge ids the learner has already been rewarded for (so we grant the bonus
   // XP only once, and never retroactively for badges earned before this shipped).
   const [claimedBadges, setClaimedBadges] = useState<string[]>([]);
@@ -12721,11 +16048,14 @@ function ElioraApp() {
     | "home"
     | "chat"
     | "summarize"
+    | "notebook"
     | "practice"
     | "calendar"
     | "plan"
     | "progress"
     | "study"
+    | "together"
+    | "school"
   >("home");
   // Sub-sections within the Plan tab, so it's not one overwhelming scroll.
   // "overview" is the main landing page that summarizes everything.
@@ -12770,6 +16100,10 @@ function ElioraApp() {
   const [studyPlanSubject, setStudyPlanSubject] = useState("");
   const [listening, setListening] = useState(false);
   const [speechSupported, setSpeechSupported] = useState(false);
+  // Photos/files/videos staged in the composer, sent with the next message.
+  const [attachments, setAttachments] = useState<Attachment[]>([]);
+  const [attaching, setAttaching] = useState(false);
+  const fileInputRef = useRef<HTMLInputElement>(null);
   // When set, the teach-back video recorder is open (value = concept to teach).
   const [recorderOpen, setRecorderOpen] = useState<string | null>(null);
   // How hard the next teach-back should push — shared by the composer chips and
@@ -13837,12 +17171,18 @@ function ElioraApp() {
 
   // Build today's after-school study schedule from when they get home + how they
   // study (profile) + their real work (plan steps, tasks, assignments).
-  const generateStudySchedule = async () => {
+  const generateStudySchedule = async (opts?: {
+    homeHour?: number;
+    budgetMin?: number;
+    focusNote?: string;
+  }) => {
     if (generatingSchedule) return;
     setGeneratingSchedule(true);
     try {
       const today = localISO();
       const planSteps = plan.filter((m) => !m.done).map((m) => m.title);
+      const budgetMin = opts?.budgetMin ?? scheduleBudgetMin;
+      const focusNote = (opts?.focusNote ?? scheduleFocusNote).trim();
       // Pass each open task with its time estimate so the schedule can budget
       // the evening by minutes (e.g. "Review Bio notes (~20 min)").
       const taskTitles =
@@ -13858,7 +17198,9 @@ function ElioraApp() {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           kind: "schedule",
-          homeHour,
+          homeHour: opts?.homeHour ?? homeHour,
+          budgetMin: budgetMin || undefined,
+          focusNote: focusNote || undefined,
           profile: profile ?? undefined,
           plan: planSteps,
           tasks: taskTitles,
@@ -13896,6 +17238,42 @@ function ElioraApp() {
     } finally {
       setGeneratingSchedule(false);
     }
+  };
+
+  // Take the schedule-setup survey answers, remember the learner's study prefs
+  // on their profile, then build today's schedule from the fresh answers.
+  const handleScheduleSurvey = (a: {
+    homeTime: string;
+    budget: string;
+    focusTime: string;
+    sessionLength: string;
+    focusHelp: string;
+    focusNote: string;
+  }) => {
+    const nextHomeHour = HOME_TIME_HOUR[a.homeTime] ?? homeHour;
+    const budgetMin = a.budget ? STUDY_BUDGET_MIN[a.budget] : undefined;
+    setHomeHour(nextHomeHour);
+    setScheduleBudgetMin(budgetMin);
+    setScheduleFocusNote(a.focusNote);
+    if (profile && (a.focusTime || a.sessionLength || a.focusHelp)) {
+      const next: LearnerProfile = {
+        ...profile,
+        focusTime: a.focusTime || profile.focusTime,
+        sessionLength: a.sessionLength || profile.sessionLength,
+        focusHelp: a.focusHelp || profile.focusHelp,
+      };
+      setProfile(next);
+      try {
+        localStorage.setItem(PROFILE_KEY, JSON.stringify(next));
+      } catch {
+        /* ignore */
+      }
+    }
+    generateStudySchedule({
+      homeHour: nextHomeHour,
+      budgetMin,
+      focusNote: a.focusNote,
+    });
   };
 
   // Update one hour block of today's schedule (starting a fresh day if needed).
@@ -14999,6 +18377,24 @@ function ElioraApp() {
     void send(teachBackKickoff(concept, teachLevel));
   }
 
+  // Ask Eliora for one quick, practical study tip. Ties it to whatever the
+  // learner typed (or the current lesson topic) so the tip fits what they're
+  // working on right now, not generic advice.
+  function studyTipInChat() {
+    if (busy || pendingKickoff) return;
+    const topic = input.trim() || activeChat?.title?.trim() || "";
+    setInput("");
+    void send(
+      topic
+        ? `Give me ONE quick, practical study tip for working on "${topic}" ` +
+            `right now — a proven technique I can use this minute, matched to how ` +
+            `I learn and what I struggle with. Keep it to a sentence or two.`
+        : `Give me ONE quick, practical study tip I can use right now — a proven ` +
+            `technique matched to how I learn and what I struggle with. Keep it to ` +
+            `a sentence or two.`,
+    );
+  }
+
   // Open the camera recorder so the learner can teach the concept out loud.
   // Their spoken explanation (transcribed) is what gets sent to Eliora.
   function recordTeachBack() {
@@ -15199,24 +18595,59 @@ function ElioraApp() {
   function studyGuideFromQuiz(detail: string) {
     setTab("chat");
     send(
-      "I just took a quiz and got some questions wrong. Make me a short, simple " +
-        "study guide focused ONLY on these — re-teach each one in a fresh way, " +
-        "then give me 2 quick practice questions:\n" +
+      "I just took a quiz and missed some questions. Make me a focused study " +
+        "guide on ONLY these. For each one: first show me what I got wrong (my " +
+        "answer vs. the correct answer), then gently walk me through WHY my " +
+        "answer was wrong and re-teach the right idea in a fresh, simple way. " +
+        "Once you've covered them all, give me 2–3 quick practice questions on " +
+        "just these so I can check it stuck:\n" +
         detail,
     );
   }
 
+  // Turn picked files into attachments and stage them in the composer.
+  async function addFiles(list: FileList | File[] | null) {
+    if (!list) return;
+    const files = Array.from(list);
+    if (!files.length) return;
+    setAttaching(true);
+    try {
+      const room = Math.max(0, MAX_ATTACHMENTS - attachments.length);
+      const built = await Promise.all(
+        files.slice(0, room).map((f) => fileToAttachment(f).catch(() => null)),
+      );
+      const ok = built.filter((a): a is Attachment => a !== null);
+      if (ok.length) setAttachments((prev) => [...prev, ...ok].slice(0, MAX_ATTACHMENTS));
+    } finally {
+      setAttaching(false);
+    }
+  }
+
+  function removeAttachment(i: number) {
+    setAttachments((prev) => prev.filter((_, idx) => idx !== i));
+  }
+
   async function send(override?: string, opts?: { hidden?: boolean }) {
     const text = (typeof override === "string" ? override : input).trim();
-    if (!text || busy) return;
+    // A typed override (quick chip, auto-build) is text-only; a real learner
+    // turn may carry attachments with no text, which is a valid message.
+    const outgoing = typeof override === "string" ? [] : attachments;
+    if ((!text && outgoing.length === 0) || busy) return;
 
-    const userMsg: Message = { role: "user", content: text };
+    const userMsg: Message = {
+      role: "user",
+      content: text,
+      ...(outgoing.length ? { attachments: outgoing } : {}),
+    };
     // The model always sees the user/kickoff message; for a silent auto-build
     // (opts.hidden) we don't render it as a user bubble — only the reply shows.
     const apiMessages: Message[] = [...messages, userMsg];
     const visible: Message[] = opts?.hidden ? [...messages] : apiMessages;
     setMessages([...visible, { role: "assistant", content: "" }]);
-    if (typeof override !== "string") setInput("");
+    if (typeof override !== "string") {
+      setInput("");
+      setAttachments([]);
+    }
     setBusy(true);
     setChatStatus(null);
     const aborter = new AbortController();
@@ -15231,7 +18662,11 @@ function ElioraApp() {
         body: JSON.stringify({
           messages: apiMessages
             .slice(1)
-            .map((m) => ({ role: m.role, content: m.content })),
+            .map((m) => ({
+              role: m.role,
+              content: m.content,
+              ...(m.attachments?.length ? { attachments: m.attachments } : {}),
+            })),
           profile: profile ?? undefined,
           plan: plan.length ? plan : undefined,
           events: events.length ? events : undefined,
@@ -15253,6 +18688,8 @@ function ElioraApp() {
       let buffer = "";
       let acc = "";
       const videos: Video[] = [];
+      const socials: SocialRec[] = [];
+      const examples: StudentExample[] = [];
       let flashcards: Flashcard[] | undefined;
       let quiz: QuizQuestion[] | undefined;
 
@@ -15261,7 +18698,13 @@ function ElioraApp() {
         let evt: {
           type: string;
           value?: string;
-          items?: Video[] | IncomingMilestone[] | Flashcard[] | QuizQuestion[];
+          items?:
+            | Video[]
+            | SocialRec[]
+            | StudentExample[]
+            | IncomingMilestone[]
+            | Flashcard[]
+            | QuizQuestion[];
           item?: StudyEvent;
           name?: string;
         };
@@ -15333,6 +18776,10 @@ function ElioraApp() {
         }
         else if (evt.type === "videos" && evt.items)
           videos.push(...(evt.items as Video[]));
+        else if (evt.type === "socials" && evt.items)
+          socials.push(...(evt.items as SocialRec[]));
+        else if (evt.type === "examples" && evt.items)
+          examples.push(...(evt.items as StudentExample[]));
         else if (evt.type === "flashcards")
           flashcards = (evt.items as Flashcard[]) ?? [];
         else if (evt.type === "quiz") quiz = (evt.items as QuizQuestion[]) ?? [];
@@ -15342,6 +18789,8 @@ function ElioraApp() {
             role: "assistant",
             content: acc,
             videos: videos.length ? [...videos] : undefined,
+            socials: socials.length ? [...socials] : undefined,
+            examples: examples.length ? [...examples] : undefined,
             flashcards,
             quiz,
           };
@@ -15437,12 +18886,15 @@ function ElioraApp() {
             [
               ["home", "🏠 Home"],
               ["chat", "💬 Chat"],
-              ["summarize", "📝 Notes"],
+              ["summarize", "📝 Summarize"],
+              ["notebook", "📓 Smart Notes"],
               ["practice", "🧠 Practice"],
               ["calendar", "📅 Calendar"],
               ["plan", "🎯 Plan"],
               ["progress", "📊 Progress"],
               ["study", "📋 Study"],
+              ["together", "👥 Study Together"],
+              ["school", "🏫 School"],
             ] as const
           ).map(([key, label]) => (
             <button
@@ -15593,8 +19045,8 @@ function ElioraApp() {
           <button
             style={styles.sideFootBtn}
             onClick={() => setShowA11y(true)}
-            aria-label="Accessibility settings"
-            title="Accessibility"
+            aria-label="Preferences"
+            title="Preferences"
           >
             ⚙️
           </button>
@@ -15860,13 +19312,18 @@ function ElioraApp() {
               onSetPriority={setDailyTaskPriority}
               onBudget={budgetDailyTime}
             />
+            <DeadlineCountdownCard
+              events={events}
+              assignments={assignments}
+              goals={goals}
+              onOpen={() => setTab("calendar")}
+            />
             <LearnStarter
               profile={profile}
               subjects={subjects}
               missed={missed}
               busy={busy || !!pendingKickoff}
               level={teachLevel}
-              onLevel={setTeachLevel}
               onLearn={startTopicChat}
               onTeachBack={startTeachBack}
             />
@@ -15910,6 +19367,7 @@ function ElioraApp() {
                   ["🧠", "Practice quiz", "Test what you know", () => setTab("practice")],
                   ["🎯", "My plan", "See your next step", () => setTab("plan")],
                   ["🗺️", "4-year plan", "Map your path", () => setTab("plan")],
+                  ["🏫", "Connect school", "Import assignments & grades", () => setTab("school")],
                 ] as const
               ).map(([emoji, title, desc, fn]) => (
                 <button
@@ -16024,6 +19482,19 @@ function ElioraApp() {
         />
       )}
 
+      {tab === "notebook" && (
+        <div style={{ padding: "8px 16px 24px" }}>
+          <h2 style={{ fontSize: 22, fontWeight: 800, color: "var(--accent)", margin: "6px 0 2px" }}>
+            📓 Smart Notes
+          </h2>
+          <p style={{ color: "var(--muted)", fontSize: 14, margin: "0 0 14px" }}>
+            Your notes — free-form or Cornell, color-code key concepts, link notes
+            with [[title]], and pin sticky notes.
+          </p>
+          <NotesWorkspace ns={ns} />
+        </div>
+      )}
+
       {tab === "practice" && (
         <PracticeQuiz
           profile={profile}
@@ -16044,7 +19515,13 @@ function ElioraApp() {
             onClear={clearSchedule}
             homeHour={homeHour}
             onSetHomeHour={setHomeHour}
-            onGenerate={generateStudySchedule}
+            onGenerate={() => generateStudySchedule()}
+            onSetupSubmit={handleScheduleSurvey}
+            setupInitial={{
+              focusTime: profile?.focusTime,
+              sessionLength: profile?.sessionLength,
+              focusHelp: profile?.focusHelp,
+            }}
             generating={generatingSchedule}
             onStudyMinutes={logStudyMinutes}
           />
@@ -16388,7 +19865,7 @@ function ElioraApp() {
                       📝 Build with a survey
                     </button>
                   </div>
-                  <PlanPanel
+                  <PlanBoard
                     plan={plan}
                     onToggle={togglePlan}
                     onAdd={addMilestone}
@@ -16593,6 +20070,25 @@ function ElioraApp() {
         </div>
       )}
 
+      {tab === "school" && (
+        <SchoolConnect
+          profile={profile}
+          onAddAssignment={addAssignment}
+          onAddEvent={addEvent}
+          onAddSubject={addSubject}
+          onShareGrades={(grades) => {
+            setTab("chat");
+            send(
+              "Here are my current grades from my school app:\n" +
+                grades.map((g) => `- ${g.course}: ${g.grade}`).join("\n") +
+                "\nKeep these in mind when you help me — start with where I'm " +
+                "weakest, and celebrate what's going well.",
+              { hidden: true },
+            );
+          }}
+        />
+      )}
+
       {tab === "study" && (
         <div style={styles.studyScroll}>
           <ProfileCard profile={profile} onEdit={() => setEditing(true)} />
@@ -16612,6 +20108,7 @@ function ElioraApp() {
                   ["📝 Quiz me", "Quiz me on what I'm learning."],
                   ["📚 Study guide", "Make me a study guide for what I should review."],
                   ["🎬 Study videos", "Recommend me a few study videos for my class."],
+                  ["📱 Short-form recs", "Recommend TikTok, YouTube Shorts, and Instagram accounts or searches for what I'm studying."],
                   ["💡 Suggestions", "Give me a couple of study suggestions."],
                 ] as const
               ).map(([label, msg]) => (
@@ -16680,6 +20177,17 @@ function ElioraApp() {
         </div>
       )}
 
+      {tab === "together" && (
+        <StudyTogether
+          name={
+            session?.user?.name?.trim() ||
+            profile?.name?.trim() ||
+            session?.user?.email?.split("@")[0] ||
+            "Guest"
+          }
+        />
+      )}
+
       {tab === "chat" && (
         <>
       <PlanStrip
@@ -16720,6 +20228,34 @@ function ElioraApp() {
                 : busy && !(i === messages.length - 1 && chatStatus)
                   ? "…"
                   : ""}
+              {m.attachments && m.attachments.length > 0 && (
+                <div
+                  style={{
+                    ...styles.attachStrip,
+                    marginTop: m.content ? 8 : 0,
+                    marginBottom: 0,
+                  }}
+                >
+                  {m.attachments.map((a, ai) => (
+                    <div key={ai} style={styles.msgAttach} title={a.name}>
+                      {a.dataUrl ? (
+                        // eslint-disable-next-line @next/next/no-img-element
+                        <img src={a.dataUrl} alt={a.name} style={styles.msgAttachImg} />
+                      ) : (
+                        <span style={styles.msgAttachFile}>
+                          {a.kind === "video" ? "🎬" : a.kind === "image" ? "🖼️" : "📄"}{" "}
+                          {a.name}
+                        </span>
+                      )}
+                      {a.kind === "video" && a.dataUrl && (
+                        <span style={styles.msgAttachPlay} aria-hidden>
+                          ▶
+                        </span>
+                      )}
+                    </div>
+                  ))}
+                </div>
+              )}
               {/* Live status while tools run — shown even under partial text,
                   since the model often writes a preamble before its tools. */}
               {busy && i === messages.length - 1 && chatStatus && (
@@ -16735,15 +20271,15 @@ function ElioraApp() {
               )}
             </div>
             {m.role === "assistant" && a11y.readAloud && m.content && (
-              <button
-                style={styles.speakBtn}
-                onClick={() => speak(m.content)}
-                aria-label="Read this message aloud"
-              >
-                🔊 Read aloud
-              </button>
+              <SpeakButton text={m.content} />
             )}
             {m.videos && m.videos.length > 0 && <VideoCards videos={m.videos} />}
+            {m.socials && m.socials.length > 0 && (
+              <SocialCards socials={m.socials} />
+            )}
+            {m.examples && m.examples.length > 0 && (
+              <ExampleCards examples={m.examples} />
+            )}
             {m.flashcards && m.flashcards.length > 0 && (
               <FlashcardDeck
                 cards={m.flashcards}
@@ -16790,6 +20326,30 @@ function ElioraApp() {
               </button>
             ),
           )}
+        </div>
+      )}
+
+      {/* Prompted responses from the weak-topic algorithm: ready-to-send chips
+          built from the learner's quiz/flashcard misses (freshest first). */}
+      {missed.length > 0 && (
+        <div
+          style={styles.lessonAsk}
+          role="group"
+          aria-label="Practice a weak spot"
+        >
+          <span style={styles.lessonAskLabel}>🎯 Weak spots</span>
+          {weakTopicPrompts(missed).map((p) => (
+            <button
+              key={p.label}
+              type="button"
+              style={styles.weakChip}
+              disabled={busy || !!pendingKickoff}
+              onClick={() => void send(p.prompt)}
+              title={p.prompt}
+            >
+              {p.label}
+            </button>
+          ))}
         </div>
       )}
 
@@ -16843,9 +20403,77 @@ function ElioraApp() {
         >
           🎥 Record it
         </button>
+        <button
+          type="button"
+          style={styles.quickChip}
+          disabled={busy || !!pendingKickoff}
+          onClick={studyTipInChat}
+          title={
+            input.trim()
+              ? `Get a study tip for “${input.trim()}”`
+              : "Get a quick, practical study tip you can use right now"
+          }
+        >
+          💡 Study tip
+        </button>
       </div>
 
+      {(attachments.length > 0 || attaching) && (
+        <div style={styles.attachStrip} aria-label="Attachments to send">
+          {attachments.map((a, i) => (
+            <div key={i} style={styles.attachChip} title={a.name}>
+              {a.dataUrl ? (
+                // eslint-disable-next-line @next/next/no-img-element
+                <img src={a.dataUrl} alt="" style={styles.attachThumb} />
+              ) : (
+                <span style={styles.attachIcon} aria-hidden>
+                  {a.kind === "video" ? "🎬" : a.kind === "image" ? "🖼️" : "📄"}
+                </span>
+              )}
+              <span style={styles.attachName}>{a.name}</span>
+              {a.kind === "video" && (
+                <span style={styles.attachBadge} aria-hidden>▶</span>
+              )}
+              <button
+                type="button"
+                onClick={() => removeAttachment(i)}
+                style={styles.attachRemove}
+                aria-label={`Remove ${a.name}`}
+              >
+                ✕
+              </button>
+            </div>
+          ))}
+          {attaching && <span style={styles.attachName}>Preparing…</span>}
+        </div>
+      )}
+
       <div style={styles.composer}>
+        <input
+          ref={fileInputRef}
+          type="file"
+          multiple
+          accept="image/*,video/*,.pdf,.txt,.md,.csv,.tsv,.json,.rtf,.html,.htm,.xml,.doc,.docx,.ppt,.pptx,.xls,.xlsx"
+          style={{ display: "none" }}
+          onChange={(e) => {
+            void addFiles(e.target.files);
+            e.target.value = ""; // let the same file be picked again later
+          }}
+        />
+        <button
+          type="button"
+          onClick={() => fileInputRef.current?.click()}
+          disabled={busy || attaching || attachments.length >= MAX_ATTACHMENTS}
+          style={styles.micBtn}
+          aria-label="Attach a photo, file, or video"
+          title={
+            attachments.length >= MAX_ATTACHMENTS
+              ? `You can attach up to ${MAX_ATTACHMENTS} items`
+              : "Attach a photo, file, or video"
+          }
+        >
+          📎
+        </button>
         <textarea
           value={input}
           onChange={(e) => setInput(e.target.value)}
@@ -16853,6 +20481,13 @@ function ElioraApp() {
             if (e.key === "Enter" && !e.shiftKey) {
               e.preventDefault();
               send();
+            }
+          }}
+          onPaste={(e) => {
+            const files = Array.from(e.clipboardData?.files ?? []);
+            if (files.length) {
+              e.preventDefault();
+              void addFiles(files);
             }
           }}
           placeholder="Message Eliora…"
@@ -18335,6 +21970,28 @@ const styles: Record<string, React.CSSProperties> = {
     fontWeight: 700,
     cursor: "pointer",
   },
+  schedSetupBtn: {
+    background: "var(--accent)",
+    color: "#fff",
+    border: "none",
+    borderRadius: 10,
+    padding: "9px 14px",
+    fontSize: 14,
+    fontWeight: 700,
+    cursor: "pointer",
+    marginBottom: 10,
+    width: "100%",
+  },
+  schedSetupPanel: {
+    display: "flex",
+    flexDirection: "column",
+    gap: 12,
+    border: "1px solid var(--border)",
+    borderRadius: 12,
+    padding: 14,
+    marginBottom: 12,
+    background: "var(--surface)",
+  },
   schedList: { display: "flex", flexDirection: "column", gap: 6 },
   schedRow: {
     display: "flex",
@@ -19763,6 +23420,98 @@ const styles: Record<string, React.CSSProperties> = {
     WebkitBoxOrient: "vertical",
   } as React.CSSProperties,
   videoChannel: { display: "block", fontSize: 12, color: "var(--muted)", marginTop: 4 },
+  socialWrap: {
+    display: "grid",
+    gridTemplateColumns: "repeat(auto-fill, minmax(180px, 1fr))",
+    gap: 10,
+    maxWidth: "85%",
+    marginTop: 2,
+  },
+  socialCard: {
+    display: "flex",
+    flexDirection: "column",
+    alignItems: "flex-start",
+    gap: 6,
+    textDecoration: "none",
+    color: "inherit",
+    background: "var(--surface)",
+    border: "1px solid var(--border)",
+    borderRadius: 12,
+    padding: "10px 12px",
+  } as React.CSSProperties,
+  socialBadge: {
+    fontSize: 11,
+    fontWeight: 700,
+    color: "#fff",
+    padding: "3px 8px",
+    borderRadius: 999,
+  },
+  socialTitle: {
+    fontSize: 14,
+    fontWeight: 600,
+    lineHeight: 1.3,
+    color: "var(--assistant-text)",
+  },
+  socialNote: { fontSize: 12, color: "var(--muted)", lineHeight: 1.35 },
+  socialOpen: { fontSize: 12, fontWeight: 600, color: "var(--accent, #2f6f4f)" },
+  // Anonymized peer-example cards ("how other students tackled this")
+  exampleWrap: {
+    display: "flex",
+    flexDirection: "column",
+    gap: 8,
+    maxWidth: "85%",
+    marginTop: 2,
+  } as React.CSSProperties,
+  exampleHeader: {
+    fontSize: 13,
+    fontWeight: 700,
+    color: "var(--muted)",
+  } as React.CSSProperties,
+  exampleCard: {
+    display: "flex",
+    flexDirection: "column",
+    gap: 5,
+    background: "var(--surface)",
+    border: "1px solid var(--border)",
+    borderLeft: "3px solid var(--accent, #2f6f4f)",
+    borderRadius: 12,
+    padding: "10px 12px",
+  } as React.CSSProperties,
+  exampleTopRow: {
+    display: "flex",
+    alignItems: "center",
+    gap: 8,
+    flexWrap: "wrap",
+  } as React.CSSProperties,
+  exampleBadge: {
+    fontSize: 11,
+    fontWeight: 700,
+    color: "#fff",
+    background: "var(--accent, #2f6f4f)",
+    padding: "2px 8px",
+    borderRadius: 999,
+  } as React.CSSProperties,
+  exampleSubject: {
+    fontSize: 11,
+    fontWeight: 600,
+    color: "var(--muted)",
+  } as React.CSSProperties,
+  exampleTopic: {
+    fontSize: 14,
+    fontWeight: 600,
+    color: "var(--assistant-text)",
+    lineHeight: 1.3,
+  } as React.CSSProperties,
+  exampleProblem: {
+    fontSize: 13,
+    color: "var(--muted)",
+    lineHeight: 1.4,
+  } as React.CSSProperties,
+  exampleApproach: {
+    fontSize: 13,
+    color: "var(--assistant-text)",
+    lineHeight: 1.4,
+  } as React.CSSProperties,
   // Video feed tab
   feedGrid: {
     display: "grid",
@@ -20897,6 +24646,18 @@ const styles: Record<string, React.CSSProperties> = {
     fontWeight: 600,
     cursor: "pointer",
   },
+  weakChip: {
+    padding: "5px 12px",
+    borderRadius: 999,
+    borderWidth: 1,
+    borderStyle: "solid",
+    borderColor: "var(--accent)",
+    background: "var(--bg-accent-soft, rgba(111,207,151,0.12))",
+    color: "var(--accent)",
+    fontSize: 13,
+    fontWeight: 600,
+    cursor: "pointer",
+  },
   teachLevelGroup: {
     display: "inline-flex",
     flexWrap: "wrap",
@@ -20976,6 +24737,93 @@ const styles: Record<string, React.CSSProperties> = {
   micBtnActive: {
     background: "#fdecea",
     borderColor: "#e5534b",
+  },
+  // Chat attachments (composer staging strip + in-bubble thumbnails)
+  attachStrip: {
+    display: "flex",
+    flexWrap: "wrap",
+    gap: 8,
+    alignItems: "center",
+    padding: "8px 0 0",
+    marginBottom: 2,
+  },
+  attachChip: {
+    display: "inline-flex",
+    alignItems: "center",
+    gap: 6,
+    maxWidth: 220,
+    padding: "4px 6px 4px 4px",
+    borderRadius: 10,
+    border: "1px solid var(--border-strong)",
+    background: "var(--surface)",
+    position: "relative",
+  },
+  attachThumb: {
+    width: 32,
+    height: 32,
+    borderRadius: 6,
+    objectFit: "cover",
+    display: "block",
+  },
+  attachIcon: {
+    width: 32,
+    height: 32,
+    display: "inline-flex",
+    alignItems: "center",
+    justifyContent: "center",
+    fontSize: 18,
+  },
+  attachName: {
+    fontSize: 12,
+    color: "var(--muted)",
+    whiteSpace: "nowrap",
+    overflow: "hidden",
+    textOverflow: "ellipsis",
+    maxWidth: 130,
+  },
+  attachBadge: {
+    fontSize: 9,
+    color: "var(--muted)",
+  },
+  attachRemove: {
+    border: "none",
+    background: "transparent",
+    color: "var(--muted)",
+    cursor: "pointer",
+    fontSize: 12,
+    lineHeight: 1,
+    padding: 2,
+  },
+  msgAttach: {
+    position: "relative",
+    display: "inline-flex",
+    alignItems: "center",
+  },
+  msgAttachImg: {
+    maxWidth: 200,
+    maxHeight: 200,
+    borderRadius: 10,
+    objectFit: "cover",
+    display: "block",
+  },
+  msgAttachFile: {
+    display: "inline-flex",
+    alignItems: "center",
+    gap: 4,
+    padding: "6px 10px",
+    borderRadius: 10,
+    background: "rgba(0,0,0,0.06)",
+    fontSize: 13,
+  },
+  msgAttachPlay: {
+    position: "absolute",
+    top: "50%",
+    left: "50%",
+    transform: "translate(-50%,-50%)",
+    color: "#fff",
+    fontSize: 22,
+    textShadow: "0 1px 4px rgba(0,0,0,0.6)",
+    pointerEvents: "none",
   },
   // Teach-back video recorder
   recCloseBtn: {

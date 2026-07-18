@@ -4,9 +4,23 @@
 
 export type Role = "user" | "assistant";
 
+// A file/photo/video the learner attached to a chat message. Images (and a
+// still frame grabbed from a video) travel as a base64 data URL so the vision
+// model can actually see them; text-based files travel as extracted `text`.
+// `note` carries a short human hint for anything the model can't read directly.
+export interface ChatAttachment {
+  kind: "image" | "video" | "file";
+  name: string;
+  mime: string;
+  dataUrl?: string; // base64 data URL — an image, or a frame grabbed from a video
+  text?: string; // extracted text, for text-based files
+  note?: string; // extra context, e.g. "video · 0:42" or "PDF — can't read directly"
+}
+
 export interface ChatMessage {
   role: Role;
   content: string;
+  attachments?: ChatAttachment[];
 }
 
 // Collected during sign-up (the survey) instead of being asked in chat.
@@ -43,7 +57,13 @@ export interface PlanMilestone {
 }
 
 // An important date on the learner's calendar.
-export type EventKind = "exam" | "final" | "quiz" | "assignment" | "other";
+export type EventKind =
+  | "exam"
+  | "final"
+  | "quiz"
+  | "assignment"
+  | "project"
+  | "other";
 export interface StudyEvent {
   id: string;
   title: string;
@@ -387,11 +407,15 @@ clearly meant, but never add new content they didn't write.`;
 
   const task =
     mode === "handwriting"
-      ? `The student uploaded a PHOTO or scan of HANDWRITTEN notes. First read \
-and transcribe the handwriting as faithfully as you can. If a word is genuinely \
-unreadable, write [?] rather than guessing. Then lightly clean it up: fix obvious \
-spelling and spacing, and organize it into clear markdown headings and bullets \
-without changing the meaning.`
+      ? `The student uploaded a PHOTO or scan of HANDWRITTEN notes — likely messy, \
+rushed, or hard to read. First read and transcribe the handwriting. Then clean it \
+up thoroughly so it's easy to study from: fix spelling, grammar, spacing, and \
+capitalization; resolve messy or half-formed words from context (a word that's \
+smudged or scrawled but clear from the surrounding sentence should be written out \
+correctly); spell out abbreviations the student clearly meant; and organize \
+everything into clear markdown headings and bullets. Keep every real point they \
+made and never change their meaning or invent facts. Only when a word is genuinely \
+unrecoverable — not just messy — write [?] rather than guessing.`
       : mode === "highlight"
         ? `The notes may already be readable — your main job is to surface the KEY \
 IDEAS. Keep the student's content, tidy it into clean markdown headings and \
@@ -900,9 +924,101 @@ ${lines}`;
 }
 
 // Study tools.
+// A flashcard's learning FORMAT. Every style keeps the same {front, back}
+// shape — the style changes how the card is WRITTEN and how the deck labels
+// each side:
+//   basic    — front: a term,       back: its plain definition
+//   reversed — front: a definition, back: the term it names
+//   qa       — front: a question,   back: the answer
+//   cloze    — front: a sentence with the key word blanked as "____",
+//              back: the missing word(s)
+//   example  — front: a concept,    back: a concrete worked example of it
+export type FlashcardStyle = "basic" | "reversed" | "qa" | "cloze" | "example";
 export interface Flashcard {
   front: string;
   back: string;
+  style?: FlashcardStyle; // defaults to "basic" when absent
+}
+
+// UI + prompt metadata per style. `front`/`back` are the labels the deck shows
+// above each side; `blurb` guides the model when it writes cards in that style.
+export const FLASHCARD_STYLES: {
+  key: FlashcardStyle;
+  label: string;
+  emoji: string;
+  front: string;
+  back: string;
+  blurb: string;
+}[] = [
+  {
+    key: "basic",
+    label: "Term → Definition",
+    emoji: "🃏",
+    front: "Term",
+    back: "Definition",
+    blurb: "front is a key term, back is its plain-language definition",
+  },
+  {
+    key: "reversed",
+    label: "Definition → Term",
+    emoji: "🔄",
+    front: "Definition",
+    back: "Term",
+    blurb: "front is a definition or description, back is the term it names",
+  },
+  {
+    key: "qa",
+    label: "Question & Answer",
+    emoji: "❓",
+    front: "Question",
+    back: "Answer",
+    blurb: "front is a clear question, back is the answer",
+  },
+  {
+    key: "cloze",
+    label: "Fill in the blank",
+    emoji: "✏️",
+    front: "Fill in the blank",
+    back: "Answer",
+    blurb:
+      'front is a sentence with the key word replaced by a blank like "____", back is the missing word(s)',
+  },
+  {
+    key: "example",
+    label: "Concept → Example",
+    emoji: "💡",
+    front: "Concept",
+    back: "Example",
+    blurb: "front is a concept, back is a concrete worked example that shows it",
+  },
+];
+
+const FLASHCARD_STYLE_KEYS = FLASHCARD_STYLES.map((s) => s.key);
+
+// Look up a style's metadata; falls back to "basic" for missing/unknown styles.
+export function flashcardStyleMeta(style?: FlashcardStyle) {
+  return FLASHCARD_STYLES.find((s) => s.key === style) ?? FLASHCARD_STYLES[0];
+}
+
+// Accept a style string from the model / a request only if it's a known style.
+export function normalizeFlashcardStyle(
+  style?: string,
+): FlashcardStyle | undefined {
+  return FLASHCARD_STYLE_KEYS.includes(style as FlashcardStyle)
+    ? (style as FlashcardStyle)
+    : undefined;
+}
+
+// A sentence for a generation prompt describing the flashcard styles. When a
+// `style` is given, force every card into it; otherwise let the model vary.
+export function flashcardStylesPromptHint(style?: FlashcardStyle): string {
+  if (style) {
+    const m = flashcardStyleMeta(style);
+    return ` Make EVERY card in the "${m.label}" style — ${m.blurb} — and set each card's "style" to "${m.key}".`;
+  }
+  return ` Vary the card style to fit each fact — set each card's "style" to one of: ${FLASHCARD_STYLES.map(
+    (s) => `"${s.key}" (${s.blurb})`,
+  ).join("; ")}. A mix is good; pick whichever suits each card best.`;
 }
 export interface QuizQuestion {
   question: string;
@@ -1012,6 +1128,19 @@ export interface Mistake {
   createdAt: string; // ISO timestamp first seen
   lastSeen: string; // ISO timestamp most recently seen
   resolved: boolean; // learner has since mastered it
+}
+
+// A short, ANONYMIZED worked example from another learner's session — how a
+// similar problem was approached — that Eliora can surface to help the current
+// learner. Stored server-side (apps/web/lib/examples.ts), never tied to a name.
+export interface StudentExample {
+  id: string;
+  subject?: string; // class/subject, e.g. "Algebra 1"
+  topic: string; // what it's about, e.g. "solving two-step equations"
+  problem: string; // the kind of problem another student was stuck on
+  approach: string; // the approach/steps that helped them work through it
+  tags?: string[]; // extra keywords for matching
+  createdAt: string; // ISO timestamp
 }
 
 export interface ChatRequest {
@@ -1642,6 +1771,59 @@ they push.
   now?" Frame it as helping them actually learn (and not get flagged), never as
   a lecture. Then give the next hint.
 
+## Ask, don't tell — the Socratic method
+Default to GUIDING QUESTIONS over statements. When the learner is working through
+a problem or concept, lead them to the answer with questions instead of handing
+it over. A good Socratic question makes them do the next bit of thinking.
+- ASK ONE QUESTION AT A TIME, then STOP and wait for their reply. Never stack a
+  list of questions or ask a question and immediately answer it yourself. One
+  question, then the ball is in their court (this also keeps ADHD overwhelm low).
+- START FROM WHERE THEY ARE. First find out what they already know or think:
+  "What's your first instinct here?", "What does this word mean to you?", "Which
+  part feels stuck?" Build the next question on their answer.
+- USE QUESTIONS THAT UNCOVER THINKING, e.g.:
+  • Get started: "What's the very first thing you'd try?", "What is the problem
+    actually asking for?"
+  • Probe reasoning: "Why do you think that?", "How did you get there?", "What
+    makes you say so?"
+  • Test an idea: "What would happen if…?", "Does that hold if we change…?", "Can
+    you think of a case where that wouldn't work?"
+  • Connect: "Where have you seen something like this before?", "How is this like
+    the last problem you did?"
+  • Reflect: "How could you check whether that's right?", "How would you explain
+    that to a friend?"
+- WHEN THEY'RE WRONG, don't just correct — ask a question that lets them SPOT it
+  themselves: "Walk me through that step — what happens to the sign here?" Let the
+  discovery be theirs; it sticks far better than being told.
+- WHEN THEY'RE RIGHT, ask them to justify it ("How do you know?") so understanding
+  is real, not a lucky guess — then celebrate.
+- DON'T interrogate. Keep it warm, curious, and low-pressure — you're thinking
+  WITH them, not quizzing them. If they're genuinely stuck after a couple of
+  tries, give a small hint or teach the concept plainly, then return to a
+  question. The goal is understanding, not withholding help.
+- KNOW WHEN TO JUST ANSWER. Straight factual lookups, definitions, venting, or
+  when they're frustrated and need reassurance — answer directly and kindly.
+  Socratic questioning is for building understanding of a skill or concept, not
+  for stonewalling every question.
+
+## Learn from how other students solved it
+When the learner is stuck on a specific problem or concept, you can pull up
+ANONYMIZED examples from other students who worked through something similar and
+use them to guide THIS learner:
+- CALL find_student_examples with the topic (and subject) to see how peers
+  approached it. The app shows the matches to the learner as small "how another
+  student tackled this" cards, so you do NOT need to re-list them as plain text —
+  instead weave the useful idea into your next hint ("another student who got
+  stuck here started by…"). It's a parallel example to spark THEIR next step,
+  never the finished answer to copy.
+- These examples are anonymous — never invent a student's name or personal
+  details, and don't claim to know who they were.
+- AFTER you help THIS learner genuinely work through a problem, call
+  save_student_example with a short, fully anonymized write-up (subject, topic,
+  the kind of problem, and the approach that helped) so the next student stuck on
+  the same thing can benefit. Strip anything identifying — no names, no personal
+  details, no specifics that could point back to one person.
+
 ## How you work
 1. ONBOARD gently. IF a "Learner profile" section is provided below, SKIP this
    survey entirely — you already have these answers; greet them, then (unless
@@ -1758,6 +1940,17 @@ they push.
      matches what they're studying.
    - Never invent specific video IDs yourself — only rely on the search_youtube
      tool for real videos, or a search link.
+   - SHORT-FORM RECS (TikTok / YouTube Shorts / Instagram Reels). When the
+     learner wants quick, bite-sized explainers, mentions TikTok/Instagram/
+     Reels/short videos, or would benefit from variety, call recommend_socials.
+     Give 3–6 items across at least two platforms, each with a concrete thing to
+     search for — a phrase, a well-known educational creator (@handle), or a
+     hashtag (#apbiology) — plus a one-line note on why it helps. The app turns
+     each into a card that opens that platform's search, so don't paste raw
+     URLs; just introduce them in a sentence. Favor reputable, school-safe
+     creators. This tool returns no real clips (TikTok/Instagram have no search
+     API) — never claim you found a specific short; you're pointing them to a
+     search.
    - READ LINKS THE LEARNER SHARES. If they paste a URL (an article, study
      guide, assignment page, rubric, etc.) or ask about a specific link, call
      the fetch_link tool to read the page BEFORE answering — never guess at
@@ -1787,6 +1980,29 @@ they push.
      Notes tab (or the chat) — then build the material straight from that text.
      If they don't have the transcript, you may still build from his AP unit
      framework, but say it's based on the standard AP topics, not his exact words.
+   - STUDY TIPS: while the learner is studying, drop in ONE short, practical study
+     tip that fits the moment — a proven technique they can use right now, not
+     generic advice. Weave it in naturally as they work (e.g. right before a review
+     step, when they start a new topic, or when they seem stuck), never as a wall of
+     tips. Keep each to a sentence or two, tie it to what they're doing, and match it
+     to how they learn and what they struggle with. Draw from proven methods, e.g.:
+       • Active recall — close the notes and try to say/write it from memory, then
+         check. Beats re-reading.
+       • Spaced repetition — revisit a topic after a day, then a few days, so it
+         sticks (their flashcards + the mistake tracker do this).
+       • The Feynman technique — explain it in plain words as if teaching a kid; the
+         gaps you hit are what to review (this is the teach-back).
+       • Interleaving — mix a few topics/problem types in a session instead of
+         drilling one, so you learn to pick the right method.
+       • Pomodoro / timeboxing — a short focused sprint, then a break (point them to
+         the app's focus timer).
+       • Practice testing — do problems and quizzes, not just reading — retrieval is
+         what builds memory.
+       • Chunk it — break big material into small pieces and learn one at a time.
+       • Best conditions — phone in another room, water nearby, one tab, good sleep
+         before a test beats a late cram.
+     Offer the tip, then hand the step back to them. One tip at a time (ADHD: avoid
+     overwhelm).
    - REVISION: always loop back on what they got wrong (see "Needs revision").
      Re-teach it a new way, then make a quick quiz or flashcards on just those.
    - SUGGESTIONS: base every suggestion on what THIS learner struggles with —
@@ -1868,6 +2084,7 @@ export type SummaryOutput = "summary" | "studyguide" | "flashcards" | "quiz";
 export interface SummarizeRequest {
   source: SummarySource;
   output?: SummaryOutput; // what to make from the material (default: summary)
+  flashcardStyle?: FlashcardStyle; // for output "flashcards": force one style
   text?: string; // pasted notes/text, or a decoded text file
   url?: string; // a video URL (source = "video")
   fileBase64?: string; // base64 contents for source = "doc" (pdf/image)
@@ -1964,6 +2181,7 @@ function learnerTailor(profile?: LearnerProfile): string {
 export function outputSystemPrompt(
   output: SummaryOutput,
   profile?: LearnerProfile,
+  flashcardStyle?: FlashcardStyle,
 ): string {
   if (output === "summary") return summarySystemPrompt(profile);
 
@@ -2002,9 +2220,10 @@ short and words plain; never a wall of text.${tailor}`;
 
   if (output === "flashcards")
     return `${ground}
-Create flashcards covering the key facts, terms, and ideas in the material. Each \
-card: a short front (a term or question) and a simple, correct back drawn straight \
-from the material. Call the make_flashcards tool with the cards.${tailor}`;
+Create flashcards covering the key facts, terms, and ideas in the material. Keep \
+each front short and the back simple, correct, and drawn straight from the \
+material.${flashcardStylesPromptHint(flashcardStyle)} Call the make_flashcards tool \
+with the cards.${tailor}`;
 
   // quiz
   return `${ground}
@@ -2193,6 +2412,160 @@ or too unclear to grade fairly, say so and ask for more instead of guessing. \
 Return everything via the give_project_feedback tool.${tailor}`;
 }
 
+// ── School-app import ────────────────────────────────────────────────────────
+// Bring assignments, due dates, classes, and events in from ANY school app
+// (Google Classroom, Canvas, Schoology, PowerSchool…) WITHOUT accounts or OAuth.
+// Two paths feed the SAME shape so the learner previews one list either way:
+//   • a calendar feed — every school LMS can export an .ics URL or file
+//   • pasted text / CSV — a copy of the portal or a grade export, parsed by AI
+// Everything lands as SchoolImportItem[] the learner reviews, then imports into
+// the existing assignments / calendar / subjects stores (all still client-side).
+
+export type SchoolImportKind = EventKind; // exam | final | quiz | assignment | other
+
+export interface SchoolImportItem {
+  // "assignment" → a to-do with a due date (goes to the assignments list)
+  // "event"      → a dated calendar item, e.g. an exam/quiz (goes to the calendar)
+  type: "assignment" | "event";
+  title: string;
+  date?: string; // YYYY-MM-DD
+  subject?: string;
+  kind?: SchoolImportKind;
+}
+
+export interface SchoolCourseGrade {
+  course: string;
+  grade: string; // letter or percent exactly as written: "A-", "88%", "3.7"
+}
+
+export interface SchoolImport {
+  items: SchoolImportItem[];
+  classes: string[];
+  grades: SchoolCourseGrade[];
+}
+
+// Unescape an iCalendar TEXT value (RFC 5545 §3.3.11).
+function icsUnescape(v: string): string {
+  return v
+    .replace(/\\n/gi, " ")
+    .replace(/\\,/g, ",")
+    .replace(/\\;/g, ";")
+    .replace(/\\\\/g, "\\")
+    .trim();
+}
+
+// Pull YYYY-MM-DD out of an iCal date/date-time value ("20260918", "20260918T130000Z").
+function icsDate(v: string): string | undefined {
+  const m = v.match(/(\d{4})(\d{2})(\d{2})/);
+  return m ? `${m[1]}-${m[2]}-${m[3]}` : undefined;
+}
+
+// Minimal, dependency-free iCalendar parser. Unfolds RFC-5545 line folding
+// (a CRLF/LF followed by a space or tab continues the previous line), then pulls
+// each VEVENT's SUMMARY / DTSTART / DUE / DESCRIPTION. Good enough for the feeds
+// Google Classroom / Canvas / Schoology / PowerSchool export (plain VEVENTs).
+export function parseIcs(
+  raw: string,
+): { title: string; date?: string; description?: string }[] {
+  if (!raw || !/BEGIN:VCALENDAR/i.test(raw)) return [];
+  const unfolded = raw.replace(/\r?\n[ \t]/g, "");
+  const lines = unfolded.split(/\r?\n/);
+  const events: { title: string; date?: string; description?: string }[] = [];
+  let cur:
+    | { title?: string; dtstart?: string; due?: string; description?: string }
+    | null = null;
+  for (const line of lines) {
+    if (/^BEGIN:VEVENT/i.test(line)) {
+      cur = {};
+      continue;
+    }
+    if (/^END:VEVENT/i.test(line)) {
+      // Prefer an explicit DUE date (assignments) over DTSTART (when it happens).
+      if (cur?.title) {
+        events.push({
+          title: cur.title,
+          date: cur.due || cur.dtstart,
+          description: cur.description,
+        });
+      }
+      cur = null;
+      continue;
+    }
+    if (!cur) continue;
+    const colon = line.indexOf(":");
+    if (colon < 0) continue;
+    // The property name may carry ;PARAMS before the first colon.
+    const name = line.slice(0, colon).split(";")[0].toUpperCase();
+    const value = line.slice(colon + 1);
+    if (name === "SUMMARY") cur.title = icsUnescape(value);
+    else if (name === "DESCRIPTION") cur.description = icsUnescape(value);
+    else if (name === "DTSTART") cur.dtstart = icsDate(value);
+    else if (name === "DUE") cur.due = icsDate(value);
+  }
+  return events;
+}
+
+// Guess a course/subject prefix from a feed title like "AP Biology: Lab 3",
+// "Math 101 - HW 4", or "[Chemistry] Quiz". Returns undefined when unclear.
+export function guessSchoolSubject(title: string): string | undefined {
+  const m =
+    title.match(/^\s*\[([^\]]{2,40})\]/) ||
+    title.match(/^([^:\-–—]{2,40}?)\s*[:\-–—]\s+\S/);
+  const s = (m?.[1] ?? "").trim();
+  return s && s.length <= 40 ? s : undefined;
+}
+
+// Classify one feed item: exams/finals/quizzes are dated things that HAPPEN
+// (→ calendar events); homework/projects/anything else with a due date is a
+// to-do (→ assignments). Also guesses the subject from the title.
+export function classifySchoolItem(
+  title: string,
+  description?: string,
+): { type: "assignment" | "event"; kind: SchoolImportKind; subject?: string } {
+  const hay = `${title} ${description ?? ""}`.toLowerCase();
+  let kind: SchoolImportKind = "other";
+  if (/\bfinal\b/.test(hay)) kind = "final";
+  else if (/\bmidterm\b|\bexam\b|\btest\b/.test(hay)) kind = "exam";
+  else if (/\bquiz\b/.test(hay)) kind = "quiz";
+  else if (/\b(project|capstone|thesis|dissertation)\b/.test(hay))
+    kind = "project";
+  else if (
+    /\b(assignment|homework|hw|essay|paper|lab|worksheet|problem set|pset|reading|due|turn in|submit)\b/.test(
+      hay,
+    )
+  )
+    kind = "assignment";
+  const type =
+    kind === "exam" || kind === "final" || kind === "quiz"
+      ? "event"
+      : "assignment";
+  return { type, kind, subject: guessSchoolSubject(title) };
+}
+
+// System prompt for the pasted-text / CSV path of the school importer.
+export function schoolImportPrompt(profile?: LearnerProfile): string {
+  const ctx = profile?.klass
+    ? `\nThe learner's main class is "${profile.klass}" — prefer it when a subject is ambiguous.`
+    : "";
+  return `You extract school data from whatever a student pastes — a copy of their \
+school portal or LMS, a class schedule, an assignment list, a CSV export, or a \
+grade report. Pull out four things and return them via the extract_school_data \
+tool:
+- classes: the distinct course/class names (e.g. "AP Biology", "Algebra II"). \
+Deduplicate; do NOT include teacher names, room numbers, or periods.
+- assignments: homework / projects / papers / labs / readings that are to be \
+DONE — each with a title, the subject/class if known, and a due date if one is \
+given.
+- events: dated things that HAPPEN on a specific day — exams, finals, quizzes, \
+presentations — each with a title, date, and kind (exam/final/quiz/assignment/other).
+- grades: any course grades shown, each as the course name plus the grade EXACTLY \
+as written (a letter like "A-" or a percent like "88%").
+All dates MUST be YYYY-MM-DD. If a date has no year, assume the nearest FUTURE \
+date relative to today. Skip anything you are not confident is real — NEVER \
+invent assignments, dates, classes, or grades. If a category has nothing, return \
+an empty list for it.${ctx}`;
+}
+
 // OpenAI models (this project has the gpt-5 family + gpt-4o-mini; not gpt-4o).
 // Coaching + tool use needs nuance, so it uses gpt-5-mini. Summarizing is easy
 // and high-volume, so it uses the cheaper gpt-4o-mini. Swap chat to "gpt-5" for
@@ -2201,5 +2574,221 @@ Return everything via the give_project_feedback tool.${tailor}`;
 export const ELIORA_CHAT_MODEL = "gpt-5-mini";
 export const ELIORA_SUMMARY_MODEL = "gpt-4o-mini";
 
+// Natural-sounding text-to-speech ("read aloud"). gpt-4o-mini-tts is the
+// current low-cost, high-quality OpenAI voice model; "nova" is a warm,
+// friendly voice that suits a study coach.
+export const ELIORA_TTS_MODEL = "gpt-4o-mini-tts";
+export const ELIORA_TTS_VOICE = "nova";
+// Voices the OpenAI speech API accepts, for a picker in Settings.
+export const ELIORA_TTS_VOICES = [
+  "alloy",
+  "ash",
+  "ballad",
+  "coral",
+  "echo",
+  "fable",
+  "nova",
+  "onyx",
+  "sage",
+  "shimmer",
+] as const;
+export type ElioraTtsVoice = (typeof ELIORA_TTS_VOICES)[number];
+
 // Back-compat alias (chat model).
 export const ELIORA_MODEL = ELIORA_CHAT_MODEL;
+
+// ---------------------------------------------------------------------------
+// Study Together — shared study rooms
+// ---------------------------------------------------------------------------
+// Real-time-ish study rooms so learners can focus alongside each other. Eliora
+// has no database or websockets, so a room is just a small JSON record on the
+// server (see apps/web/lib/rooms.ts) that clients poll a few times a second.
+// The shared pomodoro timer is stored as a phase + start time, so every client
+// derives the same remaining seconds locally from the server clock — no ticks
+// need to be pushed. Presence is "who sent a heartbeat recently".
+
+export type TogetherTimerMode = "focus" | "break" | "idle";
+
+// The shared pomodoro. `startedAt` is the epoch-ms the current phase began;
+// `durationSec` is how long the phase lasts. When paused, `remainingSec` holds
+// the frozen time left so resuming picks up where it stopped.
+export interface TogetherTimer {
+  mode: TogetherTimerMode;
+  running: boolean;
+  startedAt?: number; // epoch ms when the running phase began
+  durationSec: number; // length of the current phase, seconds
+  remainingSec?: number; // frozen time left while paused
+  updatedBy?: string; // name of whoever last changed it
+}
+
+export interface TogetherMember {
+  id: string; // stable per-device id
+  name: string;
+  lastSeen: number; // epoch ms of last heartbeat
+}
+
+export interface TogetherMessage {
+  id: string;
+  memberId: string;
+  name: string;
+  text: string;
+  at: number; // epoch ms
+}
+
+export interface TogetherRoom {
+  code: string; // short join code, e.g. "SNAIL7"
+  name: string;
+  topic?: string; // what the room is working on
+  createdAt: number;
+  timer: TogetherTimer;
+  members: TogetherMember[];
+  messages: TogetherMessage[];
+}
+
+// Default pomodoro lengths.
+export const TOGETHER_FOCUS_SEC = 25 * 60;
+export const TOGETHER_BREAK_SEC = 5 * 60;
+
+// A member counts as "present" if their last heartbeat was within this window.
+// Poll faster than this (a few seconds) so members don't flicker out.
+export const TOGETHER_PRESENCE_MS = 20_000;
+
+// Room codes: unambiguous chars only (no O/0, I/1) so they're easy to read out.
+export const TOGETHER_CODE_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
+export const TOGETHER_CODE_LENGTH = 6;
+
+export function isValidRoomCode(code: unknown): code is string {
+  return (
+    typeof code === "string" &&
+    new RegExp(`^[${TOGETHER_CODE_ALPHABET}]{${TOGETHER_CODE_LENGTH}}$`).test(
+      code.trim().toUpperCase(),
+    )
+  );
+}
+
+// Seconds left on the shared timer, derived from the server clock so every
+// client agrees. Pass `now` (Date.now()) from the caller.
+export function togetherRemainingSec(timer: TogetherTimer, now: number): number {
+  if (timer.mode === "idle") return 0;
+  if (!timer.running) return timer.remainingSec ?? timer.durationSec;
+  if (!timer.startedAt) return timer.durationSec;
+  const elapsed = Math.floor((now - timer.startedAt) / 1000);
+  return Math.max(0, timer.durationSec - elapsed);
+}
+
+// Format seconds as "MM:SS" for the timer face.
+export function formatTogetherClock(totalSec: number): string {
+  const s = Math.max(0, Math.floor(totalSec));
+  const m = Math.floor(s / 60);
+  const r = s % 60;
+  return `${m}:${r.toString().padStart(2, "0")}`;
+}
+
+// Members seen within the presence window, most-recent first.
+export function togetherPresentMembers(
+  room: TogetherRoom,
+  now: number,
+): TogetherMember[] {
+  return room.members
+    .filter((m) => now - m.lastSeen < TOGETHER_PRESENCE_MS)
+    .sort((a, b) => b.lastSeen - a.lastSeen);
+}
+
+// ---------------------------------------------------------------------------
+// Shared folders — a study space two friends keep in sync
+// ---------------------------------------------------------------------------
+// Like Study Together (above), a shared folder is a small JSON record on the
+// server (see apps/web/lib/folders.ts) identified by a short join code. But
+// unlike a room it's meant to *last*: friends in the same class share one
+// folder and keep it stocked with upcoming tests, projects, and assignments,
+// plus free-form notes ("Mr. Lee said the essay is 800 words"). Everyone with
+// the code can add, check off, and remove items; clients poll for changes the
+// same way rooms do. It's a lightweight collaboration space, not an account
+// system — the code is the only key, so treat it like a shared password.
+
+// The four things a shared-folder item can be. `note` is a catch-all for
+// free-form info that isn't a dated deliverable.
+export type FolderItemKind = "test" | "project" | "assignment" | "note";
+
+export const FOLDER_ITEM_KINDS: readonly FolderItemKind[] = [
+  "test",
+  "project",
+  "assignment",
+  "note",
+];
+
+// Human labels + an emoji per kind, for chips and pickers in the UI.
+export const FOLDER_ITEM_KIND_META: Record<
+  FolderItemKind,
+  { label: string; emoji: string }
+> = {
+  test: { label: "Test", emoji: "📝" },
+  project: { label: "Project", emoji: "🛠️" },
+  assignment: { label: "Assignment", emoji: "📚" },
+  note: { label: "Note", emoji: "📌" },
+};
+
+// One entry in a shared folder. `due` drives ordering and the "soon" chips;
+// `details` holds whatever context friends jot down (rubric, page count, what
+// the test covers). `done` lets the group tick things off together.
+export interface FolderItem {
+  id: string;
+  kind: FolderItemKind;
+  title: string;
+  subject?: string; // class this belongs to (e.g. "AP Bio")
+  due?: string; // YYYY-MM-DD (optional; notes usually have none)
+  details?: string; // free-form context, links, what it covers
+  done: boolean;
+  addedBy: string; // display name of whoever added it
+  addedById: string; // stable member id of the adder
+  createdAt: number; // epoch ms
+  updatedAt: number; // epoch ms, bumped on any edit/toggle
+}
+
+export interface FolderMember {
+  id: string; // stable per-device id
+  name: string;
+  lastSeen: number; // epoch ms of last heartbeat
+}
+
+export interface SharedFolder {
+  code: string; // short join code, e.g. "MATH42"
+  name: string; // what the group calls it, e.g. "AP Bio squad"
+  createdAt: number;
+  members: FolderMember[];
+  items: FolderItem[];
+}
+
+// A member counts as "here" if seen within this window (matches rooms). Folders
+// don't need presence for correctness, but it's nice to show who's around.
+export const FOLDER_PRESENCE_MS = 30_000;
+
+// Join codes reuse the room alphabet (no ambiguous chars) and length so both
+// features feel the same and the input rules line up.
+export const FOLDER_CODE_ALPHABET = TOGETHER_CODE_ALPHABET;
+export const FOLDER_CODE_LENGTH = TOGETHER_CODE_LENGTH;
+
+export function isValidFolderCode(code: unknown): code is string {
+  return (
+    typeof code === "string" &&
+    new RegExp(`^[${FOLDER_CODE_ALPHABET}]{${FOLDER_CODE_LENGTH}}$`).test(
+      code.trim().toUpperCase(),
+    )
+  );
+}
+
+// Order items the way a study group reads them: things still to do first (by
+// soonest due date, undated last), then anything checked off. Stable within a
+// tie by creation time so the list doesn't jump around between polls.
+export function sortFolderItems(items: FolderItem[]): FolderItem[] {
+  const rank = (it: FolderItem): number => {
+    if (it.done) return Number.MAX_SAFE_INTEGER;
+    return it.due ? new Date(`${it.due}T00:00:00`).getTime() : Number.MAX_SAFE_INTEGER - 1;
+  };
+  return [...items].sort((a, b) => {
+    const ra = rank(a);
+    const rb = rank(b);
+    if (ra !== rb) return ra - rb;
+    return a.createdAt - b.createdAt;
+  });
+}

@@ -386,8 +386,14 @@ Return your feedback by calling the give_feedback tool.`;
 
 export type NotesPolishMode = "clean" | "handwriting" | "highlight";
 
+// How the cleaned notes should be structured. "outline" is the classic
+// headings-and-bullets shape; the others reshape the same content for
+// different ways of studying.
+export type NotesFormat = "outline" | "cornell" | "paragraph" | "qa";
+
 export interface NotesPolishRequest {
   mode: NotesPolishMode;
+  format?: NotesFormat; // defaults to "outline"
   text?: string; // pasted messy notes, or a decoded text file
   fileBase64?: string; // base64 image/pdf/text (e.g. a photo of handwriting)
   fileMediaType?: string; // e.g. "image/jpeg", "application/pdf"
@@ -395,9 +401,28 @@ export interface NotesPolishRequest {
   profile?: LearnerProfile;
 }
 
+const NOTES_FORMAT_RULES: Record<NotesFormat, string> = {
+  outline: `Structure "cleaned" as a study OUTLINE: a ## heading per topic \
+with short - bullets underneath (nest sub-bullets where it helps).`,
+  cornell: `Structure "cleaned" in CORNELL style with exactly three sections: \
+"## Cues" — 3–8 short recall questions or prompt words a student could quiz \
+themselves with; "## Notes" — the cleaned-up notes as bullets grouped under \
+**bold** topic lines; "## Summary" — 2–4 sentences in plain words capturing \
+the whole page. Every cue must be answerable from the Notes section, and all \
+three sections are REQUIRED — never skip the final ## Summary.`,
+  paragraph: `Structure "cleaned" as flowing PARAGRAPHS: a ## heading per \
+topic followed by 2–5 connected sentences of clear prose — no bullet lists. \
+Turn fragments into full sentences without adding new facts.`,
+  qa: `Structure "cleaned" as QUESTION & ANSWER pairs for self-quizzing: \
+under a ## heading per topic, write each point as "**Q:** …" on one line and \
+"**A:** …" on the next. Turn every real point in the notes into a pair; the \
+answers must come only from the notes.`,
+};
+
 export function notesPolishSystemPrompt(
   mode: NotesPolishMode,
   profile?: LearnerProfile,
+  format: NotesFormat = "outline",
 ): string {
   const ground = `You are Eliora, a warm study coach helping a student tidy up \
 their notes. Work ONLY from what the student gives you. Do NOT invent facts, \
@@ -413,26 +438,27 @@ up thoroughly so it's easy to study from: fix spelling, grammar, spacing, and \
 capitalization; resolve messy or half-formed words from context (a word that's \
 smudged or scrawled but clear from the surrounding sentence should be written out \
 correctly); spell out abbreviations the student clearly meant; and organize \
-everything into clear markdown headings and bullets. Keep every real point they \
-made and never change their meaning or invent facts. Only when a word is genuinely \
+everything into the FORMAT described below. Keep every real point they made and \
+never change their meaning or invent facts. Only when a word is genuinely \
 unrecoverable — not just messy — write [?] rather than guessing.`
       : mode === "highlight"
         ? `The notes may already be readable — your main job is to surface the KEY \
-IDEAS. Keep the student's content, tidy it into clean markdown headings and \
-bullets, and mark the most important takeaways so they stand out (see the \
+IDEAS. Keep the student's content, tidy it into the FORMAT described below, and \
+mark the most important takeaways so they stand out (see the \
 highlight rule below). Be generous but not indiscriminate with highlights here — \
 this mode is about making the key ideas pop.`
         : `The student's notes are messy — rushed, disorganized, full of \
 fragments and abbreviations. Clean them up: fix spelling, grammar, and spacing; \
-group related points; and organize everything into clear markdown headings and \
-bullets so it's easy to study from. Keep every real point they made.`;
+group related points; and organize everything into the FORMAT described below \
+so it's easy to study from. Keep every real point they made.`;
 
   return `${ground}
 
 ${task}
 
 Return your result by calling the polish_notes tool with:
-- "cleaned": the tidied notes as markdown (## headings, - bullets, **bold**). \
+- "cleaned": the tidied notes as markdown (**bold** where useful). \
+${NOTES_FORMAT_RULES[format]} \
 Wrap the single most important phrase in each section — the core takeaway, key \
 term, or fact worth remembering — in ==double equals== so it shows up \
 highlighted. Highlight sparingly (one or two per section); if everything is \
@@ -560,6 +586,22 @@ export const CHECK_IN_CHAT_PROMPT =
   "exam, and topics I've struggled with. Ask me ONE friendly opening question " +
   "to see how I'm doing and what I want to focus on today. Don't dump a to-do " +
   "list or lecture me — keep it short, warm, and easy to reply to.";
+
+// The kickoff message behind the "Study tip" chip (web composer + mobile study
+// tools). Asks Eliora for ONE quick, practical, proven technique the learner can
+// use right now — matched to how they learn and what they struggle with (the
+// model already has their profile in context). Pass the topic they're working on
+// (typed text or the current lesson) to tie the tip to it; omit for a general tip.
+export function studyTipPrompt(topic?: string): string {
+  const t = topic?.trim();
+  return t
+    ? `Give me ONE quick, practical study tip for working on "${t}" right now — ` +
+        `a proven technique I can use this minute, matched to how I learn and ` +
+        `what I struggle with. Keep it to a sentence or two.`
+    : "Give me ONE quick, practical study tip I can use right now — a proven " +
+        "technique matched to how I learn and what I struggle with. Keep it to a " +
+        "sentence or two.";
+}
 
 // System prompt for /api/suggest?kind=schedule: build an after-school study
 // schedule in 1-hour blocks, from when the learner gets home until 9 PM, shaped
@@ -1154,6 +1196,8 @@ export interface ChatRequest {
   assignments?: Assignment[]; // day-to-day homework the learner entered
   goals?: SmartGoal[]; // SMART goals the learner has set
   fourYearPlan?: FourYearPlan; // the learner's long-term academic roadmap
+  tutor?: string; // id of the AI tutor persona the learner picked (see ELIORA_TUTORS)
+  material?: StudyMaterial[]; // digests of textbooks/handouts they uploaded
 }
 
 // Lists the subject folders that already exist so Eliora doesn't duplicate them.
@@ -1806,6 +1850,36 @@ it over. A good Socratic question makes them do the next bit of thinking.
   Socratic questioning is for building understanding of a skill or concept, not
   for stonewalling every question.
 
+## Explain topics in depth when they want to understand
+When the learner asks you to explain, teach, or "help me understand" a topic (as
+opposed to venting, a quick fact, or working through their own graded problem),
+GO DEEP. A hint is not enough here — give a real, thorough explanation that
+actually builds understanding. Depth and ADHD-friendliness are not opposites:
+the trick is a long explanation that's well-structured and easy to follow, not a
+shapeless wall of text.
+- START WITH THE BIG PICTURE. One or two plain sentences on what this topic is
+  and why it matters / where it's used, before any detail. Give them a hook to
+  hang the rest on.
+- BUILD IT UP IN LAYERS. Explain the core idea first in the simplest possible
+  terms, then add the next layer of detail, then the next. Go from "the gist" to
+  "the mechanism" to "the nuances" — each layer building on the last.
+- USE A CONCRETE EXAMPLE (or an analogy tied to their interests) to make it real,
+  then connect the example back to the general idea. Worked examples and
+  analogies are how abstract ideas click.
+- COVER THE WHOLE THING. Don't stop at the surface — explain the how and the WHY,
+  the parts that trip people up, common misconceptions, and how the pieces fit
+  together. Be genuinely informative and complete.
+- KEEP IT SCANNABLE. Use short paragraphs, clear headers or bold key terms, and
+  small bullet lists so a long explanation still reads easily. Define jargon the
+  first time you use it. Length is fine; density and clutter are not.
+- CHECK IN AND GO FURTHER. After a solid explanation, ask if any part needs
+  unpacking more, and offer to go deeper on a sub-part. Then close with the
+  teach-back (below) so it locks in.
+This "go deep" mode is for LEARNING a concept. It does NOT override "Guide, don't
+do it for them" — still never write their graded assignment. Explaining a topic
+richly is exactly what a good teacher does; withholding it isn't Socratic, it's
+just unhelpful.
+
 ## Learn from how other students solved it
 When the learner is stuck on a specific problem or concept, you can pull up
 ANONYMIZED examples from other students who worked through something similar and
@@ -2022,7 +2096,12 @@ use them to guide THIS learner:
      Give 1–2 at a time, never a long list (ADHD: avoid overwhelm).
 
 ## Rules
-- Keep replies short. Avoid walls of text. Use simple words and clear formatting.
+- Match reply length to the need. Default to short — one idea, one next step —
+  for coaching, nudges, check-ins, and quick questions. But when they ask you to
+  explain or teach a topic, go in depth (see "Explain topics in depth") — a
+  thorough, well-structured explanation, not a one-liner. Avoid shapeless walls
+  of text either way: use simple words, short paragraphs, headers, and bullets so
+  even a long answer stays easy to follow.
 - Check understanding ("Does that make sense, or should I explain differently?").
 - TEACH IT BACK. Once you've taught a topic and the learner shows they've
   grasped it (they answer your check-understanding questions well, or say it
@@ -2297,6 +2376,164 @@ is right, and a short "topic" tag naming the sub-concept it tests.
   )}
 
 Call the make_quiz tool with the questions.`;
+}
+
+// ---------------------------------------------------------------------------
+// Lessons from your own material.
+//
+// The learner uploads (or pastes) their own material — class notes, a PDF, a
+// photo of a handout — and Eliora turns it into a do-able LESSON, not just a
+// summary: short teaching sections to read, then check questions to answer.
+// Two sizes: "mini" (~5–10 min, the essentials) and "regular" (~20–30 min,
+// the full material). Grounded in the material only, like the summarizer.
+// ---------------------------------------------------------------------------
+
+export type LessonSize = "mini" | "regular";
+
+// One step of the lesson, Khan-Academy style: a short teaching chunk followed
+// immediately by a single check question on JUST that chunk. The learner reads,
+// answers, gets feedback, then advances — teaching and practice interleaved
+// rather than a wall of text with a quiz bolted on the end.
+export interface LessonStep {
+  heading: string;
+  body: string; // markdown (bullets / **bold** / ==highlight==)
+  check?: QuizQuestion; // the practice question for this step (usually present)
+}
+
+export interface Lesson {
+  title: string;
+  size: LessonSize;
+  minutes: number; // rough time to complete
+  intro: string; // 1–2 sentences: what you'll learn and why it matters
+  steps: LessonStep[]; // teach-then-check steps, in learning order
+  keyTerms: { term: string; definition: string }[];
+  recap?: string; // 1–2 sentence wrap-up shown after the last step
+  note?: string; // one warm line from Eliora about the lesson
+}
+
+export interface LessonRequest {
+  size?: LessonSize; // default "regular"
+  text?: string; // pasted material, or a decoded text file
+  fileBase64?: string; // base64 contents of a PDF / image
+  fileMediaType?: string; // e.g. "application/pdf", "image/png"
+  fileName?: string;
+  profile?: LearnerProfile;
+}
+
+// Per-size shape of the lesson: how long and how many teach-then-check steps.
+const LESSON_SHAPE: Record<
+  LessonSize,
+  { minutes: number; steps: string; depth: string }
+> = {
+  mini: {
+    minutes: 8,
+    steps: "2–3",
+    depth:
+      "Keep it TIGHT: teach only the most important ideas — the ones the \
+learner must not walk away without. Skip minor details.",
+  },
+  regular: {
+    minutes: 25,
+    steps: "4–6",
+    depth:
+      "Be THOROUGH: cover all the substantive points in the material so the \
+lesson can replace re-reading the source.",
+  },
+};
+
+// How to shape a lesson for each detected learning style: how step bodies
+// should teach and what kind of check question fits. Lesson-specific, unlike
+// LEARNING_STYLE_TACTICS (which steers chat coaching and resource picks).
+const LESSON_STYLE_TACTICS: Record<LearningStyle, string> = {
+  visual:
+    'teach in pictures made of words: "picture it like…" analogies, describe \
+what a diagram of the idea would show, lay comparisons out as labeled bullet \
+maps instead of prose, and put the ==highlight== on the phrase they should \
+visualize. Where it helps, end a step by inviting a 10-second sketch.',
+  aural:
+    "write step bodies conversationally, as if talking them through it out \
+loud; give a say-it-aloud mnemonic or catchphrase for the key idea, and \
+invite them to say the idea back in their own words before answering the check.",
+  read_write:
+    "lean on precise written definitions, numbered lists, and clean bullet \
+points they could copy straight into notes; bold the key terms in the body, \
+and invite them to jot the main line of a step in their own words.",
+  kinesthetic:
+    'teach by DOING: open a step with a tiny worked example, then unpack the \
+idea behind it (do-then-review); tie each idea to a real-world use, and frame \
+check questions as small "apply it" problems rather than pure recall.',
+};
+
+// Prompt block telling the lesson builder to teach the way THIS learner
+// learns, from the detected VARK style. Returns "" when there's no signal.
+function lessonStyleTailor(profile?: LearnerProfile): string {
+  const result = detectLearningStyle(profile);
+  if (!result) return "";
+  const tactics = result.primary
+    .map((s) => `- ${LEARNING_STYLE_LABELS[s]}: ${LESSON_STYLE_TACTICS[s]}`)
+    .join("\n");
+  const interests = [profile?.hobbies, profile?.interests]
+    .filter((v) => v?.trim())
+    .join("; ");
+  return `\n\nTeach the way THIS learner learns best — detected style: \
+${result.label}${result.multimodal ? " (multimodal — blend these)" : ""}:
+${tactics}${
+    interests
+      ? `\nTheir interests (${interests}) are great fuel for examples and analogies.`
+      : ""
+  }
+Shape every step's body and check question this way, but stay grounded in the \
+material — the style changes HOW you teach it, never WHAT is true.`;
+}
+
+// System prompt for building a lesson FROM uploaded material. Grounded like the
+// summarizer (teach what's in the material, don't invent facts) and shaped like
+// a Khan-Academy lesson: small teaching steps, each followed immediately by one
+// practice question the learner answers before moving on.
+export function lessonPrompt(
+  size: LessonSize,
+  profile?: LearnerProfile,
+): string {
+  const shape = LESSON_SHAPE[size];
+  return `You are Eliora, a warm, patient study coach. Turn the material the \
+user provides into a ${size === "mini" ? "MINI" : "FULL"} LESSON they can do \
+right now (about ${shape.minutes} minutes) — something to LEARN from step by \
+step, like a Khan Academy lesson: teach a little, then check it, then move on.
+
+Build it as a sequence of ${shape.steps} STEPS. For each step:
+- A clear, short heading.
+- A body that TEACHES ONE idea in plain language: what it is, how it works, \
+why it matters, with a concrete example or simple analogy when it helps. Keep \
+it SHORT — a few sentences and bullets, the amount someone can read in a minute \
+before answering. Wrap the single most important phrase in ==double equals== to \
+highlight it.
+- ONE multiple-choice "check" question testing JUST what that step taught, so \
+the learner practices it immediately before advancing. Each check has 3–4 \
+options, EXACTLY ONE correct answer grounded in the material, a one-line \
+explanation of why it's right (this is shown as feedback), and a short topic tag.
+
+Also provide:
+- A short, motivating title and a 1–2 sentence intro (what they'll learn and \
+why it matters), shown before step 1.
+- Key terms from the material, each with a plain-words definition.
+- A 1–2 sentence "recap" shown after the last step, tying the ideas together.
+- One warm, encouraging sentence about the lesson ("note").
+
+${shape.depth}
+
+Rules:
+- Each step should build on the ones before it — simplest first, so the learner \
+is always ready for the next step's question.
+- Be FAITHFUL: work from the material. Explain and unpack what's there, but do \
+NOT invent facts, dates, names, statistics, or claims that aren't in it. Every \
+check question and its correct answer must be grounded in the material.
+- Keep sentences short and words plain. Be warm and encouraging.
+- If the material is too short or unclear to teach from, return a lesson with \
+no steps and a "note" kindly asking for more material.${learnerTailor(
+    profile,
+  )}${lessonStyleTailor(profile)}
+
+Call the make_lesson tool with the lesson.`;
 }
 
 // Follow-up Q&A about the study notes Eliora just generated. The notes travel
@@ -2594,6 +2831,273 @@ export const ELIORA_TTS_VOICES = [
 ] as const;
 export type ElioraTtsVoice = (typeof ELIORA_TTS_VOICES)[number];
 
+// ---------------------------------------------------------------------------
+// AI tutors — subject specialists the learner can pick on the home screen
+// ---------------------------------------------------------------------------
+// Every tutor is still Eliora underneath: the ADHD coaching rules, tools, and
+// tone in ELIORA_SYSTEM_PROMPT always apply. A tutor only layers on a name, a
+// subject lens, and a way of explaining — so switching tutors changes *how* a
+// topic is taught, never how supportive the app is. Each one also carries a
+// read-aloud voice so the tutor sounds like themselves.
+export interface ElioraTutor {
+  id: string;
+  name: string;
+  emoji: string;
+  subject: string; // short "what I'm for" label shown on the card
+  tagline: string; // one line of personality for the card
+  voice: ElioraTtsVoice; // matching read-aloud voice
+  /** Appended to the system prompt when this tutor is selected. */
+  style: string;
+}
+
+export const ELIORA_TUTORS: readonly ElioraTutor[] = [
+  {
+    id: "eliora",
+    name: "Eliora",
+    emoji: "🌱",
+    subject: "All subjects",
+    tagline: "Your all-round study coach",
+    voice: "nova",
+    style:
+      "Stay your default self: a warm generalist coach who can help with any " +
+      "subject, plus planning, focus, and motivation.",
+  },
+  {
+    id: "milo",
+    name: "Milo",
+    emoji: "📐",
+    subject: "Math",
+    tagline: "Numbers, step by step — never skips a line",
+    voice: "sage",
+    style:
+      "You're Milo, a math tutor. Work problems ONE line at a time and say what " +
+      "changed on each line and why. Never hand over the final answer first — ask " +
+      "them to try the next line, then check it. Show a worked parallel example " +
+      "before their actual problem when they're stuck. Watch for the classic slips " +
+      "(sign errors, dropped terms, order of operations) and point at the line " +
+      "where it happened instead of restating the whole solution. Keep numbers " +
+      "small in examples; dyscalculia-friendly pacing.",
+  },
+  {
+    id: "iris",
+    name: "Iris",
+    emoji: "🔬",
+    subject: "Science",
+    tagline: "Explains the why behind every fact",
+    voice: "shimmer",
+    style:
+      "You're Iris, a science tutor (biology, chemistry, physics). Lead with the " +
+      "mechanism, not the vocabulary — explain WHY something happens with a " +
+      "concrete everyday analogy first, then attach the technical term to it. " +
+      "Draw processes as short numbered chains (cause → effect → effect). For " +
+      "calculations, keep units visible at every step. Offer a quick 'predict " +
+      "what happens if…' question to check real understanding.",
+  },
+  {
+    id: "wren",
+    name: "Wren",
+    emoji: "✍️",
+    subject: "English & writing",
+    tagline: "Gets you unstuck on the blank page",
+    voice: "fable",
+    style:
+      "You're Wren, an English and writing tutor. Blank-page paralysis is the " +
+      "enemy: start by getting ONE messy sentence out of them, then shape it. " +
+      "Coach structure (claim → evidence → why it matters) rather than rewriting " +
+      "their work — never write the essay for them. Give feedback as two things " +
+      "that land and one specific thing to change next. For reading, ask what the " +
+      "author is doing, not just what happened.",
+  },
+  {
+    id: "atlas",
+    name: "Atlas",
+    emoji: "🏛️",
+    subject: "History & social studies",
+    tagline: "Turns dates into stories that stick",
+    voice: "onyx",
+    style:
+      "You're Atlas, a history and social-studies tutor. Teach through story and " +
+      "cause-and-effect, never as a list of dates — who wanted what, what got in " +
+      "the way, what changed. Anchor each event to one vivid detail that makes it " +
+      "memorable. Connect the past to something happening now. When they need " +
+      "dates for a test, build a short timeline they can picture.",
+  },
+  {
+    id: "pixel",
+    name: "Pixel",
+    emoji: "💻",
+    subject: "Coding & tech",
+    tagline: "Debug it together, one line at a time",
+    voice: "echo",
+    style:
+      "You're Pixel, a coding tutor. Read their code back to them in plain " +
+      "English before touching it, so they see what it actually does. Debug by " +
+      "narrowing: what did you expect, what happened, what's the smallest thing " +
+      "we can print or test? Give hints and short snippets, not finished programs " +
+      "— they should type the fix themselves. Name the concept behind each bug so " +
+      "it transfers to the next one.",
+  },
+  {
+    id: "lingo",
+    name: "Lingo",
+    emoji: "🗣️",
+    subject: "Languages",
+    tagline: "Practice out loud, mistakes welcome",
+    voice: "coral",
+    style:
+      "You're Lingo, a language tutor. Get them producing the language early — " +
+      "short exchanges, not grammar lectures. Correct gently by echoing the " +
+      "corrected version back naturally, then explain the rule in one line. Mix " +
+      "in the language and English so they're never lost. Build vocabulary in " +
+      "small themed sets and recycle old words into new sentences.",
+  },
+  {
+    id: "quill",
+    name: "Quill",
+    emoji: "🎯",
+    subject: "Test prep",
+    tagline: "Calm, timed practice for the big day",
+    voice: "ballad",
+    style:
+      "You're Quill, an exam-prep tutor. Work backwards from the test: what's on " +
+      "it, what's worth the most, what's shakiest. Run short timed sets and " +
+      "review every miss by WHY it was missed (didn't know it / misread it / ran " +
+      "out of time) — the reason decides the fix. Teach question strategy and " +
+      "elimination. Keep test anxiety low: normalize nerves, and never imply a " +
+      "score defines them.",
+  },
+] as const;
+
+export const ELIORA_DEFAULT_TUTOR = "eliora";
+
+export function tutorById(id?: string): ElioraTutor {
+  return (
+    ELIORA_TUTORS.find((t) => t.id === id) ??
+    ELIORA_TUTORS.find((t) => t.id === ELIORA_DEFAULT_TUTOR)!
+  );
+}
+
+// Layers the chosen tutor's persona onto the base system prompt. The default
+// tutor adds nothing — it *is* the base prompt.
+export function tutorContext(id?: string): string {
+  if (!id || id === ELIORA_DEFAULT_TUTOR) return "";
+  const tutor = ELIORA_TUTORS.find((t) => t.id === id);
+  if (!tutor) return "";
+  return `\n\n## Your tutor persona: ${tutor.name} (${tutor.subject})
+The learner picked ${tutor.name}, your ${tutor.subject.toLowerCase()} specialist.
+Introduce yourself as ${tutor.name} if they ask who you are, and teach in this style:
+
+${tutor.style}
+
+This is a lens, not a limit. Every coaching rule above still applies — tiny
+steps, no overwhelm, celebrate wins, and use your tools exactly as usual. If
+they bring up something outside ${tutor.subject.toLowerCase()}, help anyway as
+${tutor.name} rather than refusing or handing them off.`;
+}
+
+// ---------------------------------------------------------------------------
+// Study material — the learner's own textbook, handout, or notes
+// ---------------------------------------------------------------------------
+// A tutor teaches best from the book the learner is actually graded on. The
+// learner uploads a chapter (PDF, photo of a page, or pasted text) once; the
+// model reads it and returns this digest. The digest — NOT the raw file — is
+// what rides along in every later chat request, so the tutor stays grounded in
+// their material without re-sending a megabyte of PDF on every message.
+export interface MaterialTopic {
+  title: string; // e.g. "4.2 The light-dependent reactions"
+  summary: string; // a few lines on what that section actually says
+}
+export interface MaterialTerm {
+  term: string;
+  definition: string; // defined the way THIS material defines it
+}
+export interface StudyMaterial {
+  id: string;
+  title: string; // e.g. "Biology — Ch. 4: Photosynthesis"
+  subject?: string;
+  source: string; // file name, or "Pasted text"
+  overview: string; // 2–3 sentences: what this material covers
+  topics: MaterialTopic[];
+  terms: MaterialTerm[];
+  addedAt: string; // YYYY-MM-DD
+}
+
+export interface MaterialRequest {
+  text?: string; // pasted material
+  fileBase64?: string; // base64 contents of a PDF / image / text file
+  fileMediaType?: string; // e.g. "application/pdf", "image/png"
+  fileName?: string;
+  subject?: string; // the folder/class it belongs to, if known
+  profile?: LearnerProfile;
+}
+
+// How many materials (and how much of each) travel in the system prompt. The
+// digest is small, but a learner with a whole semester uploaded would still
+// blow the budget — newest wins.
+export const MATERIAL_MAX = 4;
+const MATERIAL_TOPICS_MAX = 14;
+const MATERIAL_TERMS_MAX = 24;
+
+export function materialDigestPrompt(profile?: LearnerProfile): string {
+  return `You are reading a learner's own study material — a textbook chapter, \
+handout, worksheet, slide deck, or their notes. Index it so a tutor can teach \
+from it later.
+
+Rules:
+- Summarize ONLY what's actually in the material. Never add outside facts, and \
+never invent sections that aren't there.
+- Keep the material's own wording for technical terms, notation, and symbols — \
+the learner is graded on THIS book's phrasing, not a synonym.
+- Break it into the sections the material itself uses (chapter/section headings, \
+numbered parts). If it has no headings, split it by topic in the order taught.
+- Each section summary should carry the actual content (the definition, the \
+rule, the steps, the example) — enough that a tutor could teach that section \
+from the summary alone. A few sentences each, not a label.
+- Pull the key terms the material defines, and define each one the way the \
+material does.
+- Give it a title that names the subject and the chapter/topic, e.g. \
+"Biology — Ch. 4: Photosynthesis".
+- If the material is unreadable (blurry photo, blank pages, no real content), \
+return an empty topics list and say so in the title.${profileContext(profile)}`;
+}
+
+// Puts the learner's uploaded material into the tutor's system prompt, and
+// tells it to actually teach FROM it rather than from general knowledge.
+export function materialContext(materials?: StudyMaterial[]): string {
+  if (!materials || !materials.length) return "";
+  const blocks = materials.slice(-MATERIAL_MAX).map((m) => {
+    const topics = m.topics
+      .slice(0, MATERIAL_TOPICS_MAX)
+      .map((t) => `- ${t.title}: ${t.summary}`)
+      .join("\n");
+    const terms = m.terms
+      .slice(0, MATERIAL_TERMS_MAX)
+      .map((t) => `- ${t.term}: ${t.definition}`)
+      .join("\n");
+    return `### ${m.title}${m.subject ? ` (${m.subject})` : ""}
+Source: ${m.source}
+${m.overview}${topics ? `\n\nSections:\n${topics}` : ""}${
+      terms ? `\n\nKey terms (as this material defines them):\n${terms}` : ""
+    }`;
+  });
+  return `\n\n## The learner's own study material
+They uploaded this — it's the book/handout they're actually taught and graded
+on. Teach FROM it:
+- Use ITS definitions, notation, symbols, and vocabulary, even where you'd
+  normally phrase something differently. If your usual wording differs, use
+  theirs and mention the other name once.
+- Name the section you're drawing on ("that's section 4.2 in your chapter") so
+  they can find it in the book.
+- Build examples, practice, flashcards, and quizzes from these topics first.
+- The digest below is a summary, not the full text. If they ask about something
+  in the material you don't have the detail for, say which section it's in and
+  ask them to paste or photograph that part — do NOT guess what their book says.
+- If they ask about something the material doesn't cover at all, say so plainly,
+  then help anyway from your own knowledge and flag it as outside their book.
+
+${blocks.join("\n\n")}`;
+}
+
 // Back-compat alias (chat model).
 export const ELIORA_MODEL = ELIORA_CHAT_MODEL;
 
@@ -2791,4 +3295,212 @@ export function sortFolderItems(items: FolderItem[]): FolderItem[] {
     if (ra !== rb) return ra - rb;
     return a.createdAt - b.createdAt;
   });
+}
+
+// ---------------------------------------------------------------------------
+// Doubts board — ask a question, show your work, help each other out
+// ---------------------------------------------------------------------------
+// The asynchronous half of Study Together. A study room is "sit and focus with
+// me right now"; a doubt is "I'm stuck on this, here's what I tried" left up for
+// anyone to answer later. Threads read like Reddit: nested replies, up/down
+// votes, and the asker can mark the reply that actually unstuck them.
+//
+// A doubt lives in one of two scopes:
+//   "global"  — visible to everyone using Eliora
+//   <CODE>    — a private study group; knowing the 6-char code is membership,
+//               exactly like a shared folder
+// Storage is the same local-JSON, poll-for-updates shape as rooms and folders
+// (see apps/web/lib/doubts.ts).
+
+export const DOUBT_GLOBAL_SCOPE = "global";
+
+// Group codes reuse the room alphabet/length so every join code in Eliora looks
+// and validates the same way.
+export const DOUBT_CODE_ALPHABET = TOGETHER_CODE_ALPHABET;
+export const DOUBT_CODE_LENGTH = TOGETHER_CODE_LENGTH;
+
+export function isValidGroupCode(code: unknown): code is string {
+  return (
+    typeof code === "string" &&
+    new RegExp(`^[${DOUBT_CODE_ALPHABET}]{${DOUBT_CODE_LENGTH}}$`).test(
+      code.trim().toUpperCase(),
+    )
+  );
+}
+
+// A scope is either the global feed or a valid group code.
+export function isValidDoubtScope(scope: unknown): scope is string {
+  return scope === DOUBT_GLOBAL_SCOPE || isValidGroupCode(scope);
+}
+
+export function normalizeDoubtScope(scope: unknown): string | null {
+  if (scope === DOUBT_GLOBAL_SCOPE) return DOUBT_GLOBAL_SCOPE;
+  if (typeof scope === "string" && isValidGroupCode(scope)) {
+    return scope.trim().toUpperCase();
+  }
+  return null;
+}
+
+// Votes are stored per-voter rather than as a running total so a member can
+// change or take back their vote, and so we can show "you upvoted this".
+export type DoubtVoteValue = 1 | -1;
+export type DoubtVotes = Record<string, DoubtVoteValue>;
+
+// One reply in the thread. `parentId` points at another reply for nesting;
+// undefined means it's a direct answer to the doubt. `work` is the optional
+// "here's my working" block — rendered as a distinct, monospaced panel so
+// step-by-step solutions stay readable instead of collapsing into prose.
+export interface DoubtReply {
+  id: string;
+  parentId?: string;
+  authorId: string;
+  authorName: string;
+  text: string;
+  work?: string;
+  at: number; // epoch ms
+  votes: DoubtVotes;
+}
+
+export interface Doubt {
+  id: string;
+  scope: string; // DOUBT_GLOBAL_SCOPE or a group code
+  authorId: string;
+  authorName: string;
+  subject?: string;
+  title: string;
+  body: string;
+  work?: string; // "what I've tried so far"
+  createdAt: number;
+  votes: DoubtVotes;
+  replies: DoubtReply[];
+  solvedReplyId?: string; // the reply the asker marked as the one that helped
+}
+
+export interface DoubtGroupMember {
+  id: string;
+  name: string;
+  lastSeen: number;
+}
+
+// A private study group. Like a shared folder this is meant to last a term, so
+// there's no presence-based expiry — just a long idle sweep server-side.
+export interface DoubtGroup {
+  code: string;
+  name: string;
+  createdAt: number;
+  members: DoubtGroupMember[];
+}
+
+// Field caps, enforced server-side and mirrored as maxLength in the UI.
+export const DOUBT_TITLE_MAX = 140;
+export const DOUBT_BODY_MAX = 2000;
+export const DOUBT_WORK_MAX = 2000;
+export const DOUBT_REPLY_MAX = 2000;
+// How deep replies can nest before further answers are flattened onto the last
+// level. Reddit goes forever; on a study board three levels is plenty and keeps
+// the indentation readable on a phone.
+export const DOUBT_MAX_DEPTH = 3;
+
+export type DoubtSort = "top" | "new" | "unanswered";
+
+// Net score: upvotes minus downvotes.
+export function doubtScore(votes: DoubtVotes | undefined): number {
+  if (!votes) return 0;
+  return Object.values(votes).reduce<number>((sum, v) => sum + v, 0);
+}
+
+// Which way (if at all) this member voted — drives the arrow highlighting.
+export function myVote(votes: DoubtVotes | undefined, memberId: string): 0 | 1 | -1 {
+  return votes?.[memberId] ?? 0;
+}
+
+// Feed ordering.
+//   top         — best answered-and-upvoted first, recency breaking ties
+//   new         — straight reverse-chronological
+//   unanswered  — only doubts nobody has replied to yet, newest first, so the
+//                 people who came to help can find someone still waiting
+export function sortDoubts(doubts: Doubt[], sort: DoubtSort): Doubt[] {
+  const list = [...doubts];
+  if (sort === "new") return list.sort((a, b) => b.createdAt - a.createdAt);
+  if (sort === "unanswered") {
+    return list
+      .filter((d) => d.replies.length === 0)
+      .sort((a, b) => b.createdAt - a.createdAt);
+  }
+  return list.sort((a, b) => {
+    const sa = doubtScore(a.votes);
+    const sb = doubtScore(b.votes);
+    if (sa !== sb) return sb - sa;
+    return b.createdAt - a.createdAt;
+  });
+}
+
+// A reply plus its children, ready to render with indentation. Replies whose
+// parent is missing (deleted, or a bad id) are treated as top-level so nothing
+// silently disappears from a thread.
+export interface DoubtReplyNode {
+  reply: DoubtReply;
+  depth: number;
+  children: DoubtReplyNode[];
+}
+
+// Turn the flat reply array into a tree. Within each level: the accepted answer
+// floats to the top, then highest score, then oldest first (so a conversation
+// still reads in order once scores tie).
+export function buildDoubtTree(doubt: Doubt): DoubtReplyNode[] {
+  const byId = new Map(doubt.replies.map((r) => [r.id, r]));
+  const children = new Map<string, DoubtReply[]>();
+  const roots: DoubtReply[] = [];
+  for (const reply of doubt.replies) {
+    const parent = reply.parentId && byId.has(reply.parentId) ? reply.parentId : null;
+    if (!parent) {
+      roots.push(reply);
+    } else {
+      const siblings = children.get(parent);
+      if (siblings) siblings.push(reply);
+      else children.set(parent, [reply]);
+    }
+  }
+
+  const rank = (list: DoubtReply[]): DoubtReply[] =>
+    [...list].sort((a, b) => {
+      const aSolved = a.id === doubt.solvedReplyId ? 1 : 0;
+      const bSolved = b.id === doubt.solvedReplyId ? 1 : 0;
+      if (aSolved !== bSolved) return bSolved - aSolved;
+      const sa = doubtScore(a.votes);
+      const sb = doubtScore(b.votes);
+      if (sa !== sb) return sb - sa;
+      return a.at - b.at;
+    });
+
+  // Guard against a cycle in parentId (only reachable via a malformed store) so
+  // a bad record can't hang the render.
+  const seen = new Set<string>();
+  const build = (reply: DoubtReply, depth: number): DoubtReplyNode => {
+    seen.add(reply.id);
+    const kids = rank(children.get(reply.id) ?? []).filter((r) => !seen.has(r.id));
+    return { reply, depth, children: kids.map((r) => build(r, depth + 1)) };
+  };
+  return rank(roots).map((r) => build(r, 0));
+}
+
+// "Helped 4 people" — how many of this member's replies an asker marked as the
+// one that unstuck them. The board's whole incentive to answer.
+export function countDoubtHelps(doubts: Doubt[], memberId: string): number {
+  return doubts.filter((d) =>
+    d.replies.some((r) => r.id === d.solvedReplyId && r.authorId === memberId),
+  ).length;
+}
+
+// "2h ago" — compact relative time for post and reply bylines.
+export function doubtAgo(at: number, now: number): string {
+  const s = Math.max(0, Math.floor((now - at) / 1000));
+  if (s < 60) return "just now";
+  const m = Math.floor(s / 60);
+  if (m < 60) return `${m}m ago`;
+  const h = Math.floor(m / 60);
+  if (h < 24) return `${h}h ago`;
+  const d = Math.floor(h / 24);
+  if (d < 7) return `${d}d ago`;
+  return `${Math.floor(d / 7)}w ago`;
 }

@@ -6,12 +6,14 @@ import {
   eventsContext,
   fourYearPlanContext,
   goalsContext,
+  materialContext,
   mistakesContext,
   normalizeFlashcardStyle,
   planContext,
   profileContext,
   revisionContext,
   subjectsContext,
+  tutorContext,
   type ChatAttachment,
   type ChatMessage,
   type ChatRequest,
@@ -1171,6 +1173,8 @@ export async function POST(req: Request) {
     `need help with. Text files arrive as "[Attached file …]" blocks. For anything ` +
     `marked as unreadable (e.g. a PDF or raw video), don't pretend to see it — say ` +
     `what you'd need (a photo/screenshot, or the pasted text) to help.` +
+    tutorContext(body.tutor) +
+    materialContext(body.material) +
     profileContext(body.profile) +
     planContext(body.plan) +
     eventsContext(body.events, today) +

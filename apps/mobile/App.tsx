@@ -294,6 +294,20 @@ const STUDY_BUDGET_MIN: Record<string, number | undefined> = {
   "As much as fits": undefined,
 };
 
+// Sent when the learner taps the "Study tip" study tool. Asks for ONE quick,
+// proven technique tied to what they're working on. Mirrors studyTipPrompt in
+// @eliora/shared (mobile doesn't bundle the shared package, so it keeps a copy).
+function studyTipPrompt(topic?: string): string {
+  const t = topic?.trim();
+  return t
+    ? `Give me ONE quick, practical study tip for working on "${t}" right now — ` +
+        `a proven technique I can use this minute, matched to how I learn and ` +
+        `what I struggle with. Keep it to a sentence or two.`
+    : "Give me ONE quick, practical study tip I can use right now — a proven " +
+        "technique matched to how I learn and what I struggle with. Keep it to a " +
+        "sentence or two.";
+}
+
 // Sent when the learner taps "Build/Rebuild plan from our chat".
 const PLAN_FROM_CHAT_PROMPT =
   "Look back over our whole conversation so far and create or update my " +
@@ -2134,6 +2148,7 @@ function Summarizer({
 }
 
 type NotesMode = "clean" | "handwriting" | "highlight";
+type NotesFormat = "outline" | "cornell" | "paragraph" | "qa";
 type PolishedNotes = {
   cleaned: string;
   keyIdeas: string[];
@@ -2157,6 +2172,7 @@ function stripMd(s: string): string {
 // Three modes map to the three AI note features; all hit /api/notes-polish.
 function SmartNotes({ profile }: { profile: LearnerProfile }) {
   const [mode, setMode] = useState<NotesMode>("clean");
+  const [format, setFormat] = useState<NotesFormat>("outline");
   const [text, setText] = useState("");
   const [file, setFile] = useState<{
     name: string;
@@ -2204,6 +2220,7 @@ function SmartNotes({ profile }: { profile: LearnerProfile }) {
     // A pasted-text file just becomes the text; a pdf/image goes as base64.
     const body = {
       mode,
+      format,
       text: (file?.text ?? text).trim() || undefined,
       fileBase64: file?.base64,
       fileMediaType: file?.mediaType,
@@ -2231,6 +2248,12 @@ function SmartNotes({ profile }: { profile: LearnerProfile }) {
     ["handwriting", "✍️ Handwriting"],
     ["highlight", "🖍️ Highlight"],
   ] as const;
+  const formats = [
+    ["outline", "🗂️ Outline"],
+    ["cornell", "📔 Cornell"],
+    ["paragraph", "📄 Paragraphs"],
+    ["qa", "❓ Q&A"],
+  ] as const;
 
   return (
     <View style={styles.card}>
@@ -2249,6 +2272,20 @@ function SmartNotes({ profile }: { profile: LearnerProfile }) {
             style={[styles.outChip, mode === k && styles.outChipActive]}
           >
             <Text style={[styles.outChipText, mode === k && styles.outChipTextActive]}>
+              {label}
+            </Text>
+          </TouchableOpacity>
+        ))}
+      </View>
+      <View style={[styles.outputRow, { marginTop: 6, alignItems: "center" }]}>
+        <Text style={styles.calEmpty}>Format:</Text>
+        {formats.map(([k, label]) => (
+          <TouchableOpacity
+            key={k}
+            onPress={() => setFormat(k)}
+            style={[styles.outChip, format === k && styles.outChipActive]}
+          >
+            <Text style={[styles.outChipText, format === k && styles.outChipTextActive]}>
               {label}
             </Text>
           </TouchableOpacity>
@@ -2321,6 +2358,358 @@ function SmartNotes({ profile }: { profile: LearnerProfile }) {
             </>
           )}
         </View>
+      )}
+    </View>
+  );
+}
+
+// Lessons from your own material (mirrors Lesson types in @eliora/shared).
+// Upload notes / a PDF / a photo of a handout, pick a size, and Eliora builds
+// a Khan-Academy-style lesson: teach-then-check steps you work through one at a
+// time, plus key terms and a recap.
+type LessonSize = "mini" | "regular";
+type LessonStep = { heading: string; body: string; check?: QuizQuestion };
+type Lesson = {
+  title: string;
+  size: LessonSize;
+  minutes: number;
+  intro: string;
+  steps: LessonStep[];
+  keyTerms: { term: string; definition: string }[];
+  recap?: string;
+  note?: string;
+};
+
+// One check question inside the lesson player: the learner picks an option and
+// taps Check, then sees whether they were right plus the explanation. Reports a
+// missed topic upward the first time they get it wrong. Returns whether the
+// learner has answered correctly yet, so the player can gate "Next" on mastery.
+function LessonCheck({
+  q,
+  onResolved,
+  onMissed,
+}: {
+  q: QuizQuestion;
+  onResolved: (correct: boolean) => void;
+  onMissed: (topic: string) => void;
+}) {
+  const [picked, setPicked] = useState<number | null>(null);
+  const [checked, setChecked] = useState(false);
+  const correct = checked && picked === q.answerIndex;
+
+  function check() {
+    if (picked === null) return;
+    setChecked(true);
+    const isRight = picked === q.answerIndex;
+    if (!isRight) onMissed(q.topic || q.question);
+    onResolved(isRight);
+  }
+
+  return (
+    <View style={{ marginTop: 10 }}>
+      <Text style={[styles.resultText, { fontWeight: "700" }]}>{q.question}</Text>
+      {q.options.map((opt, i) => {
+        const isPicked = picked === i;
+        const isAnswer = i === q.answerIndex;
+        // After checking, mark the right answer green and a wrong pick red.
+        const state = checked
+          ? isAnswer
+            ? styles.lessonOptCorrect
+            : isPicked
+              ? styles.lessonOptWrong
+              : null
+          : isPicked
+            ? styles.lessonOptPicked
+            : null;
+        return (
+          <TouchableOpacity
+            key={i}
+            style={[styles.lessonOpt, state]}
+            disabled={checked}
+            onPress={() => setPicked(i)}
+          >
+            <Text style={styles.lessonOptText}>{opt}</Text>
+          </TouchableOpacity>
+        );
+      })}
+      {!checked ? (
+        <TouchableOpacity
+          onPress={check}
+          disabled={picked === null}
+          style={[
+            styles.secondaryBtn,
+            { marginTop: 8 },
+            picked === null && styles.primaryBtnDisabled,
+          ]}
+        >
+          <Text style={styles.secondaryBtnText}>Check answer</Text>
+        </TouchableOpacity>
+      ) : (
+        <Text
+          style={[
+            styles.resultText,
+            { marginTop: 8, fontWeight: "700", color: correct ? "#2e7d32" : "#c0392b" },
+          ]}
+        >
+          {correct ? "✅ Correct!" : "❌ Not quite."}
+          {q.explanation ? ` ${stripMd(q.explanation)}` : ""}
+        </Text>
+      )}
+    </View>
+  );
+}
+
+// The interactive lesson player: shows one step at a time (teach → check →
+// feedback), a progress bar, and a completion screen with the score. "Next" is
+// gated until the step's check question is answered (mastery-style pacing).
+function LessonPlayer({
+  lesson,
+  onMissed,
+  onRestart,
+}: {
+  lesson: Lesson;
+  onMissed: (topic: string) => void;
+  onRestart: () => void;
+}) {
+  const total = lesson.steps.length;
+  const [idx, setIdx] = useState(0);
+  const [done, setDone] = useState(false);
+  // Per-step outcome once its check is answered (true = correct first try path).
+  const [results, setResults] = useState<Record<number, boolean>>({});
+  const step = lesson.steps[idx];
+  const answered = step?.check ? idx in results : true;
+  const answeredCount = Object.keys(results).length;
+  const score = Object.values(results).filter(Boolean).length;
+  const withChecks = lesson.steps.filter((s) => s.check).length;
+
+  function next() {
+    if (idx + 1 >= total) setDone(true);
+    else setIdx(idx + 1);
+  }
+
+  if (done) {
+    return (
+      <View style={styles.resultBox}>
+        <Text style={styles.cardClass}>🎉 Lesson complete</Text>
+        {withChecks > 0 && (
+          <Text style={[styles.resultText, { fontWeight: "700", marginTop: 4 }]}>
+            You got {score} of {withChecks} checks right.
+          </Text>
+        )}
+        {!!lesson.recap && (
+          <Text style={[styles.resultText, { marginTop: 6 }]}>{stripMd(lesson.recap)}</Text>
+        )}
+        {lesson.keyTerms.length > 0 && (
+          <>
+            <Text style={[styles.cardClass, { marginTop: 10 }]}>📚 Key terms</Text>
+            {lesson.keyTerms.map((t, i) => (
+              <Text key={i} style={styles.resultText}>
+                • {t.term} — {t.definition}
+              </Text>
+            ))}
+          </>
+        )}
+        {!!lesson.note && (
+          <Text style={[styles.resultText, { marginTop: 8 }]}>{lesson.note}</Text>
+        )}
+        <TouchableOpacity style={[styles.secondaryBtn, { marginTop: 12 }]} onPress={onRestart}>
+          <Text style={styles.secondaryBtnText}>Make another lesson</Text>
+        </TouchableOpacity>
+      </View>
+    );
+  }
+
+  return (
+    <View style={styles.resultBox}>
+      <Text style={styles.cardClass}>
+        {lesson.size === "mini" ? "⚡" : "📖"} {lesson.title}
+      </Text>
+      {idx === 0 && !!lesson.intro && (
+        <Text style={[styles.resultText, { marginTop: 2 }]}>{stripMd(lesson.intro)}</Text>
+      )}
+      {/* Progress bar */}
+      <View style={styles.lessonProgressTrack}>
+        <View
+          style={[styles.lessonProgressFill, { width: `${((idx + 1) / total) * 100}%` }]}
+        />
+      </View>
+      <Text style={styles.calEmpty}>
+        Step {idx + 1} of {total} · ~{lesson.minutes} min
+      </Text>
+
+      <Text style={[styles.cardClass, { marginTop: 10 }]}>{step.heading}</Text>
+      <Text style={styles.resultText}>{stripMd(step.body)}</Text>
+
+      {step.check && (
+        <LessonCheck
+          // Reset the check widget's internal state when the step changes.
+          key={idx}
+          q={step.check}
+          onMissed={onMissed}
+          onResolved={(correct) => setResults((r) => ({ ...r, [idx]: correct }))}
+        />
+      )}
+
+      <TouchableOpacity
+        onPress={next}
+        disabled={!answered}
+        style={[styles.primaryBtn, { marginTop: 12 }, !answered && styles.primaryBtnDisabled]}
+      >
+        <Text style={styles.primaryBtnText}>
+          {idx + 1 >= total ? "Finish lesson" : "Next step →"}
+        </Text>
+      </TouchableOpacity>
+    </View>
+  );
+}
+
+function LessonBuilder({
+  profile,
+  onMissed,
+}: {
+  profile: LearnerProfile;
+  onMissed: (topic: string) => void;
+}) {
+  const [size, setSize] = useState<LessonSize>("mini");
+  const [text, setText] = useState("");
+  const [file, setFile] = useState<{
+    name: string;
+    base64?: string;
+    mediaType?: string;
+    text?: string;
+  } | null>(null);
+  const [loading, setLoading] = useState(false);
+  const [lesson, setLesson] = useState<Lesson | null>(null);
+  const [err, setErr] = useState("");
+  const canSubmit = (text.trim().length >= 20 || !!file) && !loading;
+
+  async function pickFile() {
+    const res = await DocumentPicker.getDocumentAsync({
+      type: ["application/pdf", "text/*", "image/*"],
+      copyToCacheDirectory: true,
+    });
+    if (res.canceled || !res.assets?.length) return;
+    const asset = res.assets[0];
+    const mime = asset.mimeType ?? "";
+    const isText =
+      mime.startsWith("text/") || /\.(txt|md|markdown)$/i.test(asset.name);
+    try {
+      if (isText) {
+        const content = await FileSystem.readAsStringAsync(asset.uri);
+        setFile({ name: asset.name, text: content });
+      } else {
+        const base64 = await FileSystem.readAsStringAsync(asset.uri, {
+          encoding: FileSystem.EncodingType.Base64,
+        });
+        setFile({ name: asset.name, base64, mediaType: mime });
+      }
+    } catch {
+      setFile({ name: asset.name });
+    }
+  }
+
+  async function build() {
+    if (!canSubmit) return;
+    setLoading(true);
+    setErr("");
+    setLesson(null);
+    // A pasted-text file just becomes the text; a pdf/image goes as base64.
+    const body = {
+      size,
+      text: (file?.text ?? text).trim() || undefined,
+      fileBase64: file?.base64,
+      fileMediaType: file?.mediaType,
+      fileName: file?.base64 ? file?.name : undefined,
+      profile,
+    };
+    try {
+      const res = await expoFetch(`${API_BASE_URL}/api/lesson`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+      });
+      const data = await res.json();
+      if (data.lesson) setLesson(data.lesson as Lesson);
+      else setErr(data.error || "Couldn't build a lesson — try again.");
+    } catch {
+      setErr("Couldn't reach the server. Please try again.");
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  const sizes = [
+    ["mini", "⚡ Mini · ~5–10 min"],
+    ["regular", "📖 Regular · ~20–30 min"],
+  ] as const;
+
+  // Once a lesson is built, hand off to the interactive player.
+  if (lesson && lesson.steps.length > 0) {
+    return (
+      <View style={styles.card}>
+        <View style={styles.cardHead}>
+          <Text style={styles.cardClass}>🎓 Lesson</Text>
+          <Text style={styles.linkBtn} onPress={() => setLesson(null)}>
+            Exit
+          </Text>
+        </View>
+        <LessonPlayer lesson={lesson} onMissed={onMissed} onRestart={() => setLesson(null)} />
+      </View>
+    );
+  }
+
+  return (
+    <View style={styles.card}>
+      <View style={styles.cardHead}>
+        <Text style={styles.cardClass}>🎓 Lesson from your material</Text>
+      </View>
+      <Text style={styles.calEmpty}>
+        Paste your notes or upload a PDF, photo, or text file, and I'll turn it
+        into a lesson you can work through like Khan Academy — learn a bit,
+        answer a quick question, then move to the next step.
+      </Text>
+      <View style={[styles.outputRow, { marginTop: 8 }]}>
+        {sizes.map(([k, label]) => (
+          <TouchableOpacity
+            key={k}
+            onPress={() => setSize(k)}
+            style={[styles.outChip, size === k && styles.outChipActive]}
+          >
+            <Text style={[styles.outChipText, size === k && styles.outChipTextActive]}>
+              {label}
+            </Text>
+          </TouchableOpacity>
+        ))}
+      </View>
+      <TextInput
+        style={[styles.formInput, styles.formTextarea, { minHeight: 120, marginTop: 8 }]}
+        value={text}
+        onChangeText={setText}
+        placeholder="Paste your notes, a handout, or any material here…"
+        placeholderTextColor="#8a938d"
+        multiline
+      />
+      <TouchableOpacity style={[styles.secondaryBtn, { marginTop: 8 }]} onPress={pickFile}>
+        <Text style={styles.secondaryBtnText}>
+          {file ? `Selected: ${file.name}` : "Upload a file (PDF, photo, or text)"}
+        </Text>
+      </TouchableOpacity>
+      <TouchableOpacity
+        onPress={build}
+        disabled={!canSubmit}
+        style={[styles.primaryBtn, { marginTop: 10 }, !canSubmit && styles.primaryBtnDisabled]}
+      >
+        <Text style={styles.primaryBtnText}>
+          {loading
+            ? "Building your lesson…"
+            : size === "mini"
+              ? "⚡ Build mini lesson"
+              : "📖 Build lesson"}
+        </Text>
+      </TouchableOpacity>
+      {!!err && <Text style={[styles.resultText, { color: "#c0392b" }]}>{err}</Text>}
+      {lesson && lesson.steps.length === 0 && !!lesson.note && (
+        <Text style={[styles.resultText, { marginTop: 8 }]}>{lesson.note}</Text>
       )}
     </View>
   );
@@ -3627,6 +4016,52 @@ function ScheduleSetupSurvey({
     </View>
   );
 
+  // Like choiceGroup but multi-select — value is a comma-joined list.
+  const multiChoiceGroup = (
+    question: string,
+    options: string[],
+    value: string,
+    setValue: (s: string) => void,
+  ) => {
+    const chosen = new Set(
+      value ? value.split(",").map((s) => s.trim()).filter(Boolean) : [],
+    );
+    const toggle = (opt: string) => {
+      const next = new Set(chosen);
+      if (next.has(opt)) next.delete(opt);
+      else next.add(opt);
+      setValue([...next].join(", "));
+    };
+    return (
+      <View style={styles.field}>
+        <Text style={styles.fieldLabel}>
+          {question}{" "}
+          <Text style={styles.choiceHint}>(select all that apply)</Text>
+        </Text>
+        {options.map((opt) => {
+          const isSel = chosen.has(opt);
+          return (
+            <TouchableOpacity
+              key={opt}
+              style={[styles.choiceBtn, isSel && styles.choiceBtnSelected]}
+              onPress={() => toggle(opt)}
+            >
+              <View
+                style={[
+                  styles.choiceCheckbox,
+                  isSel && styles.choiceCheckboxSelected,
+                ]}
+              >
+                {isSel && <Text style={styles.choiceCheckMark}>✓</Text>}
+              </View>
+              <Text style={styles.choiceText}>{opt}</Text>
+            </TouchableOpacity>
+          );
+        })}
+      </View>
+    );
+  };
+
   return (
     <Modal visible={visible} animationType="slide" onRequestClose={onClose}>
       <View style={styles.container}>
@@ -3666,7 +4101,7 @@ function ScheduleSetupSurvey({
             sessionLength,
             setSessionLength,
           )}
-          {choiceGroup(
+          {multiChoiceGroup(
             "What helps you focus?",
             FOCUS_HELP_OPTIONS,
             focusHelp,
@@ -3993,6 +4428,542 @@ function CheckInCard({
   );
 }
 
+// --- Study Together ----------------------------------------------------------
+// Shared study rooms: focus alongside other learners with a synced pomodoro,
+// live presence, and a room chat. The app has no realtime backend, so the client
+// polls the web /api/rooms endpoints a few times a second and derives the
+// countdown locally from the server clock (mirrors @eliora/shared TogetherRoom).
+type TogetherTimerMode = "focus" | "break" | "idle";
+type TogetherTimer = {
+  mode: TogetherTimerMode;
+  running: boolean;
+  startedAt?: number;
+  durationSec: number;
+  remainingSec?: number;
+  updatedBy?: string;
+};
+type TogetherMember = { id: string; name: string; lastSeen: number };
+type TogetherMessage = {
+  id: string;
+  memberId: string;
+  name: string;
+  text: string;
+  at: number;
+};
+type TogetherRoom = {
+  code: string;
+  name: string;
+  topic?: string;
+  createdAt: number;
+  timer: TogetherTimer;
+  members: TogetherMember[];
+  messages: TogetherMessage[];
+};
+
+const TOGETHER_PRESENCE_MS = 20_000;
+const TOGETHER_ID_KEY = "eliora-together-id";
+const TOGETHER_LAST_KEY = "eliora-together-last";
+
+function togetherRemaining(timer: TogetherTimer, now: number): number {
+  if (timer.mode === "idle") return 0;
+  if (!timer.running) return timer.remainingSec ?? timer.durationSec;
+  if (!timer.startedAt) return timer.durationSec;
+  return Math.max(0, timer.durationSec - Math.floor((now - timer.startedAt) / 1000));
+}
+function togetherClock(sec: number): string {
+  const s = Math.max(0, Math.floor(sec));
+  return `${Math.floor(s / 60)}:${String(s % 60).padStart(2, "0")}`;
+}
+
+function StudyTogether({ profile }: { profile: LearnerProfile | null }) {
+  const name = profile?.name?.trim() || "Guest";
+  const [room, setRoom] = useState<TogetherRoom | null>(null);
+  const [now, setNow] = useState<number>(() => Date.now());
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState("");
+  const [createTopic, setCreateTopic] = useState("");
+  const [joinCode, setJoinCode] = useState("");
+  const [draft, setDraft] = useState("");
+  const memberIdRef = useRef<string>("");
+  const roomRef = useRef<TogetherRoom | null>(null);
+  roomRef.current = room;
+
+  // Stable per-device member id (async load), then auto-rejoin the last room.
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      let id = await AsyncStorage.getItem(TOGETHER_ID_KEY);
+      if (!id) {
+        id = nbId() + nbId();
+        await AsyncStorage.setItem(TOGETHER_ID_KEY, id);
+      }
+      if (cancelled) return;
+      memberIdRef.current = id;
+      const last = await AsyncStorage.getItem(TOGETHER_LAST_KEY);
+      if (last && !cancelled) enter("join", { code: last }, true);
+    })();
+    return () => {
+      cancelled = true;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  // Local 1s tick so the countdown moves smoothly between polls.
+  useEffect(() => {
+    const t = setInterval(() => setNow(Date.now()), 1000);
+    return () => clearInterval(t);
+  }, []);
+
+  // Poll while in a room: refresh presence + pull the latest state.
+  const code = room?.code;
+  useEffect(() => {
+    if (!code) return;
+    let alive = true;
+    const poll = async () => {
+      try {
+        const res = await fetch(
+          `${API_BASE_URL}/api/rooms/${code}?memberId=${encodeURIComponent(
+            memberIdRef.current,
+          )}&name=${encodeURIComponent(name)}`,
+        );
+        if (!alive) return;
+        if (res.status === 404) {
+          await AsyncStorage.removeItem(TOGETHER_LAST_KEY);
+          setRoom(null);
+          setErr("That room has ended.");
+          return;
+        }
+        const data = (await res.json()) as { room?: TogetherRoom };
+        if (data.room && alive) {
+          setRoom(data.room);
+          setNow(Date.now());
+        }
+      } catch {
+        /* transient — next tick retries */
+      }
+    };
+    poll();
+    const t = setInterval(poll, 2500);
+    return () => {
+      alive = false;
+      clearInterval(t);
+    };
+  }, [code, name]);
+
+  async function enter(
+    action: "create" | "join",
+    extra: { name?: string; topic?: string; code?: string },
+    silent = false,
+  ) {
+    if (!memberIdRef.current) return;
+    if (!silent) {
+      setBusy(true);
+      setErr("");
+    }
+    try {
+      const res = await fetch(`${API_BASE_URL}/api/rooms`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          action,
+          memberId: memberIdRef.current,
+          memberName: name,
+          ...extra,
+        }),
+      });
+      const data = (await res.json()) as { room?: TogetherRoom; error?: string };
+      if (data.room) {
+        setRoom(data.room);
+        setNow(Date.now());
+        await AsyncStorage.setItem(TOGETHER_LAST_KEY, data.room.code);
+        setJoinCode("");
+        setCreateTopic("");
+      } else if (!silent) {
+        setErr(data.error || "Couldn't reach that room — try again.");
+      } else {
+        await AsyncStorage.removeItem(TOGETHER_LAST_KEY);
+      }
+    } catch {
+      if (!silent) setErr("Couldn't reach the server. Please try again.");
+    } finally {
+      if (!silent) setBusy(false);
+    }
+  }
+
+  // Fire a room action and adopt the returned state for a snappy response.
+  async function act(body: Record<string, unknown>) {
+    const current = roomRef.current;
+    if (!current) return;
+    try {
+      const res = await fetch(`${API_BASE_URL}/api/rooms/${current.code}`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ memberId: memberIdRef.current, name, ...body }),
+      });
+      const data = (await res.json()) as { room?: TogetherRoom };
+      if (data.room) {
+        setRoom(data.room);
+        setNow(Date.now());
+      }
+    } catch {
+      /* the poll loop will reconcile */
+    }
+  }
+
+  function sendChat() {
+    const text = draft.trim();
+    if (!text) return;
+    setDraft("");
+    act({ action: "message", text });
+  }
+
+  async function leave() {
+    const current = roomRef.current;
+    await AsyncStorage.removeItem(TOGETHER_LAST_KEY);
+    setRoom(null);
+    setDraft("");
+    if (current) {
+      try {
+        await fetch(`${API_BASE_URL}/api/rooms/${current.code}`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ action: "leave", memberId: memberIdRef.current }),
+        });
+      } catch {
+        /* presence timeout will drop us anyway */
+      }
+    }
+  }
+
+  // ---- Landing: create or join --------------------------------------------
+  if (!room) {
+    return (
+      <View style={{ gap: 12 }}>
+        <View style={styles.card}>
+          <View style={styles.cardHead}>
+            <Text style={styles.cardClass}>👥 Study Together</Text>
+          </View>
+          <Text style={[styles.cardRow, { color: "#5b6660" }]}>
+            Focus alongside other learners. Start a room and share the code, or
+            join one — you&apos;ll share a pomodoro timer and a room chat.
+          </Text>
+          {err ? <Text style={togetherStyles.err}>{err}</Text> : null}
+
+          <Text style={togetherStyles.colTitle}>Start a room</Text>
+          <TextInput
+            style={togetherStyles.field}
+            placeholder="What are you working on? (optional)"
+            placeholderTextColor="#8a938d"
+            value={createTopic}
+            maxLength={120}
+            onChangeText={setCreateTopic}
+          />
+          <TouchableOpacity
+            style={[styles.primaryBtn, busy && styles.primaryBtnDisabled]}
+            disabled={busy}
+            onPress={() =>
+              enter("create", {
+                name: `${name.split(" ")[0]}'s room`,
+                topic: createTopic.trim() || undefined,
+              })
+            }
+          >
+            <Text style={styles.primaryBtnText}>
+              {busy ? "Creating…" : "Create room"}
+            </Text>
+          </TouchableOpacity>
+
+          <Text style={[togetherStyles.colTitle, { marginTop: 14 }]}>Join a room</Text>
+          <TextInput
+            style={[togetherStyles.field, togetherStyles.codeField]}
+            placeholder="ENTER CODE"
+            placeholderTextColor="#8a938d"
+            value={joinCode}
+            autoCapitalize="characters"
+            autoCorrect={false}
+            maxLength={6}
+            onChangeText={(t) =>
+              setJoinCode(t.toUpperCase().replace(/[^A-Z0-9]/g, ""))
+            }
+          />
+          <TouchableOpacity
+            style={[styles.ghostBtn, { alignItems: "center" }]}
+            disabled={busy || joinCode.length !== 6}
+            onPress={() => enter("join", { code: joinCode })}
+          >
+            <Text
+              style={[
+                styles.ghostBtnText,
+                (busy || joinCode.length !== 6) && { opacity: 0.5 },
+              ]}
+            >
+              Join room
+            </Text>
+          </TouchableOpacity>
+        </View>
+      </View>
+    );
+  }
+
+  // ---- In a room -----------------------------------------------------------
+  const present = room.members
+    .filter((m) => now - m.lastSeen < TOGETHER_PRESENCE_MS)
+    .sort((a, b) => b.lastSeen - a.lastSeen);
+  const remaining = togetherRemaining(room.timer, now);
+  const running = room.timer.running && room.timer.mode !== "idle";
+  const paused = !room.timer.running && room.timer.mode !== "idle";
+  const isFocus = room.timer.mode === "focus";
+  const timeUp = running && remaining <= 0;
+
+  return (
+    <View style={{ gap: 12 }}>
+      {/* Header */}
+      <View style={styles.card}>
+        <View style={styles.cardHead}>
+          <Text style={styles.cardClass}>👥 {room.name}</Text>
+          <TouchableOpacity onPress={leave}>
+            <Text style={styles.linkBtn}>Leave</Text>
+          </TouchableOpacity>
+        </View>
+        {room.topic ? (
+          <Text style={[styles.cardRow, { color: "#5b6660" }]}>{room.topic}</Text>
+        ) : null}
+        <View style={togetherStyles.codeRow}>
+          <Text style={{ color: "#5b6660", fontSize: 13 }}>Room code</Text>
+          <View style={togetherStyles.codeChip}>
+            <Text style={togetherStyles.codeChipText}>{room.code}</Text>
+          </View>
+        </View>
+      </View>
+
+      {/* Shared timer */}
+      <View style={styles.card}>
+        <View style={styles.cardHead}>
+          <Text style={styles.cardClass}>⏱️ Shared timer</Text>
+          {room.timer.mode !== "idle" ? (
+            <View
+              style={[
+                togetherStyles.phasePill,
+                { backgroundColor: isFocus ? "#2f6f4f" : "#3b9e6f" },
+              ]}
+            >
+              <Text style={togetherStyles.phasePillText}>
+                {isFocus ? "Focus" : "Break"}
+              </Text>
+            </View>
+          ) : null}
+        </View>
+        <Text style={[togetherStyles.clock, timeUp && { fontSize: 30, color: "#2f6f4f" }]}>
+          {timeUp ? "Time's up!" : togetherClock(remaining)}
+        </Text>
+        <View style={togetherStyles.timerBtns}>
+          {room.timer.mode === "idle" || timeUp ? (
+            <>
+              <TouchableOpacity
+                style={[styles.primaryBtn, { flex: 1, alignItems: "center" }]}
+                onPress={() => act({ action: "timer", timer: "focus" })}
+              >
+                <Text style={styles.primaryBtnText}>Focus · 25m</Text>
+              </TouchableOpacity>
+              <TouchableOpacity
+                style={[styles.ghostBtn, { alignItems: "center" }]}
+                onPress={() => act({ action: "timer", timer: "break" })}
+              >
+                <Text style={styles.ghostBtnText}>Break · 5m</Text>
+              </TouchableOpacity>
+            </>
+          ) : (
+            <>
+              {running ? (
+                <TouchableOpacity
+                  style={[styles.ghostBtn, { flex: 1, alignItems: "center" }]}
+                  onPress={() => act({ action: "timer", timer: "pause" })}
+                >
+                  <Text style={styles.ghostBtnText}>Pause</Text>
+                </TouchableOpacity>
+              ) : (
+                <TouchableOpacity
+                  style={[styles.primaryBtn, { flex: 1, alignItems: "center" }]}
+                  onPress={() => act({ action: "timer", timer: "resume" })}
+                >
+                  <Text style={styles.primaryBtnText}>Resume</Text>
+                </TouchableOpacity>
+              )}
+              <TouchableOpacity
+                style={[styles.ghostBtn, { alignItems: "center" }]}
+                onPress={() => act({ action: "timer", timer: "reset" })}
+              >
+                <Text style={styles.ghostBtnText}>Reset</Text>
+              </TouchableOpacity>
+            </>
+          )}
+        </View>
+        {room.timer.updatedBy ? (
+          <Text style={{ color: "#8a938d", fontSize: 12, marginTop: 8 }}>
+            {paused ? "Paused" : "Set"} by {room.timer.updatedBy}
+          </Text>
+        ) : null}
+      </View>
+
+      {/* Presence */}
+      <View style={styles.card}>
+        <View style={styles.cardHead}>
+          <Text style={styles.cardClass}>🟢 Studying now · {present.length}</Text>
+        </View>
+        <View style={togetherStyles.avatars}>
+          {present.map((m) => (
+            <View key={m.id} style={togetherStyles.avatar}>
+              <View style={togetherStyles.avatarDot} />
+              <Text style={togetherStyles.avatarText}>{m.name}</Text>
+            </View>
+          ))}
+        </View>
+      </View>
+
+      {/* Chat */}
+      <View style={styles.card}>
+        <View style={styles.cardHead}>
+          <Text style={styles.cardClass}>💬 Room chat</Text>
+        </View>
+        <View style={{ gap: 10, marginTop: 8 }}>
+          {room.messages.length === 0 ? (
+            <Text style={{ color: "#8a938d", fontSize: 13.5 }}>
+              Say hi 👋 — messages are visible to everyone in the room.
+            </Text>
+          ) : (
+            room.messages.slice(-30).map((m) => {
+              const mine = m.memberId === memberIdRef.current;
+              return (
+                <View
+                  key={m.id}
+                  style={{ alignItems: mine ? "flex-end" : "flex-start" }}
+                >
+                  <Text style={togetherStyles.msgMeta}>{mine ? "You" : m.name}</Text>
+                  <View
+                    style={[
+                      togetherStyles.msgBubble,
+                      mine
+                        ? { backgroundColor: "#2f6f4f" }
+                        : { backgroundColor: "#eef1ee" },
+                    ]}
+                  >
+                    <Text style={{ color: mine ? "#fff" : "#1c2421", fontSize: 14.5 }}>
+                      {m.text}
+                    </Text>
+                  </View>
+                </View>
+              );
+            })
+          )}
+        </View>
+        <View style={togetherStyles.chatRow}>
+          <TextInput
+            style={styles.input}
+            placeholder="Message the room…"
+            placeholderTextColor="#8a938d"
+            value={draft}
+            maxLength={500}
+            onChangeText={setDraft}
+            onSubmitEditing={sendChat}
+            returnKeyType="send"
+          />
+          <TouchableOpacity
+            style={[styles.sendBtn, !draft.trim() && styles.primaryBtnDisabled]}
+            disabled={!draft.trim()}
+            onPress={sendChat}
+          >
+            <Text style={styles.sendText}>Send</Text>
+          </TouchableOpacity>
+        </View>
+      </View>
+    </View>
+  );
+}
+
+const togetherStyles = StyleSheet.create({
+  err: {
+    backgroundColor: "#eef1ee",
+    color: "#2f6f4f",
+    borderRadius: 10,
+    padding: 10,
+    fontSize: 14,
+    marginTop: 8,
+  },
+  colTitle: {
+    fontSize: 12,
+    fontWeight: "700",
+    color: "#5b6660",
+    textTransform: "uppercase",
+    letterSpacing: 0.5,
+    marginTop: 12,
+    marginBottom: 6,
+  },
+  field: {
+    fontSize: 16,
+    backgroundColor: "#fff",
+    borderRadius: 12,
+    borderWidth: 1,
+    borderColor: "#d9ddd8",
+    paddingHorizontal: 14,
+    paddingVertical: 10,
+    marginBottom: 8,
+    color: "#1c2421",
+  },
+  codeField: { textTransform: "uppercase", letterSpacing: 3, fontWeight: "700" },
+  codeRow: {
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "space-between",
+    marginTop: 8,
+  },
+  codeChip: {
+    backgroundColor: "#eef1ee",
+    borderWidth: 1,
+    borderColor: "#d9ddd8",
+    borderRadius: 10,
+    paddingHorizontal: 14,
+    paddingVertical: 6,
+  },
+  codeChipText: {
+    fontSize: 20,
+    fontWeight: "800",
+    letterSpacing: 3,
+    color: "#2f6f4f",
+  },
+  clock: {
+    fontSize: 48,
+    fontWeight: "800",
+    textAlign: "center",
+    color: "#1c2421",
+    paddingVertical: 12,
+  },
+  phasePill: { borderRadius: 999, paddingHorizontal: 10, paddingVertical: 3 },
+  phasePillText: { color: "#fff", fontSize: 12, fontWeight: "700" },
+  timerBtns: { flexDirection: "row", gap: 10, justifyContent: "center" },
+  avatars: { flexDirection: "row", flexWrap: "wrap", gap: 8, marginTop: 8 },
+  avatar: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 6,
+    backgroundColor: "#eef1ee",
+    borderWidth: 1,
+    borderColor: "#d9ddd8",
+    borderRadius: 999,
+    paddingHorizontal: 12,
+    paddingVertical: 5,
+  },
+  avatarDot: { width: 8, height: 8, borderRadius: 4, backgroundColor: "#37b26b" },
+  avatarText: { fontSize: 13.5, fontWeight: "600", color: "#1c2421" },
+  msgMeta: { fontSize: 11, color: "#8a938d", marginBottom: 2, marginHorizontal: 4 },
+  msgBubble: {
+    maxWidth: "85%",
+    paddingHorizontal: 12,
+    paddingVertical: 8,
+    borderRadius: 14,
+  },
+  chatRow: { flexDirection: "row", gap: 8, marginTop: 12, alignItems: "flex-end" },
+});
+
 export default function App() {
   const [chats, setChats] = useState<Chat[]>([]);
   const [activeChatId, setActiveChatId] = useState<string>("");
@@ -4079,7 +5050,7 @@ export default function App() {
   const [editing, setEditing] = useState(false);
   const [summarizing, setSummarizing] = useState(false);
   const [tab, setTab] = useState<
-    "chat" | "study" | "practice" | "calendar" | "plan" | "notebook"
+    "chat" | "study" | "practice" | "calendar" | "plan" | "notebook" | "together"
   >("chat");
   const [input, setInput] = useState("");
   const [busy, setBusy] = useState(false);
@@ -5057,6 +6028,16 @@ export default function App() {
             🧠 Practice
           </Text>
         </TouchableOpacity>
+        <TouchableOpacity
+          style={[styles.viewTab, tab === "together" && styles.viewTabActive]}
+          onPress={() => setTab("together")}
+        >
+          <Text
+            style={[styles.viewTabText, tab === "together" && styles.viewTabTextActive]}
+          >
+            👥 Study Together
+          </Text>
+        </TouchableOpacity>
       </ScrollView>
 
       {tab === "plan" ? (
@@ -5235,7 +6216,7 @@ export default function App() {
                   ["📚 Study guide", "Make me a study guide for what I should review."],
                   ["🎬 Study videos", "Recommend me a few study videos for my class."],
                   ["📱 Short-form recs", "Recommend TikTok, YouTube Shorts, and Instagram accounts or searches for what I'm studying."],
-                  ["🧠 Study tip", "Give me ONE quick, practical study tip I can use right now — a proven technique matched to how I learn and what I struggle with. Keep it to a sentence or two."],
+                  ["🧠 Study tip", studyTipPrompt()],
                   ["💡 Suggestions", "Give me a couple of study suggestions."],
                 ] as const
               ).map(([label, msg]) => (
@@ -5254,6 +6235,7 @@ export default function App() {
             </View>
           </View>
           <SmartNotes profile={profile} />
+          <LessonBuilder profile={profile} onMissed={addMissed} />
         </ScrollView>
       ) : tab === "notebook" ? (
         <NotesWorkspace />
@@ -5266,6 +6248,10 @@ export default function App() {
             onMissed={addMissed}
             onStudyGuide={studyGuideFromQuiz}
           />
+        </ScrollView>
+      ) : tab === "together" ? (
+        <ScrollView contentContainerStyle={styles.studyScroll}>
+          <StudyTogether profile={profile} />
         </ScrollView>
       ) : tab === "calendar" ? (
         <ScrollView contentContainerStyle={styles.studyScroll}>
@@ -5669,6 +6655,32 @@ const styles = StyleSheet.create({
   outChipActive: { backgroundColor: "#2f6f4f", borderColor: "#2f6f4f" },
   outChipText: { fontSize: 13, color: "#5b6660" },
   outChipTextActive: { color: "#fff", fontWeight: "600" },
+  // Lesson player (Khan-Academy-style stepped lessons)
+  lessonProgressTrack: {
+    height: 8,
+    borderRadius: 999,
+    backgroundColor: "#e6eae6",
+    marginTop: 10,
+    overflow: "hidden",
+  },
+  lessonProgressFill: {
+    height: 8,
+    borderRadius: 999,
+    backgroundColor: "#2f6f4f",
+  },
+  lessonOpt: {
+    borderWidth: 1,
+    borderColor: "#d9ddd8",
+    borderRadius: 12,
+    paddingHorizontal: 14,
+    paddingVertical: 12,
+    marginTop: 8,
+    backgroundColor: "#fff",
+  },
+  lessonOptText: { fontSize: 16, color: "#1c2421" },
+  lessonOptPicked: { borderColor: "#2f6f4f", backgroundColor: "#eef5f0" },
+  lessonOptCorrect: { borderColor: "#2e7d32", backgroundColor: "#e4f4e6" },
+  lessonOptWrong: { borderColor: "#c0392b", backgroundColor: "#fbe9e7" },
   // Chat header
   header: {
     paddingTop: 64,
@@ -5928,6 +6940,33 @@ const styles = StyleSheet.create({
   planItemText: { flex: 1, fontSize: 15, color: "#1c2421", lineHeight: 21 },
   planItemDone: { textDecorationLine: "line-through", color: "#8a938d" },
   checkpointBadge: { color: "#b8742a", fontWeight: "700", fontSize: 12 },
+  // Plan path (snake) view
+  pathToggleRow: { flexDirection: "row", gap: 8, marginBottom: 10 },
+  pathToggleBtn: {
+    flex: 1,
+    paddingVertical: 8,
+    paddingHorizontal: 10,
+    borderRadius: 10,
+    borderWidth: 1,
+    borderColor: "#d9ddd8",
+    backgroundColor: "#fff",
+    alignItems: "center",
+  },
+  pathToggleBtnActive: { backgroundColor: "#2f6f4f", borderColor: "#2f6f4f" },
+  pathToggleText: { fontSize: 13, fontWeight: "700", color: "#5b6660" },
+  pathToggleTextActive: { color: "#fff" },
+  pathHerePill: {
+    fontSize: 11,
+    fontWeight: "800",
+    color: "#2f6f4f",
+    backgroundColor: "#fff",
+    borderWidth: 1,
+    borderColor: "#2f6f4f",
+    borderRadius: 999,
+    paddingHorizontal: 8,
+    paddingVertical: 2,
+    overflow: "hidden",
+  },
   // Calendar
   calForm: { gap: 8, marginVertical: 10 },
   calInput: {

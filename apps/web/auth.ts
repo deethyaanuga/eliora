@@ -3,17 +3,24 @@ import Google from "next-auth/providers/google";
 import Credentials from "next-auth/providers/credentials";
 import { verifyUser } from "@/lib/users";
 
-// Read-only Google Classroom scopes so Eliora can pull the signed-in student's
-// own courses, coursework, and grades. Sensitive scopes: the Classroom API must
-// be enabled on the Google Cloud project and these must be added to the OAuth
-// consent screen (app stays in "testing" until Google verifies it — fine for dev).
-const CLASSROOM_SCOPES = [
+// Google scopes Eliora asks for at sign-in:
+//  - Read-only Classroom scopes so it can pull the student's own courses,
+//    coursework, and grades.
+//  - documents: so it can create a Google Doc from the student's notes
+//    (Notes workspace → "Sync to Google Docs"). The new doc lands in the
+//    student's Drive; the Docs API create/batchUpdate calls ride the same token.
+// These are sensitive scopes: the Classroom + Docs APIs must be enabled on the
+// Google Cloud project and each scope added to the OAuth consent screen (the app
+// stays in "testing" until Google verifies it — fine for dev). Adding a scope
+// means existing sessions must sign in with Google again to grant it.
+const GOOGLE_SCOPES = [
   "openid",
   "email",
   "profile",
   "https://www.googleapis.com/auth/classroom.courses.readonly",
   "https://www.googleapis.com/auth/classroom.coursework.me.readonly",
   "https://www.googleapis.com/auth/classroom.student-submissions.me.readonly",
+  "https://www.googleapis.com/auth/documents",
 ].join(" ");
 
 // Auth.js (NextAuth v5). Two ways to sign in:
@@ -51,7 +58,7 @@ export const { handlers, auth, signIn, signOut } = NextAuth({
     Google({
       authorization: {
         params: {
-          scope: CLASSROOM_SCOPES,
+          scope: GOOGLE_SCOPES,
           access_type: "offline",
           prompt: "consent",
         },

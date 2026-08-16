@@ -25,6 +25,16 @@ apps/web/.notif-subs.json
 apps/web/.study-rooms.json
 apps/web/.study-rooms.json.*.tmp
 
+# Local shared-folders store (dev only)
+.shared-folders.json
+apps/web/.shared-folders.json
+apps/web/.shared-folders.json.*.tmp
+
+# Local doubts-board store (dev only)
+.doubts.json
+apps/web/.doubts.json
+apps/web/.doubts.json.*.tmp
+
 # Local anonymized peer-example bank (dev only)
 .student-examples.json
 apps/web/.student-examples.json

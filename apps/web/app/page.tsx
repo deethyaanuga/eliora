@@ -2,6 +2,30 @@
 
 import { useCallback, useEffect, useRef, useState, type ReactNode } from "react";
 import { signIn, signOut, useSession } from "next-auth/react";
+import {
+  buildDoubtTree,
+  countDoubtHelps,
+  doubtAgo,
+  doubtScore,
+  DOUBT_BODY_MAX,
+  DOUBT_GLOBAL_SCOPE,
+  DOUBT_REPLY_MAX,
+  DOUBT_TITLE_MAX,
+  DOUBT_WORK_MAX,
+  ELIORA_DEFAULT_TUTOR,
+  ELIORA_TUTORS,
+  MATERIAL_MAX,
+  myVote,
+  sortDoubts,
+  studyTipPrompt,
+  tutorById,
+  type Doubt,
+  type DoubtGroup,
+  type DoubtReplyNode,
+  type DoubtSort,
+  type ElioraTutor,
+  type StudyMaterial,
+} from "@eliora/shared";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
@@ -1296,13 +1320,37 @@ const TTS_VOICES: { id: string; label: string }[] = [
   { id: "sage", label: "Sage · gentle" },
 ];
 
+// Roughly how long `text` takes to say, used to cap waits on voices that never
+// report they've finished (some browsers ship no voices at all).
+function speechBudgetMs(text: string): number {
+  const words = text.split(/\s+/).filter(Boolean).length;
+  return Math.min(120_000, 4_000 + words * 450);
+}
+
 // Robotic browser voice — the fallback when OpenAI TTS is unavailable.
-function speakFallback(text: string) {
-  if (typeof window === "undefined" || !window.speechSynthesis) return;
-  window.speechSynthesis.cancel();
-  const u = new SpeechSynthesisUtterance(text);
-  u.rate = 0.95;
-  window.speechSynthesis.speak(u);
+// Resolves once it stops talking so callers can wait their turn.
+function speakFallback(text: string): Promise<void> {
+  return new Promise((resolve) => {
+    const synth =
+      typeof window === "undefined" ? null : window.speechSynthesis ?? null;
+    if (!synth) return resolve();
+    synth.cancel();
+    let settled = false;
+    const finish = () => {
+      if (settled) return;
+      settled = true;
+      window.clearTimeout(guard);
+      resolve();
+    };
+    // Some browsers never fire onend (or have no voice installed at all), so
+    // don't let a caller wait on it forever.
+    const guard = window.setTimeout(finish, speechBudgetMs(text));
+    const u = new SpeechSynthesisUtterance(text);
+    u.rate = 0.95;
+    u.onend = finish;
+    u.onerror = finish;
+    synth.speak(u);
+  });
 }
 
 // One shared player so a second "Read aloud" (or a click elsewhere) stops
@@ -1364,9 +1412,308 @@ async function speak(text: string, onState?: (s: "loading" | "playing" | "idle")
     onState?.("playing");
   } catch {
     // Network/API trouble → still read it aloud with the built-in voice.
-    speakFallback(clean);
+    // "idle" only once that voice is done, so the caller isn't told the reading
+    // finished while the browser is still talking.
+    await speakFallback(clean);
     onState?.("idle");
   }
+}
+
+// Like speak(), but resolves when the voice has finished talking (not merely
+// started) — the voice conversation below needs to know when it's safe to
+// listen again without hearing Eliora through the speakers.
+function speakUntilDone(text: string): Promise<void> {
+  return new Promise((resolve) => {
+    if (!text.trim()) return resolve();
+    let settled = false;
+    const finish = () => {
+      if (settled) return;
+      settled = true;
+      window.clearTimeout(guard);
+      resolve();
+    };
+    // Last-ditch guard: if playback never reports that it ended (a stalled
+    // audio element, a browser with no voices), the conversation still moves on
+    // instead of sitting on "speaking" forever.
+    const guard = window.setTimeout(finish, speechBudgetMs(text) + 15_000);
+    void speak(text, (state) => {
+      if (state === "idle") finish();
+    });
+  });
+}
+
+// Markdown reads badly out loud — strip the syntax (and the emoji Eliora likes
+// to sprinkle in) so the voice says the words and nothing else.
+function plainSpeech(md: string): string {
+  return md
+    .replace(/```[\s\S]*?```/g, " (code example on screen) ")
+    .replace(/`([^`]+)`/g, "$1")
+    .replace(/!\[[^\]]*\]\([^)]*\)/g, "")
+    .replace(/\[([^\]]+)\]\([^)]*\)/g, "$1")
+    .replace(/^#{1,6}\s*/gm, "")
+    .replace(/^\s*[-*+]\s+/gm, "")
+    .replace(/^\s*>\s?/gm, "")
+    .replace(/\*\*|__|~~|\*|_/g, "")
+    .replace(/\|/g, " ")
+    .replace(/[\u{1F300}-\u{1FAFF}\u{2600}-\u{27BF}\u{FE0F}]/gu, "")
+    .replace(/\n+/g, ". ")
+    .replace(/\.\s*\.+/g, ".")
+    .replace(/[ \t]+/g, " ")
+    .trim();
+}
+
+type VoicePhase = "listening" | "thinking" | "speaking";
+
+// How long a pause has to last before we treat it as "your turn is over".
+const VOICE_SILENCE_MS = 1300;
+
+// Hands-free conversation: you talk, Eliora answers out loud, then she listens
+// again. Recognition runs in the browser (audio never leaves the device — only
+// the transcript is sent); the reply comes from the normal chat endpoint and is
+// voiced by /api/tts, so it lands in the chat transcript underneath too.
+function VoiceChat({
+  onSend,
+  onClose,
+}: {
+  onSend: (text: string) => Promise<string>;
+  onClose: () => void;
+}) {
+  const [phase, setPhaseState] = useState<VoicePhase>("listening");
+  const [heard, setHeard] = useState("");
+  const [reply, setReply] = useState("");
+  const [error, setError] = useState<string | null>(null);
+
+  // The loop below lives entirely inside one effect, so phase/controls travel
+  // through refs instead of state that would be stale in a callback.
+  const phaseRef = useRef<VoicePhase>("listening");
+  const sendRef = useRef(onSend);
+  const skipRef = useRef<() => void>(() => {});
+  const sendNowRef = useRef<() => void>(() => {});
+  const cutSpeechRef = useRef<(() => void) | null>(null);
+  useEffect(() => {
+    sendRef.current = onSend;
+  });
+
+  const setPhase = (p: VoicePhase) => {
+    phaseRef.current = p;
+    setPhaseState(p);
+  };
+
+  useEffect(() => {
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const w = window as any;
+    const SR = w.SpeechRecognition || w.webkitSpeechRecognition;
+    if (!SR) {
+      setError(
+        "This browser can't listen yet. Chrome, Edge, or Safari support voice mode — or just type your message.",
+      );
+      return;
+    }
+
+    let closed = false;
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    let rec: any = null;
+    let silence: number | undefined;
+    let finalText = "";
+    let heardText = "";
+
+    const clearSilence = () => {
+      if (silence) window.clearTimeout(silence);
+      silence = undefined;
+    };
+
+    const stopListening = () => {
+      clearSilence();
+      if (!rec) return;
+      const r = rec;
+      rec = null;
+      r.onresult = null;
+      r.onend = null;
+      r.onerror = null;
+      try {
+        r.stop();
+      } catch {
+        /* already stopped */
+      }
+    };
+
+    const listen = () => {
+      if (closed) return;
+      stopListening();
+      finalText = "";
+      heardText = "";
+      setHeard("");
+      setReply("");
+      setPhase("listening");
+      const r = new SR();
+      r.lang = "en-US";
+      r.continuous = true;
+      r.interimResults = true;
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      r.onresult = (e: any) => {
+        let interim = "";
+        for (let i = e.resultIndex; i < e.results.length; i++) {
+          const res = e.results[i];
+          if (res.isFinal) finalText += res[0].transcript + " ";
+          else interim += res[0].transcript;
+        }
+        heardText = `${finalText} ${interim}`.replace(/\s+/g, " ").trim();
+        setHeard(heardText);
+        // Pause long enough and we take it as the end of your turn.
+        clearSilence();
+        silence = window.setTimeout(() => {
+          if (heardText.trim()) void takeTurn(heardText.trim());
+        }, VOICE_SILENCE_MS);
+      };
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      r.onerror = (e: any) => {
+        if (e?.error === "not-allowed" || e?.error === "service-not-allowed") {
+          setError(
+            "Microphone access is blocked. Allow it in your browser (the 🔒 icon in the address bar), then open voice mode again.",
+          );
+          closed = true;
+          stopListening();
+        }
+        // "no-speech" and "aborted" are normal — onend restarts us.
+      };
+      r.onend = () => {
+        // Chrome cuts recognition off after a lull; restart so the
+        // conversation stays hands-free.
+        if (!closed && rec === r && phaseRef.current === "listening") {
+          try {
+            r.start();
+          } catch {
+            /* already restarting */
+          }
+        }
+      };
+      rec = r;
+      try {
+        r.start();
+      } catch {
+        /* already running */
+      }
+    };
+
+    const takeTurn = async (said: string) => {
+      stopListening();
+      setHeard(said);
+      setReply("");
+      setPhase("thinking");
+      let answer = "";
+      try {
+        answer = await sendRef.current(said);
+      } catch {
+        answer = "Sorry — I couldn't reach the server. Let's try that again.";
+      }
+      if (closed) return;
+      setReply(answer);
+      const spoken = plainSpeech(answer);
+      if (spoken) {
+        setPhase("speaking");
+        // Racing against a resolver lets "Skip" (or hanging up) cut the voice
+        // off without leaving this await hanging forever.
+        const interrupted = new Promise<void>((res) => {
+          cutSpeechRef.current = res;
+        });
+        await Promise.race([speakUntilDone(spoken), interrupted]);
+        cutSpeechRef.current = null;
+        stopSpeaking();
+      }
+      if (!closed) listen();
+    };
+
+    skipRef.current = () => {
+      stopSpeaking();
+      cutSpeechRef.current?.();
+    };
+    sendNowRef.current = () => {
+      const said = heardText.trim();
+      if (said) void takeTurn(said);
+    };
+
+    listen();
+    return () => {
+      closed = true;
+      stopListening();
+      stopSpeaking();
+      cutSpeechRef.current?.();
+    };
+  }, []);
+
+  const status = error
+    ? "Voice mode needs a hand"
+    : phase === "listening"
+      ? "Listening…"
+      : phase === "thinking"
+        ? "Thinking…"
+        : "Eliora is talking";
+
+  return (
+    <div style={styles.voiceOverlay}>
+      <div style={styles.voiceCard}>
+        <div style={styles.voiceHead}>
+          <span style={styles.voiceTitle}>🎙️ Voice mode</span>
+          <button
+            style={styles.recCloseBtn}
+            onClick={onClose}
+            aria-label="Leave voice mode"
+          >
+            ✕
+          </button>
+        </div>
+
+        <div
+          className={`eliora-orb${error ? "" : ` ${phase}`}`}
+          style={styles.voiceOrb}
+          aria-hidden
+        >
+          🌱
+        </div>
+
+        <div style={styles.voiceStatus} aria-live="polite">
+          {status}
+        </div>
+
+        {error ? (
+          <p style={styles.voiceError}>{error}</p>
+        ) : (
+          <>
+            <p style={styles.voiceHeard}>
+              {heard ||
+                (phase === "listening"
+                  ? "Go ahead — say anything. Pause for a second when you're done and I'll answer."
+                  : "…")}
+            </p>
+            {reply && <p style={styles.voiceReply}>{reply}</p>}
+          </>
+        )}
+
+        <div style={styles.voiceControls}>
+          {!error && phase === "listening" && heard.trim() && (
+            <button style={styles.recSecondary} onClick={() => sendNowRef.current()}>
+              ⏎ Send now
+            </button>
+          )}
+          {!error && phase === "speaking" && (
+            <button style={styles.recSecondary} onClick={() => skipRef.current()}>
+              ⏭ Skip — my turn
+            </button>
+          )}
+          <button style={styles.recPrimary} onClick={onClose}>
+            ⏹ End voice chat
+          </button>
+        </div>
+
+        {!error && (
+          <p style={styles.voiceHint}>
+            Everything you say lands in this chat, so you can scroll back and
+            read it later.
+          </p>
+        )}
+      </div>
+    </div>
+  );
 }
 
 // "Read aloud" control with live loading / playing state.
@@ -3983,6 +4330,262 @@ function weakTopicPrompts(missed: string[]): WeakPrompt[] {
 // back" jumps straight to the Feynman exercise on what you already know. Tapping
 // a suggestion chip fills the box so you can then pick which of the two to run.
 // Suggestions lead with weak spots, then class + subject folders.
+// The AI tutors shelf on the home screen. Each tutor is the same Eliora with a
+// subject lens, a teaching style, and a matching read-aloud voice — picking one
+// changes how every later chat explains things, so the choice sticks until it's
+// changed. Tapping the selected tutor again opens a fresh session with them.
+function TutorPicker({
+  selected,
+  busy,
+  materials,
+  materialBusy,
+  materialError,
+  onSelect,
+  onStart,
+  onAddMaterial,
+  onRemoveMaterial,
+}: {
+  selected: string;
+  busy: boolean;
+  materials: StudyMaterial[];
+  materialBusy: string | null; // name of the material currently being read
+  materialError: string;
+  onSelect: (id: string) => void;
+  onStart: (tutor: ElioraTutor) => void;
+  onAddMaterial: (source: { file?: File; text?: string }) => void;
+  onRemoveMaterial: (id: string) => void;
+}) {
+  const active = tutorById(selected);
+  const [previewing, setPreviewing] = useState(false);
+  return (
+    <div style={styles.card}>
+      <div style={styles.cardHead}>
+        <span style={styles.cardClass}>🧑‍🏫 AI tutors</span>
+        <span style={{ color: "var(--muted)", fontSize: 13 }}>
+          {active.emoji} {active.name}
+        </span>
+      </div>
+      <p style={{ color: "var(--muted)", margin: "2px 0 12px", fontSize: 13 }}>
+        Pick who teaches you. Each tutor explains their subject differently and
+        has their own voice — everything else (your plan, goals, and tools)
+        stays the same.
+      </p>
+      <div style={styles.tutorGrid}>
+        {ELIORA_TUTORS.map((t) => {
+          const isActive = t.id === active.id;
+          return (
+            <button
+              key={t.id}
+              className="eliora-action-card"
+              style={{
+                ...styles.tutorCard,
+                ...(isActive ? styles.tutorCardActive : null),
+              }}
+              aria-pressed={isActive}
+              onClick={() => onSelect(t.id)}
+            >
+              <span style={styles.tutorAvatar}>{t.emoji}</span>
+              <span style={styles.tutorName}>{t.name}</span>
+              <span style={styles.tutorSubject}>{t.subject}</span>
+              <span style={styles.tutorTagline}>{t.tagline}</span>
+            </button>
+          );
+        })}
+      </div>
+      <div style={styles.tutorActions}>
+        <button
+          style={styles.tutorStartBtn}
+          disabled={busy}
+          onClick={() => onStart(active)}
+          title={`Start a new chat with ${active.name}`}
+        >
+          Start a session with {active.name} →
+        </button>
+        <button
+          style={styles.tutorVoiceBtn}
+          disabled={previewing}
+          onClick={() =>
+            void speak(
+              `Hi, I'm ${active.name}. I help with ${active.subject.toLowerCase()}. ` +
+                `Tell me what you're working on and we'll take it one step at a time.`,
+              (s) => setPreviewing(s !== "idle"),
+            )
+          }
+        >
+          {previewing ? "🔊 Playing…" : "🔊 Hear their voice"}
+        </button>
+      </div>
+      <TutorMaterial
+        tutor={active}
+        materials={materials}
+        busyName={materialBusy}
+        error={materialError}
+        onAdd={onAddMaterial}
+        onRemove={onRemoveMaterial}
+      />
+    </div>
+  );
+}
+
+// "Teach from my textbook" — upload a chapter (PDF), photograph a page, or
+// paste the text. The material is read once into a digest (sections + key
+// terms) that then rides along in every chat, so the tutor teaches from the
+// learner's actual book instead of general knowledge.
+function TutorMaterial({
+  tutor,
+  materials,
+  busyName,
+  error,
+  onAdd,
+  onRemove,
+}: {
+  tutor: ElioraTutor;
+  materials: StudyMaterial[];
+  busyName: string | null;
+  error: string;
+  onAdd: (source: { file?: File; text?: string }) => void;
+  onRemove: (id: string) => void;
+}) {
+  const [pasting, setPasting] = useState(false);
+  const [text, setText] = useState("");
+  const [openId, setOpenId] = useState<string | null>(null);
+  const fileRef = useRef<HTMLInputElement>(null);
+  const atCap = materials.length >= MATERIAL_MAX;
+  return (
+    <div style={styles.tutorMaterial}>
+      <div style={styles.tutorMaterialHead}>
+        <span style={styles.tutorMaterialTitle}>📚 Teach from my textbook</span>
+        {materials.length > 0 && (
+          <span style={{ color: "var(--muted)", fontSize: 12 }}>
+            {materials.length}/{MATERIAL_MAX} added
+          </span>
+        )}
+      </div>
+      <p style={{ color: "var(--muted)", margin: "2px 0 10px", fontSize: 13 }}>
+        Upload a chapter, snap a photo of a page, or paste the text.{" "}
+        {tutor.name} will teach from it — your book&apos;s wording, your
+        book&apos;s sections.
+      </p>
+
+      {materials.map((m) => (
+        <div key={m.id} style={styles.materialRow}>
+          <button
+            className="eliora-row-btn"
+            style={styles.materialRowMain}
+            onClick={() => setOpenId(openId === m.id ? null : m.id)}
+            title="What's in this material"
+          >
+            <span style={{ flexShrink: 0 }}>📕</span>
+            <span style={{ flex: 1, textAlign: "left", minWidth: 0 }}>
+              <span style={styles.materialTitle}>{m.title}</span>
+              <span style={styles.materialMeta}>
+                {m.topics.length} section{m.topics.length === 1 ? "" : "s"}
+                {m.terms.length ? ` · ${m.terms.length} terms` : ""} · {m.source}
+              </span>
+            </span>
+            <span style={{ color: "var(--muted)" }}>
+              {openId === m.id ? "▾" : "›"}
+            </span>
+          </button>
+          <button
+            style={styles.materialRemove}
+            onClick={() => onRemove(m.id)}
+            aria-label={`Remove ${m.title}`}
+            title="Remove this material"
+          >
+            ×
+          </button>
+          {openId === m.id && (
+            <div style={styles.materialDetail}>
+              {m.overview && (
+                <p style={{ margin: "0 0 8px" }}>{m.overview}</p>
+              )}
+              <ol style={styles.materialTopicList}>
+                {m.topics.map((t, i) => (
+                  <li key={i}>{t.title}</li>
+                ))}
+              </ol>
+            </div>
+          )}
+        </div>
+      ))}
+
+      {busyName && (
+        <div style={styles.materialReading}>
+          ⏳ Reading “{busyName}” — this takes a few seconds for a long chapter.
+        </div>
+      )}
+      {error && <div style={styles.materialError}>{error}</div>}
+
+      {pasting ? (
+        <div style={{ marginTop: 8 }}>
+          <textarea
+            style={styles.materialTextarea}
+            value={text}
+            placeholder="Paste the chapter or your notes here…"
+            onChange={(e) => setText(e.target.value)}
+          />
+          <div style={styles.tutorActions}>
+            <button
+              style={styles.tutorStartBtn}
+              disabled={text.trim().length < 40 || !!busyName}
+              onClick={() => {
+                onAdd({ text: text.trim() });
+                setText("");
+                setPasting(false);
+              }}
+            >
+              Add this material
+            </button>
+            <button
+              style={styles.tutorVoiceBtn}
+              onClick={() => {
+                setPasting(false);
+                setText("");
+              }}
+            >
+              Cancel
+            </button>
+          </div>
+        </div>
+      ) : (
+        <div style={styles.tutorActions}>
+          <input
+            ref={fileRef}
+            type="file"
+            accept=".pdf,.txt,.md,.markdown,.csv,image/*,application/pdf"
+            style={{ display: "none" }}
+            onChange={(e) => {
+              const f = e.target.files?.[0];
+              if (f) onAdd({ file: f });
+              e.target.value = ""; // let them re-pick the same file
+            }}
+          />
+          <button
+            style={styles.tutorVoiceBtn}
+            disabled={!!busyName || atCap}
+            onClick={() => fileRef.current?.click()}
+            title={
+              atCap
+                ? `Remove one first — ${MATERIAL_MAX} materials is the limit`
+                : "PDF, photo of a page, or a text file"
+            }
+          >
+            📤 Upload a chapter
+          </button>
+          <button
+            style={styles.tutorVoiceBtn}
+            disabled={!!busyName || atCap}
+            onClick={() => setPasting(true)}
+          >
+            📋 Paste text
+          </button>
+        </div>
+      )}
+    </div>
+  );
+}
+
 function LearnStarter({
   profile,
   subjects,
@@ -9099,6 +9702,56 @@ function ScheduleGrid({
     </div>
   );
 
+  // Like setupChoice but multi-select — value is a comma-joined list.
+  const setupMultiChoice = (
+    question: string,
+    options: string[],
+    value: string,
+    setValue: (s: string) => void,
+  ) => {
+    const chosen = new Set(
+      value ? value.split(",").map((s) => s.trim()).filter(Boolean) : [],
+    );
+    const toggle = (opt: string) => {
+      const next = new Set(chosen);
+      if (next.has(opt)) next.delete(opt);
+      else next.add(opt);
+      setValue([...next].join(", "));
+    };
+    return (
+      <div style={styles.label}>
+        {question}{" "}
+        <span style={styles.choiceHint}>(select all that apply)</span>
+        <div style={styles.choiceList}>
+          {options.map((opt) => {
+            const isSel = chosen.has(opt);
+            return (
+              <button
+                key={opt}
+                type="button"
+                onClick={() => toggle(opt)}
+                style={{
+                  ...styles.choiceBtn,
+                  ...(isSel ? styles.choiceBtnSelected : {}),
+                }}
+              >
+                <span
+                  style={{
+                    ...styles.choiceCheckbox,
+                    ...(isSel ? styles.choiceCheckboxSelected : {}),
+                  }}
+                >
+                  {isSel ? "✓" : ""}
+                </span>
+                {opt}
+              </button>
+            );
+          })}
+        </div>
+      </div>
+    );
+  };
+
   // Per-task countdown timer. One block runs at a time. `total`/`study` let us
   // credit the finished session's minutes toward "hours studied" (study blocks
   // only), logged once when the countdown runs out.
@@ -9196,7 +9849,7 @@ function ScheduleGrid({
             suSessionLength,
             setSuSessionLength,
           )}
-          {setupChoice(
+          {setupMultiChoice(
             "What helps you focus?",
             FOCUS_HELP_OPTIONS,
             suFocusHelp,
@@ -11821,14 +12474,14 @@ function Summarizer({
 
   return (
     <div style={styles.tabPanel}>
-        <div style={styles.modalHead}>
-          <h2 style={styles.modalTitle}>Summarize notes</h2>
-          {onClose && (
+        {onClose && (
+          <div style={styles.modalHead}>
+            <h2 style={styles.modalTitle}>Summarize notes</h2>
             <button style={styles.linkBtn} onClick={onClose}>
               Close
             </button>
-          )}
-        </div>
+          </div>
+        )}
 
         <div style={styles.tabs}>
           {(["text", "video", "doc"] as const).map((t) => (
@@ -12896,6 +13549,7 @@ function AssignmentFeedback({
 }
 
 type NotesMode = "clean" | "handwriting" | "highlight";
+type NotesFormat = "outline" | "cornell" | "paragraph" | "qa";
 type PolishedNotes = {
   cleaned: string;
   keyIdeas: string[];
@@ -12908,6 +13562,7 @@ type PolishedNotes = {
 // Three modes map to the three AI note features; all hit /api/notes-polish.
 function SmartNotes({ profile }: { profile: LearnerProfile | null }) {
   const [mode, setMode] = useState<NotesMode>("clean");
+  const [format, setFormat] = useState<NotesFormat>("outline");
   const [text, setText] = useState("");
   const [file, setFile] = useState<{
     base64: string;
@@ -12918,6 +13573,12 @@ function SmartNotes({ profile }: { profile: LearnerProfile | null }) {
   const [out, setOut] = useState<PolishedNotes | null>(null);
   const [err, setErr] = useState("");
   const [copied, setCopied] = useState(false);
+  // Follow-up chat about the notes we just cleaned up.
+  const [qa, setQa] = useState<
+    { role: "user" | "assistant"; content: string }[]
+  >([]);
+  const [question, setQuestion] = useState("");
+  const [asking, setAsking] = useState(false);
   const canSubmit = (text.trim().length >= 10 || !!file) && !loading;
 
   function onFile(files: FileList | null) {
@@ -12943,12 +13604,16 @@ function SmartNotes({ profile }: { profile: LearnerProfile | null }) {
     setErr("");
     setOut(null);
     setCopied(false);
+    // A fresh set of notes means a fresh conversation about them.
+    setQa([]);
+    setQuestion("");
     try {
       const res = await fetch("/api/notes-polish", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           mode,
+          format,
           text: text.trim() || undefined,
           fileBase64: file?.base64,
           fileMediaType: file?.mediaType,
@@ -12982,11 +13647,91 @@ function SmartNotes({ profile }: { profile: LearnerProfile | null }) {
     }
   }
 
+  // Everything the AI produced, flattened into one block of text — this is the
+  // source of truth the chatbot is allowed to answer from.
+  function notesContext(o: PolishedNotes) {
+    const parts = [o.cleaned.replace(/==([^=]+)==/g, "$1")];
+    if (o.keyIdeas.length)
+      parts.push(`Key ideas:\n${o.keyIdeas.map((i) => `- ${i}`).join("\n")}`);
+    if (o.keyTerms.length)
+      parts.push(
+        `Key terms:\n${o.keyTerms
+          .map((t) => `- ${t.term}: ${t.definition}`)
+          .join("\n")}`,
+      );
+    return parts.filter(Boolean).join("\n\n");
+  }
+
+  // Ask a follow-up about the cleaned notes. Streams the answer back token by
+  // token, same as the Summarize tool's Q&A.
+  async function ask(preset?: string) {
+    const q = (preset ?? question).trim();
+    if (!q || asking || !out) return;
+    setAsking(true);
+    setQuestion("");
+    // Show the question right away, plus a placeholder that fills in.
+    const history = qa;
+    setQa([
+      ...history,
+      { role: "user", content: q },
+      { role: "assistant", content: "" },
+    ]);
+    try {
+      const res = await fetch("/api/notes-qa", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          notes: notesContext(out),
+          question: q,
+          history,
+          profile: profile ?? undefined,
+        }),
+      });
+      if (!res.body) throw new Error("no stream");
+      const reader = res.body.getReader();
+      const decoder = new TextDecoder();
+      let acc = "";
+      while (true) {
+        const { value, done } = await reader.read();
+        if (done) break;
+        acc += decoder.decode(value, { stream: true });
+        setQa([
+          ...history,
+          { role: "user", content: q },
+          { role: "assistant", content: acc },
+        ]);
+      }
+    } catch {
+      setQa([
+        ...history,
+        { role: "user", content: q },
+        {
+          role: "assistant",
+          content: "Sorry, I couldn't answer that. Please try again.",
+        },
+      ]);
+    } finally {
+      setAsking(false);
+    }
+  }
+
   const modes = [
     ["clean", "🧹 Clean up"],
     ["handwriting", "✍️ Handwriting"],
     ["highlight", "🖍️ Highlight"],
   ] as const;
+  const formats = [
+    ["outline", "🗂️ Outline"],
+    ["cornell", "📔 Cornell"],
+    ["paragraph", "📄 Paragraphs"],
+    ["qa", "❓ Q&A"],
+  ] as const;
+  const starters = [
+    "Explain this more simply",
+    "Quiz me on these notes",
+    "What's most important here?",
+    "Give me an example",
+  ];
 
   return (
     <div style={styles.card}>
@@ -13003,6 +13748,18 @@ function SmartNotes({ profile }: { profile: LearnerProfile | null }) {
             key={k}
             onClick={() => setMode(k)}
             style={{ ...styles.outChip, ...(mode === k ? styles.outChipActive : {}) }}
+          >
+            {label}
+          </button>
+        ))}
+      </div>
+      <div style={{ ...styles.outputRow, marginTop: 6, alignItems: "center" }}>
+        <span style={{ color: "var(--muted)", fontSize: 12.5 }}>Format:</span>
+        {formats.map(([k, label]) => (
+          <button
+            key={k}
+            onClick={() => setFormat(k)}
+            style={{ ...styles.outChip, ...(format === k ? styles.outChipActive : {}) }}
           >
             {label}
           </button>
@@ -13103,6 +13860,72 @@ function SmartNotes({ profile }: { profile: LearnerProfile | null }) {
               ))}
             </>
           )}
+          {/* Chat about the notes — grounded in the cleaned result above. */}
+          <div style={{ ...styles.qaBox, marginTop: 16 }}>
+            <div style={styles.qaHead}>💬 Chat about these notes</div>
+            {qa.length === 0 && (
+              <>
+                <p style={{ color: "var(--muted)", fontSize: 12.5, margin: 0 }}>
+                  Ask me anything about what&apos;s above — I&apos;ll answer from
+                  your notes.
+                </p>
+                <div style={styles.outputRow}>
+                  {starters.map((s) => (
+                    <button
+                      key={s}
+                      style={{
+                        ...styles.outChip,
+                        ...(asking ? { opacity: 0.5, cursor: "default" } : {}),
+                      }}
+                      disabled={asking}
+                      onClick={() => ask(s)}
+                    >
+                      {s}
+                    </button>
+                  ))}
+                </div>
+              </>
+            )}
+            {qa.map((m, i) => (
+              <div
+                key={i}
+                style={m.role === "user" ? styles.qaUser : styles.qaBot}
+              >
+                {m.role === "user" ? (
+                  m.content
+                ) : m.content ? (
+                  <div style={styles.resultMd}>
+                    {renderMarkdown(m.content, "var(--accent)")}
+                  </div>
+                ) : (
+                  "Thinking…"
+                )}
+              </div>
+            ))}
+            <div style={styles.qaInputRow}>
+              <input
+                style={styles.formInput}
+                value={question}
+                onChange={(e) => setQuestion(e.target.value)}
+                onKeyDown={(e) => {
+                  if (e.key === "Enter") ask();
+                }}
+                placeholder="e.g. Can you explain the second point more simply?"
+              />
+              <button
+                style={{
+                  ...styles.primaryBtn,
+                  ...(asking || !question.trim()
+                    ? { opacity: 0.5, cursor: "default" }
+                    : {}),
+                }}
+                onClick={() => ask()}
+                disabled={asking || !question.trim()}
+              >
+                {asking ? "…" : "Ask"}
+              </button>
+            </div>
+          </div>
         </div>
       )}
     </div>
@@ -13771,6 +14594,115 @@ function CanvasBoard({
   );
 }
 
+// "Sync to Google Docs" for a single note. Rides the existing Google login and
+// posts the note to /api/notes/export-doc, which creates a formatted doc and
+// returns its link. Falls back to a Google-sign-in nudge if the account isn't
+// Google (the Docs scope only comes with a Google login).
+function GoogleDocsSync({ note }: { note: NoteDoc }) {
+  const { data: session } = useSession();
+  const isGoogle =
+    (session as { authProvider?: string } | null)?.authProvider === "google";
+  const [state, setState] = useState<"idle" | "saving" | "done" | "error">(
+    "idle",
+  );
+  const [msg, setMsg] = useState("");
+  const [url, setUrl] = useState("");
+
+  async function sync() {
+    setState("saving");
+    setMsg("");
+    setUrl("");
+    try {
+      const res = await fetch("/api/notes/export-doc", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          title: note.title,
+          template: note.template,
+          body: note.body,
+          cue: note.cue,
+          summary: note.summary,
+        }),
+      });
+      const data = (await res.json()) as {
+        url?: string;
+        error?: string;
+        needsGoogle?: boolean;
+      };
+      if (data.url) {
+        setUrl(data.url);
+        setState("done");
+        window.open(data.url, "_blank", "noopener,noreferrer");
+      } else if (data.needsGoogle) {
+        setState("error");
+        setMsg(data.error || "Sign in with Google to save to Docs.");
+      } else {
+        setState("error");
+        setMsg(data.error || "Couldn't save to Google Docs — try again.");
+      }
+    } catch {
+      setState("error");
+      setMsg("Couldn't reach the server. Please try again.");
+    }
+  }
+
+  return (
+    <div style={{ display: "flex", alignItems: "center", gap: 10, flexWrap: "wrap" }}>
+      {isGoogle ? (
+        <button
+          onClick={sync}
+          disabled={state === "saving"}
+          style={{
+            padding: "6px 14px",
+            borderRadius: 999,
+            border: "1px solid var(--border)",
+            background: "var(--bg)",
+            color: "var(--assistant-text)",
+            fontSize: 13,
+            fontWeight: 700,
+            cursor: state === "saving" ? "default" : "pointer",
+            opacity: state === "saving" ? 0.6 : 1,
+            display: "inline-flex",
+            alignItems: "center",
+            gap: 6,
+          }}
+        >
+          📄 {state === "saving" ? "Saving to Google Docs…" : "Sync to Google Docs"}
+        </button>
+      ) : (
+        <button
+          onClick={() => signIn("google", { callbackUrl: "/" })}
+          style={{
+            padding: "6px 14px",
+            borderRadius: 999,
+            border: "1px solid var(--border)",
+            background: "var(--bg)",
+            color: "var(--assistant-text)",
+            fontSize: 13,
+            fontWeight: 700,
+            cursor: "pointer",
+          }}
+        >
+          📄 Sign in with Google to save to Docs
+        </button>
+      )}
+      {state === "done" && url && (
+        <a
+          href={url}
+          target="_blank"
+          rel="noopener noreferrer"
+          style={{ fontSize: 12.5, color: "var(--accent)", fontWeight: 700 }}
+        >
+          ✓ Opened in Google Docs
+        </a>
+      )}
+      {state === "error" && msg && (
+        <span style={{ fontSize: 12.5, color: "#c0392b" }}>{msg}</span>
+      )}
+    </div>
+  );
+}
+
 function NotesWorkspace({ ns }: { ns: string }) {
   const STORE_KEY = `eliora-notebook::${ns}`;
   const [docs, setDocs] = useState<NoteDoc[]>([]);
@@ -14065,6 +14997,7 @@ function NotesWorkspace({ ns }: { ns: string }) {
               />
             ) : (
               <>
+            <GoogleDocsSync note={active} />
             {/* Concept color toolbar */}
             <div style={{ display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap" }}>
               <span style={{ fontSize: 12.5, color: "var(--muted)", fontWeight: 600 }}>
@@ -15314,6 +16247,11 @@ function togetherClock(sec: number): string {
 }
 
 function StudyTogether({ name }: { name: string }) {
+  // Two halves: live rooms (focus alongside someone right now) and the doubts
+  // board (ask a question, get answered later). Rooms keep polling in the
+  // background while you're reading doubts, so switching tabs doesn't drop you
+  // out of a session.
+  const [view, setView] = useState<"rooms" | "doubts">("rooms");
   const [room, setRoom] = useState<TogetherRoom | null>(null);
   const [now, setNow] = useState(() => Date.now());
   const [busy, setBusy] = useState(false);
@@ -15477,10 +16415,42 @@ function StudyTogether({ name }: { name: string }) {
     }
   }
 
+  const tabs = (
+    <div style={styles.tabBar}>
+      {(
+        [
+          ["rooms", "⏱️ Rooms"],
+          ["doubts", "🙋 Doubts"],
+        ] as const
+      ).map(([key, label]) => (
+        <button
+          key={key}
+          style={{
+            ...styles.viewTab,
+            ...(view === key ? styles.viewTabActive : {}),
+          }}
+          onClick={() => setView(key)}
+        >
+          {label}
+        </button>
+      ))}
+    </div>
+  );
+
+  if (view === "doubts") {
+    return (
+      <div style={styles.studyScroll}>
+        {tabs}
+        <DoubtsBoard name={name} />
+      </div>
+    );
+  }
+
   // ---- Landing: create or join --------------------------------------------
   if (!room) {
     return (
       <div style={styles.studyScroll}>
+        {tabs}
         <div style={styles.card}>
           <div style={styles.cardHead}>
             <span style={styles.cardClass}>👥 Study Together</span>
@@ -15566,6 +16536,7 @@ function StudyTogether({ name }: { name: string }) {
 
   return (
     <div style={styles.studyScroll}>
+      {tabs}
       {/* Header */}
       <div style={styles.card}>
         <div style={{ ...styles.cardHead, marginBottom: 2 }}>
@@ -15843,6 +16814,1702 @@ const tstyles = {
   chatRow: { display: "flex", gap: 8, marginTop: 10 } as React.CSSProperties,
 };
 
+// --- Doubts board -------------------------------------------------------------
+// The asynchronous half of Study Together: post what you're stuck on with your
+// working shown, and other learners answer in a Reddit-style thread — nested
+// replies, up/down votes, and the asker marks the answer that unstuck them.
+//
+// Two scopes: the global feed (everyone on Eliora) or a private group you join
+// with a code. Group codes live in localStorage, so "my groups" is per-device
+// exactly like the room id — knowing the code is membership.
+//
+// Types and the pure ranking/threading helpers come from @eliora/shared; unlike
+// StudyTogether above (which predates them) this imports them directly rather
+// than keeping client-side copies.
+type DoubtGroupRef = { code: string; name: string };
+
+const DOUBT_GROUPS_KEY = "eliora-doubt-groups";
+const DOUBT_SCOPE_KEY = "eliora-doubt-scope";
+
+function DoubtsBoard({ name }: { name: string }) {
+  // Per-device id, shared with Study Together so your posts and your room
+  // presence are the same "you".
+  const [memberId, setMemberId] = useState("");
+  const [groups, setGroups] = useState<DoubtGroupRef[]>([]);
+  const [scope, setScope] = useState<string>(DOUBT_GLOBAL_SCOPE);
+  const [doubts, setDoubts] = useState<Doubt[]>([]);
+  const [sort, setSort] = useState<DoubtSort>("top");
+  const [loaded, setLoaded] = useState(false);
+  const [err, setErr] = useState("");
+  const [now, setNow] = useState(() => Date.now());
+
+  // Which thread is expanded, and where a reply box is currently open.
+  const [openId, setOpenId] = useState<string | null>(null);
+  const [replyTo, setReplyTo] = useState<{ doubtId: string; parentId?: string } | null>(
+    null,
+  );
+  const [replyText, setReplyText] = useState("");
+  const [replyWork, setReplyWork] = useState("");
+  const [replyShowWork, setReplyShowWork] = useState(false);
+
+  // The "ask a doubt" composer.
+  const [asking, setAsking] = useState(false);
+  const [title, setTitle] = useState("");
+  const [subject, setSubject] = useState("");
+  const [body, setBody] = useState("");
+  const [work, setWork] = useState("");
+  const [busy, setBusy] = useState(false);
+
+  // The group create/join panel.
+  const [showGroups, setShowGroups] = useState(false);
+  const [groupName, setGroupName] = useState("");
+  const [joinCode, setJoinCode] = useState("");
+  const [copied, setCopied] = useState(false);
+
+  // Restore identity, saved groups, and the last scope viewed.
+  useEffect(() => {
+    let id = localStorage.getItem(TOGETHER_ID_KEY);
+    if (!id) {
+      id =
+        typeof crypto !== "undefined" && crypto.randomUUID
+          ? crypto.randomUUID()
+          : `m-${Date.now()}-${Math.floor(Math.random() * 1e9)}`;
+      localStorage.setItem(TOGETHER_ID_KEY, id);
+    }
+    setMemberId(id);
+    try {
+      const saved = JSON.parse(localStorage.getItem(DOUBT_GROUPS_KEY) ?? "[]");
+      if (Array.isArray(saved)) setGroups(saved);
+    } catch {
+      /* corrupt entry — start with no groups */
+    }
+    const last = localStorage.getItem(DOUBT_SCOPE_KEY);
+    if (last) setScope(last);
+  }, []);
+
+  // Relative bylines ("2h ago") only need a slow tick.
+  useEffect(() => {
+    const t = setInterval(() => setNow(Date.now()), 30_000);
+    return () => clearInterval(t);
+  }, []);
+
+  const saveGroups = useCallback((next: DoubtGroupRef[]) => {
+    setGroups(next);
+    localStorage.setItem(DOUBT_GROUPS_KEY, JSON.stringify(next));
+  }, []);
+
+  const pickScope = useCallback((next: string) => {
+    setScope(next);
+    setOpenId(null);
+    setReplyTo(null);
+    setLoaded(false);
+    setErr("");
+    localStorage.setItem(DOUBT_SCOPE_KEY, next);
+  }, []);
+
+  // Poll the feed. Slower than a study room (2.5s) — a doubts board is
+  // asynchronous by nature, so every few seconds is plenty. Reading is
+  // anonymous; memberId only decides which posts render as "You".
+  useEffect(() => {
+    let alive = true;
+    async function poll() {
+      try {
+        const res = await fetch(
+          `/api/doubts?scope=${encodeURIComponent(scope)}`,
+          { cache: "no-store" },
+        );
+        if (!alive) return;
+        if (res.status === 404) {
+          // The saved group is gone — fall back to the global feed.
+          setErr("That group no longer exists.");
+          setLoaded(true);
+          pickScope(DOUBT_GLOBAL_SCOPE);
+          return;
+        }
+        const data = (await res.json()) as { feed?: { doubts: Doubt[] } };
+        if (alive && data.feed) {
+          setDoubts(data.feed.doubts);
+          setLoaded(true);
+        }
+      } catch {
+        /* transient — the next tick retries */
+      }
+    }
+    void poll();
+    const t = setInterval(poll, 5000);
+    return () => {
+      alive = false;
+      clearInterval(t);
+    };
+  }, [scope, pickScope]);
+
+  // Fire an action and adopt the returned feed so the UI updates immediately
+  // instead of waiting for the next poll.
+  async function act(payload: Record<string, unknown>): Promise<boolean> {
+    try {
+      const res = await fetch("/api/doubts", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ scope, memberId, memberName: name, ...payload }),
+      });
+      const data = (await res.json()) as {
+        feed?: { doubts: Doubt[] };
+        error?: string;
+      };
+      if (data.feed) {
+        setDoubts(data.feed.doubts);
+        return true;
+      }
+      setErr(data.error || "That didn't go through — try again.");
+      return false;
+    } catch {
+      setErr("Couldn't reach the server. Please try again.");
+      return false;
+    }
+  }
+
+  async function submitAsk() {
+    if (!title.trim() || busy) return;
+    setBusy(true);
+    setErr("");
+    const ok = await act({
+      action: "ask",
+      title,
+      subject: subject.trim() || undefined,
+      text: body,
+      work: work.trim() || undefined,
+    });
+    setBusy(false);
+    if (ok) {
+      setAsking(false);
+      setTitle("");
+      setSubject("");
+      setBody("");
+      setWork("");
+      // A brand-new doubt has no votes, so it only shows up under "New".
+      setSort("new");
+    }
+  }
+
+  async function submitReply() {
+    if (!replyTo || busy) return;
+    if (!replyText.trim() && !replyWork.trim()) return;
+    setBusy(true);
+    setErr("");
+    const ok = await act({
+      action: "reply",
+      doubtId: replyTo.doubtId,
+      parentId: replyTo.parentId,
+      text: replyText,
+      work: replyWork.trim() || undefined,
+    });
+    setBusy(false);
+    if (ok) {
+      setReplyTo(null);
+      setReplyText("");
+      setReplyWork("");
+      setReplyShowWork(false);
+    }
+  }
+
+  async function makeGroup() {
+    const wanted = groupName.trim();
+    if (!wanted || busy) return;
+    setBusy(true);
+    setErr("");
+    try {
+      const res = await fetch("/api/doubts", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          action: "create-group",
+          name: wanted,
+          memberId,
+          memberName: name,
+        }),
+      });
+      const data = (await res.json()) as { group?: DoubtGroup; error?: string };
+      if (data.group) {
+        saveGroups([
+          ...groups.filter((g) => g.code !== data.group!.code),
+          { code: data.group.code, name: data.group.name },
+        ]);
+        setGroupName("");
+        setShowGroups(false);
+        pickScope(data.group.code);
+      } else {
+        setErr(data.error || "Couldn't create that group.");
+      }
+    } catch {
+      setErr("Couldn't reach the server. Please try again.");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function enterGroup() {
+    const code = joinCode.trim().toUpperCase();
+    if (code.length !== 6 || busy) return;
+    setBusy(true);
+    setErr("");
+    try {
+      const res = await fetch("/api/doubts", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          action: "join-group",
+          code,
+          memberId,
+          memberName: name,
+        }),
+      });
+      const data = (await res.json()) as { group?: DoubtGroup; error?: string };
+      if (data.group) {
+        saveGroups([
+          ...groups.filter((g) => g.code !== data.group!.code),
+          { code: data.group.code, name: data.group.name },
+        ]);
+        setJoinCode("");
+        setShowGroups(false);
+        pickScope(data.group.code);
+      } else {
+        setErr(data.error || "No group with that code.");
+      }
+    } catch {
+      setErr("Couldn't reach the server. Please try again.");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  // Leaving a group is purely local — the code is the membership, so we just
+  // forget it on this device.
+  function forgetGroup(code: string) {
+    saveGroups(groups.filter((g) => g.code !== code));
+    if (scope === code) pickScope(DOUBT_GLOBAL_SCOPE);
+  }
+
+  const activeGroup = groups.find((g) => g.code === scope) ?? null;
+  const visible = sortDoubts(doubts, sort);
+  const helps = countDoubtHelps(doubts, memberId);
+  const unanswered = doubts.filter((d) => d.replies.length === 0).length;
+
+  function cancelReply() {
+    setReplyTo(null);
+    setReplyText("");
+    setReplyWork("");
+    setReplyShowWork(false);
+  }
+
+  // There's only ever one reply box open at a time, so a single element is
+  // handed to whichever row is composing.
+  const composer = (
+    <DoubtReplyComposer
+      text={replyText}
+      work={replyWork}
+      showWork={replyShowWork}
+      busy={busy}
+      onText={setReplyText}
+      onWork={setReplyWork}
+      onShowWork={() => setReplyShowWork(true)}
+      onSubmit={() => void submitReply()}
+      onCancel={cancelReply}
+    />
+  );
+
+  return (
+    <>
+      {/* Scope: the global feed, or one of your groups */}
+      <div style={styles.card}>
+        <div style={styles.cardHead}>
+          <span style={styles.cardClass}>🙋 Doubts</span>
+          {helps > 0 && (
+            <span style={dstyles.karma} title="Answers people marked as what helped">
+              ⭐ Helped {helps}
+            </span>
+          )}
+        </div>
+        <p style={{ color: "var(--muted)", fontSize: 14.5, margin: "0 0 12px" }}>
+          Stuck on something? Post it with what you&apos;ve already tried, and
+          other learners answer in a thread. Help someone else and they can mark
+          your answer as the one that unstuck them.
+        </p>
+        <div style={dstyles.scopeRow}>
+          <button
+            style={dstyles.scopeChip(scope === DOUBT_GLOBAL_SCOPE)}
+            onClick={() => pickScope(DOUBT_GLOBAL_SCOPE)}
+          >
+            🌍 Global
+          </button>
+          {groups.map((g) => (
+            <button
+              key={g.code}
+              style={dstyles.scopeChip(scope === g.code)}
+              onClick={() => pickScope(g.code)}
+              title={`Group code ${g.code}`}
+            >
+              👥 {g.name}
+            </button>
+          ))}
+          <button
+            style={dstyles.scopeChip(false)}
+            onClick={() => setShowGroups((v) => !v)}
+          >
+            {showGroups ? "× Close" : "+ Group"}
+          </button>
+        </div>
+
+        {showGroups && (
+          <div style={{ ...tstyles.landingGrid, marginTop: 14 }}>
+            <div style={tstyles.landingCol}>
+              <div style={tstyles.colTitle}>Start a group</div>
+              <input
+                style={styles.input}
+                placeholder="e.g. Chem class"
+                value={groupName}
+                maxLength={40}
+                onChange={(e) => setGroupName(e.target.value)}
+                onKeyDown={(e) => {
+                  if (e.key === "Enter") void makeGroup();
+                }}
+              />
+              <button
+                style={styles.primaryBtn}
+                disabled={busy || !groupName.trim()}
+                onClick={() => void makeGroup()}
+              >
+                Create group
+              </button>
+            </div>
+            <div style={tstyles.landingCol}>
+              <div style={tstyles.colTitle}>Join a group</div>
+              <input
+                style={{
+                  ...styles.input,
+                  textTransform: "uppercase",
+                  letterSpacing: 2,
+                  fontWeight: 700,
+                }}
+                placeholder="Enter code"
+                value={joinCode}
+                maxLength={6}
+                onChange={(e) =>
+                  setJoinCode(e.target.value.toUpperCase().replace(/[^A-Z0-9]/g, ""))
+                }
+                onKeyDown={(e) => {
+                  if (e.key === "Enter" && joinCode.length === 6) void enterGroup();
+                }}
+              />
+              <button
+                style={styles.secondaryBtn}
+                disabled={busy || joinCode.length !== 6}
+                onClick={() => void enterGroup()}
+              >
+                Join group
+              </button>
+            </div>
+          </div>
+        )}
+
+        {activeGroup && (
+          <div style={{ ...tstyles.codeRow, marginTop: 12 }}>
+            <span style={{ color: "var(--muted)", fontSize: 13 }}>
+              Invite to {activeGroup.name}
+            </span>
+            <span style={{ display: "flex", alignItems: "center", gap: 10 }}>
+              <button
+                style={tstyles.codeChip}
+                title="Copy code"
+                onClick={async () => {
+                  try {
+                    await navigator.clipboard.writeText(activeGroup.code);
+                    setCopied(true);
+                    window.setTimeout(() => setCopied(false), 1500);
+                  } catch {
+                    /* ignore */
+                  }
+                }}
+              >
+                {activeGroup.code} {copied ? "✓" : "⧉"}
+              </button>
+              <button
+                style={styles.linkBtn}
+                onClick={() => forgetGroup(activeGroup.code)}
+              >
+                Leave
+              </button>
+            </span>
+          </div>
+        )}
+        {err && <div style={{ ...tstyles.err, marginTop: 12, marginBottom: 0 }}>{err}</div>}
+      </div>
+
+      {/* Ask */}
+      <div style={styles.card}>
+        {asking ? (
+          <>
+            <div style={styles.cardHead}>
+              <span style={styles.cardClass}>
+                Ask {activeGroup ? activeGroup.name : "everyone"}
+              </span>
+            </div>
+            <div style={dstyles.composer}>
+              <input
+                style={styles.input}
+                placeholder="What are you stuck on? (one line)"
+                value={title}
+                maxLength={DOUBT_TITLE_MAX}
+                autoFocus
+                onChange={(e) => setTitle(e.target.value)}
+              />
+              <input
+                style={styles.input}
+                placeholder="Subject (optional) — e.g. Physics"
+                value={subject}
+                maxLength={40}
+                onChange={(e) => setSubject(e.target.value)}
+              />
+              <textarea
+                style={{ ...styles.input, minHeight: 90 }}
+                placeholder="Give the full question and where exactly it stops making sense…"
+                value={body}
+                maxLength={DOUBT_BODY_MAX}
+                onChange={(e) => setBody(e.target.value)}
+              />
+              <textarea
+                style={{
+                  ...styles.input,
+                  minHeight: 90,
+                  fontFamily: "ui-monospace, Menlo, monospace",
+                }}
+                placeholder={"What you've tried so far (optional but you'll get better answers)…\n1) …\n2) …"}
+                value={work}
+                maxLength={DOUBT_WORK_MAX}
+                onChange={(e) => setWork(e.target.value)}
+              />
+              <div style={dstyles.composerBtns}>
+                <button
+                  style={styles.primaryBtn}
+                  disabled={busy || !title.trim()}
+                  onClick={() => void submitAsk()}
+                >
+                  {busy ? "Posting…" : "Post doubt"}
+                </button>
+                <button style={styles.secondaryBtn} onClick={() => setAsking(false)}>
+                  Cancel
+                </button>
+              </div>
+            </div>
+          </>
+        ) : (
+          <button style={dstyles.askBtn} onClick={() => setAsking(true)}>
+            🙋 Ask a doubt{activeGroup ? ` in ${activeGroup.name}` : ""}…
+          </button>
+        )}
+      </div>
+
+      {/* Feed */}
+      <div style={styles.card}>
+        <div style={styles.tabBar}>
+          {(
+            [
+              ["top", "🔥 Top"],
+              ["new", "🕒 New"],
+              ["unanswered", `🫥 Unanswered${unanswered ? ` · ${unanswered}` : ""}`],
+            ] as const
+          ).map(([key, label]) => (
+            <button
+              key={key}
+              style={{
+                ...styles.viewTab,
+                ...(sort === key ? styles.viewTabActive : {}),
+              }}
+              onClick={() => setSort(key)}
+            >
+              {label}
+            </button>
+          ))}
+        </div>
+
+        {!loaded ? (
+          <p style={{ color: "var(--muted)", fontSize: 14 }}>Loading doubts…</p>
+        ) : visible.length === 0 ? (
+          <p style={{ color: "var(--muted)", fontSize: 14 }}>
+            {sort === "unanswered"
+              ? "Nothing unanswered right now — everyone's been helped 🎉"
+              : activeGroup
+                ? `No doubts in ${activeGroup.name} yet. Be the first to ask.`
+                : "No doubts yet. Ask the first one — someone will pick it up."}
+          </p>
+        ) : (
+          <div style={dstyles.feed}>
+            {visible.map((d) => {
+              const open = openId === d.id;
+              const mine = d.authorId === memberId;
+              const vote = myVote(d.votes, memberId);
+              const solved = Boolean(d.solvedReplyId);
+              return (
+                <div key={d.id} style={dstyles.post(open)}>
+                  <div style={dstyles.replyRow}>
+                    <div style={dstyles.voteCol}>
+                      <button
+                        style={dstyles.arrow(vote === 1)}
+                        title="Good question"
+                        disabled={mine}
+                        onClick={() =>
+                          void act({ action: "vote", doubtId: d.id, value: 1 })
+                        }
+                      >
+                        ▲
+                      </button>
+                      <span style={dstyles.score(vote)}>{doubtScore(d.votes)}</span>
+                      <button
+                        style={dstyles.arrow(vote === -1)}
+                        title="Not useful"
+                        disabled={mine}
+                        onClick={() =>
+                          void act({ action: "vote", doubtId: d.id, value: -1 })
+                        }
+                      >
+                        ▼
+                      </button>
+                    </div>
+                    <div style={{ flex: 1, minWidth: 0 }}>
+                      <button
+                        style={dstyles.titleBtn}
+                        onClick={() => setOpenId(open ? null : d.id)}
+                      >
+                        {d.title}
+                      </button>
+                      <div style={dstyles.byline}>
+                        {d.subject && <span style={dstyles.subjectPill}>{d.subject}</span>}
+                        {solved && <span style={dstyles.solvedPill}>✓ Solved</span>}
+                        <span>
+                          {mine ? "You" : d.authorName} · {doubtAgo(d.createdAt, now)} ·{" "}
+                          {d.replies.length === 0
+                            ? "no answers yet"
+                            : `${d.replies.length} ${
+                                d.replies.length === 1 ? "answer" : "answers"
+                              }`}
+                        </span>
+                      </div>
+
+                      {open && (
+                        <>
+                          {d.body && <div style={dstyles.bodyText}>{d.body}</div>}
+                          {d.work && (
+                            <div style={dstyles.workBlock}>
+                              <div style={dstyles.workLabel}>What they&apos;ve tried</div>
+                              {d.work}
+                            </div>
+                          )}
+                          <div style={dstyles.actionRow}>
+                            <button
+                              style={styles.linkBtn}
+                              onClick={() =>
+                                setReplyTo(
+                                  replyTo?.doubtId === d.id && !replyTo.parentId
+                                    ? null
+                                    : { doubtId: d.id },
+                                )
+                              }
+                            >
+                              {replyTo?.doubtId === d.id && !replyTo.parentId
+                                ? "Cancel"
+                                : "Answer this"}
+                            </button>
+                            {mine && (
+                              <button
+                                style={styles.linkBtn}
+                                onClick={() =>
+                                  void act({ action: "delete", doubtId: d.id })
+                                }
+                              >
+                                Delete
+                              </button>
+                            )}
+                          </div>
+                          {replyTo?.doubtId === d.id && !replyTo.parentId && composer}
+                          {d.replies.length > 0 && (
+                            <div style={dstyles.thread}>
+                              {buildDoubtTree(d).map((node) => (
+                                <DoubtBranch
+                                  key={node.reply.id}
+                                  node={node}
+                                  doubt={d}
+                                  memberId={memberId}
+                                  now={now}
+                                  replyTo={replyTo}
+                                  onReplyTo={setReplyTo}
+                                  onAct={act}
+                                  composer={composer}
+                                />
+                              ))}
+                            </div>
+                          )}
+                        </>
+                      )}
+                    </div>
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+        )}
+      </div>
+    </>
+  );
+}
+
+// The reply box, shared by "Answer this" and every nested Reply link. Defined
+// at module scope (not inside DoubtsBoard) so React keeps the same element type
+// across renders — an inline component would remount the textarea on every
+// keystroke and steal the caret.
+function DoubtReplyComposer({
+  text,
+  work,
+  showWork,
+  busy,
+  onText,
+  onWork,
+  onShowWork,
+  onSubmit,
+  onCancel,
+}: {
+  text: string;
+  work: string;
+  showWork: boolean;
+  busy: boolean;
+  onText: (v: string) => void;
+  onWork: (v: string) => void;
+  onShowWork: () => void;
+  onSubmit: () => void;
+  onCancel: () => void;
+}) {
+  return (
+    <div style={dstyles.composer}>
+      <textarea
+        style={{ ...styles.input, minHeight: 70 }}
+        placeholder="Explain it the way you'd want it explained to you…"
+        value={text}
+        maxLength={DOUBT_REPLY_MAX}
+        autoFocus
+        onChange={(e) => onText(e.target.value)}
+      />
+      {showWork ? (
+        <textarea
+          style={{
+            ...styles.input,
+            minHeight: 90,
+            fontFamily: "ui-monospace, Menlo, monospace",
+          }}
+          placeholder={"Your working, step by step…\n1) …\n2) …"}
+          value={work}
+          maxLength={DOUBT_WORK_MAX}
+          onChange={(e) => onWork(e.target.value)}
+        />
+      ) : (
+        <button style={styles.linkBtn} onClick={onShowWork}>
+          + Show your working
+        </button>
+      )}
+      <div style={dstyles.composerBtns}>
+        <button
+          style={styles.primaryBtn}
+          disabled={busy || (!text.trim() && !work.trim())}
+          onClick={onSubmit}
+        >
+          {busy ? "Posting…" : "Post answer"}
+        </button>
+        <button style={styles.secondaryBtn} onClick={onCancel}>
+          Cancel
+        </button>
+      </div>
+    </div>
+  );
+}
+
+// One reply and its children, rendered recursively — the Reddit-style thread.
+// Also module-scope, for the same remount reason as the composer above.
+function DoubtBranch({
+  node,
+  doubt,
+  memberId,
+  now,
+  replyTo,
+  onReplyTo,
+  onAct,
+  composer,
+}: {
+  node: DoubtReplyNode;
+  doubt: Doubt;
+  memberId: string;
+  now: number;
+  replyTo: { doubtId: string; parentId?: string } | null;
+  onReplyTo: (v: { doubtId: string; parentId?: string } | null) => void;
+  onAct: (payload: Record<string, unknown>) => Promise<boolean>;
+  composer: ReactNode;
+}) {
+  const r = node.reply;
+  const mine = r.authorId === memberId;
+  const accepted = doubt.solvedReplyId === r.id;
+  const vote = myVote(r.votes, memberId);
+  const composing = replyTo?.doubtId === doubt.id && replyTo.parentId === r.id;
+
+  return (
+    <div style={dstyles.branch(node.depth)}>
+      <div style={dstyles.replyRow}>
+        <div style={dstyles.voteColSm}>
+          <button
+            style={dstyles.arrow(vote === 1)}
+            title="Helpful"
+            disabled={mine}
+            onClick={() =>
+              void onAct({ action: "vote", doubtId: doubt.id, replyId: r.id, value: 1 })
+            }
+          >
+            ▲
+          </button>
+          <span style={dstyles.scoreSm(vote)}>{doubtScore(r.votes)}</span>
+          <button
+            style={dstyles.arrow(vote === -1)}
+            title="Not helpful"
+            disabled={mine}
+            onClick={() =>
+              void onAct({ action: "vote", doubtId: doubt.id, replyId: r.id, value: -1 })
+            }
+          >
+            ▼
+          </button>
+        </div>
+        <div style={{ flex: 1, minWidth: 0 }}>
+          <div style={dstyles.byline}>
+            <strong style={{ color: mine ? "var(--accent)" : "var(--text)" }}>
+              {mine ? "You" : r.authorName}
+            </strong>
+            {r.authorId === doubt.authorId && <span style={dstyles.opPill}>asker</span>}
+            {accepted && <span style={dstyles.solvedPill}>✓ This helped</span>}
+            <span>· {doubtAgo(r.at, now)}</span>
+          </div>
+          {r.text && <div style={dstyles.replyText}>{r.text}</div>}
+          {r.work && (
+            <div style={dstyles.workBlock}>
+              <div style={dstyles.workLabel}>Their working</div>
+              {r.work}
+            </div>
+          )}
+          <div style={dstyles.actionRow}>
+            <button
+              style={styles.linkBtn}
+              onClick={() =>
+                onReplyTo(composing ? null : { doubtId: doubt.id, parentId: r.id })
+              }
+            >
+              {composing ? "Cancel" : "Reply"}
+            </button>
+            {doubt.authorId === memberId && !mine && (
+              <button
+                style={styles.linkBtn}
+                onClick={() =>
+                  void onAct({ action: "accept", doubtId: doubt.id, replyId: r.id })
+                }
+              >
+                {accepted ? "Unmark" : "Mark as what helped"}
+              </button>
+            )}
+            {mine && (
+              <button
+                style={styles.linkBtn}
+                onClick={() =>
+                  void onAct({ action: "delete", doubtId: doubt.id, replyId: r.id })
+                }
+              >
+                Delete
+              </button>
+            )}
+          </div>
+          {composing && composer}
+        </div>
+      </div>
+      {node.children.map((child) => (
+        <DoubtBranch
+          key={child.reply.id}
+          node={child}
+          doubt={doubt}
+          memberId={memberId}
+          now={now}
+          replyTo={replyTo}
+          onReplyTo={onReplyTo}
+          onAct={onAct}
+          composer={composer}
+        />
+      ))}
+    </div>
+  );
+}
+
+// Local styles for the doubts board (same convention as tstyles above: kept
+// next to the component, themed off the shared CSS variables).
+const dstyles = {
+  scopeRow: {
+    display: "flex",
+    flexWrap: "wrap",
+    gap: 8,
+  } as React.CSSProperties,
+  scopeChip: (active: boolean): React.CSSProperties => ({
+    background: active ? "var(--accent)" : "var(--surface)",
+    color: active ? "#fff" : "var(--muted)",
+    border: `1px solid ${active ? "var(--accent)" : "var(--border)"}`,
+    borderRadius: 999,
+    padding: "7px 14px",
+    fontSize: 13.5,
+    fontWeight: 600,
+    cursor: "pointer",
+    maxWidth: 220,
+    overflow: "hidden",
+    textOverflow: "ellipsis",
+    whiteSpace: "nowrap",
+  }),
+  karma: {
+    fontSize: 12.5,
+    fontWeight: 700,
+    color: "var(--accent)",
+    background: "var(--assistant-bubble)",
+    border: "1px solid var(--border)",
+    borderRadius: 999,
+    padding: "3px 10px",
+    whiteSpace: "nowrap",
+  } as React.CSSProperties,
+  askBtn: {
+    width: "100%",
+    textAlign: "left",
+    background: "var(--assistant-bubble)",
+    color: "var(--muted)",
+    border: "1px dashed var(--border-strong)",
+    borderRadius: "var(--radius-md)",
+    padding: "14px 16px",
+    fontSize: 15,
+    cursor: "pointer",
+  } as React.CSSProperties,
+  composer: {
+    display: "flex",
+    flexDirection: "column",
+    gap: 10,
+    alignItems: "stretch",
+    marginTop: 8,
+  } as React.CSSProperties,
+  composerBtns: {
+    display: "flex",
+    gap: 10,
+    flexWrap: "wrap",
+  } as React.CSSProperties,
+  feed: {
+    display: "flex",
+    flexDirection: "column",
+    gap: 10,
+  } as React.CSSProperties,
+  post: (open: boolean): React.CSSProperties => ({
+    border: `1px solid ${open ? "var(--accent)" : "var(--border)"}`,
+    borderRadius: "var(--radius-md)",
+    padding: "12px 14px",
+    background: open ? "var(--surface)" : "transparent",
+  }),
+  replyRow: { display: "flex", gap: 10, alignItems: "flex-start" } as React.CSSProperties,
+  voteCol: {
+    display: "flex",
+    flexDirection: "column",
+    alignItems: "center",
+    gap: 1,
+    paddingTop: 2,
+    minWidth: 30,
+  } as React.CSSProperties,
+  voteColSm: {
+    display: "flex",
+    flexDirection: "column",
+    alignItems: "center",
+    gap: 0,
+    minWidth: 24,
+  } as React.CSSProperties,
+  arrow: (on: boolean): React.CSSProperties => ({
+    background: "transparent",
+    border: "none",
+    cursor: "pointer",
+    fontSize: 13,
+    lineHeight: 1.1,
+    padding: 1,
+    color: on ? "var(--accent)" : "var(--muted)",
+    opacity: on ? 1 : 0.65,
+  }),
+  score: (vote: number): React.CSSProperties => ({
+    fontSize: 14,
+    fontWeight: 800,
+    fontVariantNumeric: "tabular-nums",
+    color: vote !== 0 ? "var(--accent)" : "var(--text)",
+  }),
+  scoreSm: (vote: number): React.CSSProperties => ({
+    fontSize: 12.5,
+    fontWeight: 700,
+    fontVariantNumeric: "tabular-nums",
+    color: vote !== 0 ? "var(--accent)" : "var(--muted)",
+  }),
+  titleBtn: {
+    background: "transparent",
+    border: "none",
+    padding: 0,
+    textAlign: "left",
+    fontSize: 15.5,
+    fontWeight: 700,
+    lineHeight: 1.35,
+    color: "var(--text)",
+    cursor: "pointer",
+  } as React.CSSProperties,
+  byline: {
+    display: "flex",
+    flexWrap: "wrap",
+    alignItems: "center",
+    gap: 6,
+    fontSize: 12.5,
+    color: "var(--muted)",
+    marginTop: 4,
+  } as React.CSSProperties,
+  subjectPill: {
+    fontSize: 11,
+    fontWeight: 700,
+    color: "var(--assistant-text)",
+    background: "var(--assistant-bubble)",
+    borderRadius: 999,
+    padding: "2px 8px",
+  } as React.CSSProperties,
+  solvedPill: {
+    fontSize: 11,
+    fontWeight: 700,
+    color: "#fff",
+    background: "#3b9e6f",
+    borderRadius: 999,
+    padding: "2px 8px",
+  } as React.CSSProperties,
+  opPill: {
+    fontSize: 11,
+    fontWeight: 700,
+    color: "#fff",
+    background: "var(--accent)",
+    borderRadius: 999,
+    padding: "2px 8px",
+  } as React.CSSProperties,
+  bodyText: {
+    fontSize: 14.5,
+    lineHeight: 1.55,
+    whiteSpace: "pre-wrap",
+    wordBreak: "break-word",
+    margin: "10px 0 0",
+  } as React.CSSProperties,
+  replyText: {
+    fontSize: 14,
+    lineHeight: 1.5,
+    whiteSpace: "pre-wrap",
+    wordBreak: "break-word",
+    margin: "4px 0 0",
+  } as React.CSSProperties,
+  // The "show your work" panel: monospaced and boxed so step-by-step working
+  // stays legible instead of reading as another paragraph of prose.
+  workBlock: {
+    fontFamily: "ui-monospace, Menlo, monospace",
+    fontSize: 13,
+    lineHeight: 1.6,
+    whiteSpace: "pre-wrap",
+    wordBreak: "break-word",
+    background: "var(--assistant-bubble)",
+    border: "1px solid var(--border)",
+    borderRadius: 10,
+    padding: "10px 12px",
+    marginTop: 10,
+  } as React.CSSProperties,
+  workLabel: {
+    fontFamily: "inherit",
+    fontSize: 11,
+    fontWeight: 700,
+    textTransform: "uppercase",
+    letterSpacing: 0.5,
+    color: "var(--muted)",
+    marginBottom: 6,
+  } as React.CSSProperties,
+  actionRow: {
+    display: "flex",
+    gap: 14,
+    flexWrap: "wrap",
+    marginTop: 8,
+  } as React.CSSProperties,
+  thread: {
+    marginTop: 12,
+    paddingTop: 10,
+    borderTop: "1px solid var(--border)",
+    display: "flex",
+    flexDirection: "column",
+    gap: 12,
+  } as React.CSSProperties,
+  // Nested replies get a left rule per level, Reddit-style. Depth is clamped
+  // server-side (DOUBT_MAX_DEPTH) so the indent can't run off a phone screen.
+  branch: (depth: number): React.CSSProperties => ({
+    marginLeft: depth === 0 ? 0 : 12,
+    paddingLeft: depth === 0 ? 0 : 10,
+    borderLeft: depth === 0 ? "none" : "2px solid var(--border)",
+    display: "flex",
+    flexDirection: "column",
+    gap: 12,
+  }),
+};
+
+// ---------------------------------------------------------------------------
+// Shared folder — a study space two friends keep in sync (client-side copies of
+// the @eliora/shared types, matching how StudyTogether above keeps its own).
+// Friends share the join code and stock the folder with upcoming tests,
+// projects, assignments, and notes; everyone can add, tick off, and remove.
+// ---------------------------------------------------------------------------
+type FolderItemKind = "test" | "project" | "assignment" | "note";
+type FolderItem = {
+  id: string;
+  kind: FolderItemKind;
+  title: string;
+  subject?: string;
+  due?: string;
+  details?: string;
+  done: boolean;
+  addedBy: string;
+  addedById: string;
+  createdAt: number;
+  updatedAt: number;
+};
+type FolderMember = { id: string; name: string; lastSeen: number };
+type SharedFolderData = {
+  code: string;
+  name: string;
+  createdAt: number;
+  members: FolderMember[];
+  items: FolderItem[];
+};
+
+const FOLDER_KINDS: readonly FolderItemKind[] = [
+  "test",
+  "project",
+  "assignment",
+  "note",
+];
+const FOLDER_KIND_META: Record<
+  FolderItemKind,
+  { label: string; emoji: string }
+> = {
+  test: { label: "Test", emoji: "📝" },
+  project: { label: "Project", emoji: "🛠️" },
+  assignment: { label: "Assignment", emoji: "📚" },
+  note: { label: "Note", emoji: "📌" },
+};
+const FOLDER_PRESENCE_MS = 30_000;
+const FOLDER_LAST_KEY = "eliora-folder-last";
+
+// Order: still-to-do first (soonest due, undated last), done sink to the bottom.
+function sortFolderItems(items: FolderItem[]): FolderItem[] {
+  const rank = (it: FolderItem): number => {
+    if (it.done) return Number.MAX_SAFE_INTEGER;
+    return it.due
+      ? new Date(`${it.due}T00:00:00`).getTime()
+      : Number.MAX_SAFE_INTEGER - 1;
+  };
+  return [...items].sort((a, b) => {
+    const ra = rank(a);
+    const rb = rank(b);
+    if (ra !== rb) return ra - rb;
+    return a.createdAt - b.createdAt;
+  });
+}
+
+// A friendly "when is this due" label + urgency tone for coloring.
+function folderDueLabel(
+  due: string,
+  now: number,
+): { text: string; tone: "over" | "soon" | "later" } {
+  const today = new Date(now);
+  today.setHours(0, 0, 0, 0);
+  const target = new Date(`${due}T00:00:00`);
+  const days = Math.round((target.getTime() - today.getTime()) / 86_400_000);
+  if (days < 0) return { text: `${-days}d overdue`, tone: "over" };
+  if (days === 0) return { text: "Due today", tone: "soon" };
+  if (days === 1) return { text: "Due tomorrow", tone: "soon" };
+  if (days <= 6) return { text: `Due in ${days}d`, tone: "soon" };
+  const label = target.toLocaleDateString(undefined, {
+    month: "short",
+    day: "numeric",
+  });
+  return { text: `Due ${label}`, tone: "later" };
+}
+
+function SharedFolder({ name }: { name: string }) {
+  const [folder, setFolder] = useState<SharedFolderData | null>(null);
+  const [now, setNow] = useState(() => Date.now());
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState("");
+  const [createName, setCreateName] = useState("");
+  const [joinCode, setJoinCode] = useState("");
+  const [copied, setCopied] = useState(false);
+  const [editingName, setEditingName] = useState(false);
+  const [nameDraft, setNameDraft] = useState("");
+  // New-item composer.
+  const [draftKind, setDraftKind] = useState<FolderItemKind>("assignment");
+  const [draftTitle, setDraftTitle] = useState("");
+  const [draftSubject, setDraftSubject] = useState("");
+  const [draftDue, setDraftDue] = useState("");
+  const [draftDetails, setDraftDetails] = useState("");
+  const memberIdRef = useRef<string>("");
+
+  // Stable per-device member id (shared with Study Together) + auto-rejoin.
+  useEffect(() => {
+    let id = localStorage.getItem(TOGETHER_ID_KEY);
+    if (!id) {
+      id =
+        typeof crypto !== "undefined" && crypto.randomUUID
+          ? crypto.randomUUID()
+          : `m-${Date.now()}-${Math.floor(Math.random() * 1e9)}`;
+      localStorage.setItem(TOGETHER_ID_KEY, id);
+    }
+    memberIdRef.current = id;
+    const last = localStorage.getItem(FOLDER_LAST_KEY);
+    if (last) void enter("join", { code: last }, true);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  // Poll while in a folder so both friends see each other's edits.
+  const code = folder?.code;
+  useEffect(() => {
+    if (!code) return;
+    let alive = true;
+    async function poll() {
+      try {
+        const res = await fetch(
+          `/api/folders/${code}?memberId=${encodeURIComponent(
+            memberIdRef.current,
+          )}&name=${encodeURIComponent(name)}`,
+          { cache: "no-store" },
+        );
+        if (!alive) return;
+        if (res.status === 404) {
+          localStorage.removeItem(FOLDER_LAST_KEY);
+          setFolder(null);
+          setErr("That folder is no longer available.");
+          return;
+        }
+        const data = (await res.json()) as { folder?: SharedFolderData };
+        if (data.folder) {
+          setFolder(data.folder);
+          setNow(Date.now());
+        }
+      } catch {
+        /* transient — next tick retries */
+      }
+    }
+    void poll();
+    const t = setInterval(poll, 3000);
+    return () => {
+      alive = false;
+      clearInterval(t);
+    };
+  }, [code, name]);
+
+  async function enter(
+    action: "create" | "join",
+    extra: { name?: string; code?: string },
+    silent = false,
+  ) {
+    if (!silent) {
+      setBusy(true);
+      setErr("");
+    }
+    try {
+      const res = await fetch("/api/folders", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          action,
+          memberId: memberIdRef.current,
+          memberName: name,
+          ...extra,
+        }),
+      });
+      const data = (await res.json()) as {
+        folder?: SharedFolderData;
+        error?: string;
+      };
+      if (data.folder) {
+        setFolder(data.folder);
+        setNow(Date.now());
+        localStorage.setItem(FOLDER_LAST_KEY, data.folder.code);
+        setJoinCode("");
+        setCreateName("");
+      } else if (!silent) {
+        setErr(data.error || "Couldn't reach that folder — try again.");
+      } else {
+        localStorage.removeItem(FOLDER_LAST_KEY);
+      }
+    } catch {
+      if (!silent) setErr("Couldn't reach the server. Please try again.");
+    } finally {
+      if (!silent) setBusy(false);
+    }
+  }
+
+  // Fire a folder action and adopt the returned state for a snappy response.
+  async function act(body: Record<string, unknown>) {
+    if (!folder) return;
+    try {
+      const res = await fetch(`/api/folders/${folder.code}`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ memberId: memberIdRef.current, name, ...body }),
+      });
+      const data = (await res.json()) as { folder?: SharedFolderData };
+      if (data.folder) {
+        setFolder(data.folder);
+        setNow(Date.now());
+      }
+    } catch {
+      /* the poll loop will reconcile */
+    }
+  }
+
+  function addDraft() {
+    const title = draftTitle.trim();
+    if (!title) return;
+    void act({
+      action: "add",
+      item: {
+        kind: draftKind,
+        title,
+        subject: draftSubject.trim() || undefined,
+        due: draftDue || undefined,
+        details: draftDetails.trim() || undefined,
+      },
+    });
+    setDraftTitle("");
+    setDraftSubject("");
+    setDraftDue("");
+    setDraftDetails("");
+  }
+
+  async function leave() {
+    const current = folder;
+    localStorage.removeItem(FOLDER_LAST_KEY);
+    setFolder(null);
+    if (current) {
+      try {
+        await fetch(`/api/folders/${current.code}`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ action: "leave", memberId: memberIdRef.current }),
+        });
+      } catch {
+        /* presence timeout will drop us anyway */
+      }
+    }
+  }
+
+  // ---- Landing: create or join --------------------------------------------
+  if (!folder) {
+    return (
+      <div style={styles.studyScroll}>
+        <div style={styles.card}>
+          <div style={styles.cardHead}>
+            <span style={styles.cardClass}>🗂️ Shared folder</span>
+          </div>
+          <p style={{ color: "var(--muted)", fontSize: 14.5, margin: "0 0 14px" }}>
+            Share one folder with a friend to keep upcoming tests, projects, and
+            assignments in one place. Anyone with the code can add and check off
+            items — great for a class or study group.
+          </p>
+          {err && <div style={tstyles.err}>{err}</div>}
+          <div style={tstyles.landingGrid}>
+            <div style={tstyles.landingCol}>
+              <div style={tstyles.colTitle}>Start a folder</div>
+              <input
+                style={styles.input}
+                placeholder="Folder name (e.g. AP Bio squad)"
+                value={createName}
+                maxLength={40}
+                onChange={(e) => setCreateName(e.target.value)}
+                onKeyDown={(e) => {
+                  if (e.key === "Enter" && createName.trim())
+                    void enter("create", { name: createName.trim() });
+                }}
+              />
+              <button
+                style={styles.primaryBtn}
+                disabled={busy || !createName.trim()}
+                onClick={() => void enter("create", { name: createName.trim() })}
+              >
+                {busy ? "Creating…" : "Create folder"}
+              </button>
+            </div>
+            <div style={tstyles.landingCol}>
+              <div style={tstyles.colTitle}>Join a folder</div>
+              <input
+                style={{
+                  ...styles.input,
+                  textTransform: "uppercase",
+                  letterSpacing: 2,
+                  fontWeight: 700,
+                }}
+                placeholder="Enter code"
+                value={joinCode}
+                maxLength={6}
+                onChange={(e) =>
+                  setJoinCode(e.target.value.toUpperCase().replace(/[^A-Z0-9]/g, ""))
+                }
+                onKeyDown={(e) => {
+                  if (e.key === "Enter" && joinCode.length === 6)
+                    void enter("join", { code: joinCode });
+                }}
+              />
+              <button
+                style={styles.secondaryBtn}
+                disabled={busy || joinCode.length !== 6}
+                onClick={() => void enter("join", { code: joinCode })}
+              >
+                Join folder
+              </button>
+            </div>
+          </div>
+        </div>
+      </div>
+    );
+  }
+
+  // ---- Inside a folder -----------------------------------------------------
+  const present = folder.members
+    .filter((m) => now - m.lastSeen < FOLDER_PRESENCE_MS)
+    .sort((a, b) => b.lastSeen - a.lastSeen);
+  const sorted = sortFolderItems(folder.items);
+  const openCount = folder.items.filter((i) => !i.done).length;
+
+  return (
+    <div style={styles.studyScroll}>
+      {/* Header */}
+      <div style={styles.card}>
+        <div style={{ ...styles.cardHead, marginBottom: 2 }}>
+          {editingName ? (
+            <input
+              autoFocus
+              style={{ ...styles.input, maxWidth: 260 }}
+              value={nameDraft}
+              maxLength={40}
+              onChange={(e) => setNameDraft(e.target.value)}
+              onBlur={() => {
+                const n = nameDraft.trim();
+                if (n && n !== folder.name)
+                  void act({ action: "rename", folderName: n });
+                setEditingName(false);
+              }}
+              onKeyDown={(e) => {
+                if (e.key === "Enter") (e.target as HTMLInputElement).blur();
+                if (e.key === "Escape") setEditingName(false);
+              }}
+            />
+          ) : (
+            <span
+              style={{ ...styles.cardClass, cursor: "pointer" }}
+              title="Rename folder"
+              onClick={() => {
+                setNameDraft(folder.name);
+                setEditingName(true);
+              }}
+            >
+              🗂️ {folder.name}
+            </span>
+          )}
+          <button style={styles.linkBtn} onClick={() => void leave()}>
+            Leave
+          </button>
+        </div>
+        <div style={tstyles.codeRow}>
+          <span style={{ color: "var(--muted)", fontSize: 13 }}>
+            Share code{present.length > 1 ? ` · ${present.length} here now` : ""}
+          </span>
+          <button
+            style={tstyles.codeChip}
+            title="Copy code"
+            onClick={async () => {
+              try {
+                await navigator.clipboard.writeText(folder.code);
+                setCopied(true);
+                window.setTimeout(() => setCopied(false), 1500);
+              } catch {
+                /* ignore */
+              }
+            }}
+          >
+            {folder.code} {copied ? "✓" : "⧉"}
+          </button>
+        </div>
+      </div>
+
+      {/* Add an item */}
+      <div style={styles.card}>
+        <div style={styles.cardHead}>
+          <span style={styles.cardClass}>➕ Add to the folder</span>
+        </div>
+        <div style={fstyles.kindRow}>
+          {FOLDER_KINDS.map((k) => (
+            <button
+              key={k}
+              style={fstyles.kindBtn(draftKind === k)}
+              onClick={() => setDraftKind(k)}
+            >
+              {FOLDER_KIND_META[k].emoji} {FOLDER_KIND_META[k].label}
+            </button>
+          ))}
+        </div>
+        <input
+          style={{ ...styles.input, marginTop: 10 }}
+          placeholder={
+            draftKind === "note" ? "What's the note?" : "What is it? (title)"
+          }
+          value={draftTitle}
+          maxLength={160}
+          onChange={(e) => setDraftTitle(e.target.value)}
+          onKeyDown={(e) => {
+            if (e.key === "Enter") addDraft();
+          }}
+        />
+        <div style={fstyles.metaRow}>
+          <input
+            style={{ ...styles.input, flex: 1, minWidth: 120 }}
+            placeholder="Subject (optional)"
+            value={draftSubject}
+            maxLength={60}
+            onChange={(e) => setDraftSubject(e.target.value)}
+          />
+          {draftKind !== "note" && (
+            <input
+              type="date"
+              style={{ ...styles.input, flex: 1, minWidth: 150 }}
+              value={draftDue}
+              onChange={(e) => setDraftDue(e.target.value)}
+            />
+          )}
+        </div>
+        <textarea
+          style={fstyles.detailsInput}
+          placeholder="Details — what it covers, rubric, page count… (optional)"
+          value={draftDetails}
+          maxLength={600}
+          rows={2}
+          onChange={(e) => setDraftDetails(e.target.value)}
+        />
+        <button
+          style={{ ...styles.primaryBtn, marginTop: 10 }}
+          disabled={!draftTitle.trim()}
+          onClick={addDraft}
+        >
+          Add {FOLDER_KIND_META[draftKind].label.toLowerCase()}
+        </button>
+      </div>
+
+      {/* The list */}
+      <div style={styles.card}>
+        <div style={styles.cardHead}>
+          <span style={styles.cardClass}>
+            📋 {openCount} to do{folder.items.length !== openCount
+              ? ` · ${folder.items.length - openCount} done`
+              : ""}
+          </span>
+        </div>
+        {folder.items.length === 0 ? (
+          <div style={{ color: "var(--muted)", fontSize: 13.5, padding: "8px 2px" }}>
+            Nothing here yet. Add a test, project, or assignment above — your
+            friend will see it too.
+          </div>
+        ) : (
+          <div style={fstyles.list}>
+            {sorted.map((it) => {
+              const meta = FOLDER_KIND_META[it.kind];
+              const due = it.due && !it.done ? folderDueLabel(it.due, now) : null;
+              const mine = it.addedById === memberIdRef.current;
+              return (
+                <div key={it.id} style={fstyles.item(it.done)}>
+                  <button
+                    style={fstyles.check(it.done)}
+                    title={it.done ? "Mark not done" : "Mark done"}
+                    onClick={() =>
+                      void act({
+                        action: "update",
+                        itemId: it.id,
+                        patch: { done: !it.done },
+                      })
+                    }
+                  >
+                    {it.done ? "✓" : ""}
+                  </button>
+                  <div style={{ flex: 1, minWidth: 0 }}>
+                    <div style={fstyles.itemTitle(it.done)}>
+                      <span>{meta.emoji}</span>
+                      <span>{it.title}</span>
+                    </div>
+                    <div style={fstyles.chipRow}>
+                      <span style={fstyles.kindChip}>{meta.label}</span>
+                      {it.subject && (
+                        <span style={fstyles.subjectChip}>{it.subject}</span>
+                      )}
+                      {due && <span style={fstyles.dueChip(due.tone)}>{due.text}</span>}
+                    </div>
+                    {it.details && (
+                      <div style={fstyles.details}>{it.details}</div>
+                    )}
+                    <div style={fstyles.addedBy}>
+                      Added by {mine ? "you" : it.addedBy}
+                    </div>
+                  </div>
+                  <button
+                    style={fstyles.remove}
+                    title="Remove"
+                    onClick={() =>
+                      void act({ action: "remove", itemId: it.id })
+                    }
+                  >
+                    ×
+                  </button>
+                </div>
+              );
+            })}
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+// Local styles for Shared folder (reuse the shared CSS variables so it themes).
+const fstyles = {
+  kindRow: { display: "flex", flexWrap: "wrap", gap: 8 } as React.CSSProperties,
+  kindBtn: (active: boolean): React.CSSProperties => ({
+    padding: "6px 12px",
+    borderRadius: 999,
+    fontSize: 13.5,
+    fontWeight: 600,
+    cursor: "pointer",
+    border: `1px solid ${active ? "var(--accent)" : "var(--border)"}`,
+    color: active ? "#fff" : "var(--assistant-text)",
+    background: active ? "var(--accent)" : "var(--assistant-bubble)",
+  }),
+  metaRow: {
+    display: "flex",
+    flexWrap: "wrap",
+    gap: 8,
+    marginTop: 8,
+  } as React.CSSProperties,
+  detailsInput: {
+    width: "100%",
+    marginTop: 8,
+    padding: "10px 12px",
+    borderRadius: 10,
+    border: "1px solid var(--border)",
+    background: "var(--assistant-bubble)",
+    color: "var(--assistant-text)",
+    fontSize: 14,
+    fontFamily: "inherit",
+    resize: "vertical",
+    boxSizing: "border-box",
+  } as React.CSSProperties,
+  list: {
+    display: "flex",
+    flexDirection: "column",
+    gap: 10,
+  } as React.CSSProperties,
+  item: (done: boolean): React.CSSProperties => ({
+    display: "flex",
+    alignItems: "flex-start",
+    gap: 10,
+    padding: "10px 12px",
+    borderRadius: 12,
+    border: "1px solid var(--border)",
+    background: "var(--assistant-bubble)",
+    opacity: done ? 0.6 : 1,
+  }),
+  check: (done: boolean): React.CSSProperties => ({
+    flexShrink: 0,
+    width: 22,
+    height: 22,
+    marginTop: 1,
+    borderRadius: 6,
+    border: `1.5px solid ${done ? "#37b26b" : "var(--border)"}`,
+    background: done ? "#37b26b" : "transparent",
+    color: "#fff",
+    fontSize: 13,
+    fontWeight: 800,
+    lineHeight: "20px",
+    cursor: "pointer",
+  }),
+  itemTitle: (done: boolean): React.CSSProperties => ({
+    display: "flex",
+    gap: 7,
+    fontSize: 15,
+    fontWeight: 600,
+    color: "var(--assistant-text)",
+    textDecoration: done ? "line-through" : "none",
+    wordBreak: "break-word",
+  }),
+  chipRow: {
+    display: "flex",
+    flexWrap: "wrap",
+    gap: 6,
+    marginTop: 5,
+  } as React.CSSProperties,
+  kindChip: {
+    fontSize: 11.5,
+    fontWeight: 700,
+    padding: "2px 8px",
+    borderRadius: 999,
+    color: "var(--muted)",
+    background: "var(--bg)",
+    border: "1px solid var(--border)",
+  } as React.CSSProperties,
+  subjectChip: {
+    fontSize: 11.5,
+    fontWeight: 600,
+    padding: "2px 8px",
+    borderRadius: 999,
+    color: "var(--accent)",
+    background: "var(--bg)",
+    border: "1px solid var(--border)",
+  } as React.CSSProperties,
+  dueChip: (tone: "over" | "soon" | "later"): React.CSSProperties => ({
+    fontSize: 11.5,
+    fontWeight: 700,
+    padding: "2px 8px",
+    borderRadius: 999,
+    color: "#fff",
+    background:
+      tone === "over" ? "#d4483b" : tone === "soon" ? "#e08a2b" : "#5a7fb0",
+  }),
+  details: {
+    fontSize: 13.5,
+    color: "var(--muted)",
+    marginTop: 6,
+    whiteSpace: "pre-wrap",
+    wordBreak: "break-word",
+  } as React.CSSProperties,
+  addedBy: {
+    fontSize: 11.5,
+    color: "var(--muted)",
+    marginTop: 6,
+  } as React.CSSProperties,
+  remove: {
+    flexShrink: 0,
+    background: "transparent",
+    border: "none",
+    color: "var(--muted)",
+    fontSize: 20,
+    lineHeight: 1,
+    cursor: "pointer",
+    padding: "0 2px",
+  } as React.CSSProperties,
+};
+
 function ElioraApp() {
   const { data: session } = useSession();
   // Namespace all saved data by the signed-in user so each account gets its own
@@ -15878,6 +18545,8 @@ function ElioraApp() {
   const SCHEDULE_KEY = `eliora-schedule::${ns}`; // today's 9am–9pm schedule
   const HOMETIME_KEY = `eliora-hometime::${ns}`; // hour the learner gets home
   const MUSIC_KEY = `eliora-music::${ns}`; // connected focus-music playlists
+  const TUTOR_KEY = `eliora-tutor::${ns}`; // the AI tutor persona they picked
+  const MATERIAL_KEY = `eliora-material::${ns}`; // textbook digests to teach from
   const [chats, setChats] = useState<Chat[]>([]);
   const [folders, setFolders] = useState<ChatFolder[]>([]);
   const [folderMenuFor, setFolderMenuFor] = useState<string | null>(null);
@@ -15945,6 +18614,11 @@ function ElioraApp() {
   };
   const [xpToast, setXpToast] = useState<string | null>(null);
   const [equippedRoom, setEquippedRoom] = useState("meadow"); // reward background
+  const [tutorId, setTutorId] = useState(ELIORA_DEFAULT_TUTOR); // AI tutor persona
+  // The learner's own textbook/handout digests, and the state of a pending read.
+  const [materials, setMaterials] = useState<StudyMaterial[]>([]);
+  const [materialBusy, setMaterialBusy] = useState<string | null>(null);
+  const [materialError, setMaterialError] = useState("");
   // Learner-created rewards + how much XP they've spent redeeming them.
   const [customRewards, setCustomRewards] = useState<CustomReward[]>([]);
   const [spentXp, setSpentXp] = useState(0);
@@ -16047,7 +18721,6 @@ function ElioraApp() {
   const [tab, setTab] = useState<
     | "home"
     | "chat"
-    | "summarize"
     | "notebook"
     | "practice"
     | "calendar"
@@ -16055,8 +18728,12 @@ function ElioraApp() {
     | "progress"
     | "study"
     | "together"
+    | "folder"
     | "school"
   >("home");
+  // Smart Notes holds two tools: the notebook itself and the summarizer, which
+  // used to be its own sidebar tab. Sub-tab picks which one is showing.
+  const [notesView, setNotesView] = useState<"notes" | "summarize">("notes");
   // Sub-sections within the Plan tab, so it's not one overwhelming scroll.
   // "overview" is the main landing page that summarizes everything.
   const [planSection, setPlanSection] = useState<
@@ -16100,6 +18777,8 @@ function ElioraApp() {
   const [studyPlanSubject, setStudyPlanSubject] = useState("");
   const [listening, setListening] = useState(false);
   const [speechSupported, setSpeechSupported] = useState(false);
+  // Hands-free voice conversation overlay (talk to Eliora, she talks back).
+  const [voiceMode, setVoiceMode] = useState(false);
   // Photos/files/videos staged in the composer, sent with the next message.
   const [attachments, setAttachments] = useState<Attachment[]>([]);
   const [attaching, setAttaching] = useState(false);
@@ -16480,6 +19159,18 @@ function ElioraApp() {
 
       const savedRoom = localStorage.getItem(ROOM_KEY);
       if (savedRoom) setEquippedRoom(savedRoom);
+
+      const rawMaterial = localStorage.getItem(MATERIAL_KEY);
+      if (rawMaterial) {
+        const parsed = JSON.parse(rawMaterial);
+        if (Array.isArray(parsed)) setMaterials(parsed as StudyMaterial[]);
+      }
+
+      const savedTutor = localStorage.getItem(TUTOR_KEY);
+      // Ignore a tutor id that no longer exists so a renamed persona falls back
+      // to the default instead of silently sending an unknown id.
+      if (savedTutor && ELIORA_TUTORS.some((t) => t.id === savedTutor))
+        setTutorId(savedTutor);
 
       const rawRewards = localStorage.getItem(CUSTOM_REWARDS_KEY);
       if (rawRewards) {
@@ -17487,6 +20178,31 @@ function ElioraApp() {
     }
   }, [equippedRoom, loaded]);
 
+  // Persist the chosen AI tutor, and point read-aloud at that tutor's voice so
+  // they sound like themselves. Settings' VoicePicker writes the same key, so
+  // picking a voice by hand there still wins until the tutor is changed again.
+  useEffect(() => {
+    if (!loaded) return;
+    try {
+      localStorage.setItem(TUTOR_KEY, tutorId);
+      localStorage.setItem(TTS_VOICE_KEY, tutorById(tutorId).voice);
+    } catch {
+      /* ignore */
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [tutorId, loaded]);
+
+  // Persist the uploaded textbook digests.
+  useEffect(() => {
+    if (!loaded) return;
+    try {
+      localStorage.setItem(MATERIAL_KEY, JSON.stringify(materials));
+    } catch {
+      /* ignore */
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [materials, loaded]);
+
   // Persist the learner's custom rewards + spent-XP balance.
   useEffect(() => {
     if (!loaded) return;
@@ -18284,6 +21000,107 @@ function ElioraApp() {
     );
   }
 
+  // Read an uploaded textbook chapter / photographed page / pasted text into a
+  // digest the tutor can teach from. The heavy file goes to the server exactly
+  // once — from then on only the small digest travels with each chat message.
+  async function addMaterial({ file, text }: { file?: File; text?: string }) {
+    if (materialBusy) return;
+    const label = file?.name ?? "your notes";
+    setMaterialError("");
+    setMaterialBusy(label);
+    try {
+      const payload: Record<string, unknown> = {
+        profile: profile ?? undefined,
+        subject: subjects[0] || undefined,
+      };
+      if (file) {
+        // Text files go up as text; PDFs and photos go up as base64 for the
+        // model to read directly (same path the lesson + notes tools use).
+        const isText =
+          file.type.startsWith("text/") ||
+          /\.(txt|md|markdown|csv)$/i.test(file.name);
+        payload.fileName = file.name;
+        if (isText) {
+          payload.text = await file.text();
+        } else {
+          const dataUrl: string = await new Promise((resolve, reject) => {
+            const reader = new FileReader();
+            reader.onload = () => resolve(String(reader.result ?? ""));
+            reader.onerror = () => reject(new Error("Couldn't read that file"));
+            reader.readAsDataURL(file);
+          });
+          payload.fileBase64 = dataUrl.split(",")[1] ?? "";
+          payload.fileMediaType = file.type || "application/octet-stream";
+        }
+      } else {
+        payload.text = text;
+      }
+
+      const res = await fetch("/api/material", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload),
+      });
+      if (!res.ok) throw new Error(`Upload failed (${res.status})`);
+      const data = (await res.json()) as {
+        material?: StudyMaterial;
+        error?: string;
+      };
+      if (!data.material) {
+        setMaterialError(data.error || "Couldn't read that material.");
+        return;
+      }
+      // Newest last — materialContext() keeps the most recent ones when it
+      // trims to MATERIAL_MAX, and so does this.
+      setMaterials((prev) => [...prev, data.material!].slice(-MATERIAL_MAX));
+    } catch (e) {
+      setMaterialError(
+        e instanceof Error ? e.message : "Couldn't read that material.",
+      );
+    } finally {
+      setMaterialBusy(null);
+    }
+  }
+
+  function removeMaterial(id: string) {
+    setMaterials((prev) => prev.filter((m) => m.id !== id));
+  }
+
+  // Open a fresh chat with a tutor. The persona itself rides along in the
+  // request body (see the `tutor` field in send()), so the kickoff only has to
+  // get the conversation started in their voice.
+  function startTutorChat(tutor: ElioraTutor) {
+    if (busy || pendingKickoff) return;
+    setTutorId(tutor.id);
+    const id = newChatId();
+    // Keep the greeting first so send()'s history slicing stays correct.
+    const msgs = profile ? [greetingFor(profile)] : [];
+    setChats((prev) => [
+      ...prev,
+      {
+        id,
+        title: `${tutor.emoji} ${tutor.name}`,
+        messages: msgs,
+        named: true,
+      },
+    ]);
+    setActiveChatId(id);
+    setInput("");
+    setTab("chat");
+    setSidebarOpen(false);
+    const book = materials[materials.length - 1];
+    setPendingKickoff(
+      `I'd like to work with you, ${tutor.name}. Introduce yourself in a line ` +
+        `or two, say how you like to teach ${tutor.subject.toLowerCase()}, and ` +
+        (book
+          ? `mention that you've read my material ("${book.title}") and will ` +
+            `teach from it. Then ask me ONE question — which section I want to ` +
+            `start with, or what I'm stuck on.`
+          : `then ask me ONE question about what I'm working on right now so we ` +
+            `can start on something small.`),
+    );
+  }
+
   // The "extra work" tail — an applied challenge / mini-project the learner
   // does AFTER the teach-back, using the topic on a fresh real-world example to
   // make it stick. Practice, not a graded assignment, so Eliora coaches rather
@@ -18384,15 +21201,7 @@ function ElioraApp() {
     if (busy || pendingKickoff) return;
     const topic = input.trim() || activeChat?.title?.trim() || "";
     setInput("");
-    void send(
-      topic
-        ? `Give me ONE quick, practical study tip for working on "${topic}" ` +
-            `right now — a proven technique I can use this minute, matched to how ` +
-            `I learn and what I struggle with. Keep it to a sentence or two.`
-        : `Give me ONE quick, practical study tip I can use right now — a proven ` +
-            `technique matched to how I learn and what I struggle with. Keep it to ` +
-            `a sentence or two.`,
-    );
+    void send(studyTipPrompt(topic));
   }
 
   // Open the camera recorder so the learner can teach the concept out loud.
@@ -18627,12 +21436,17 @@ function ElioraApp() {
     setAttachments((prev) => prev.filter((_, idx) => idx !== i));
   }
 
-  async function send(override?: string, opts?: { hidden?: boolean }) {
+  // Resolves with the assistant's finished reply, so callers that need the
+  // answer (voice mode reads it aloud) don't have to watch `messages`.
+  async function send(
+    override?: string,
+    opts?: { hidden?: boolean },
+  ): Promise<string> {
     const text = (typeof override === "string" ? override : input).trim();
     // A typed override (quick chip, auto-build) is text-only; a real learner
     // turn may carry attachments with no text, which is a valid message.
     const outgoing = typeof override === "string" ? [] : attachments;
-    if ((!text && outgoing.length === 0) || busy) return;
+    if ((!text && outgoing.length === 0) || busy) return "";
 
     const userMsg: Message = {
       role: "user",
@@ -18676,6 +21490,8 @@ function ElioraApp() {
           assignments: assignments.length ? assignments : undefined,
           goals: goals.length ? goals : undefined,
           fourYearPlan: fourYearPlan ?? undefined,
+          tutor: tutorId !== ELIORA_DEFAULT_TUTOR ? tutorId : undefined,
+          material: materials.length ? materials : undefined,
         }),
       });
 
@@ -18807,6 +21623,7 @@ function ElioraApp() {
         for (const line of lines) applyEvent(line);
       }
       applyEvent(buffer);
+      return acc;
     } catch (err) {
       const stopped = err instanceof DOMException && err.name === "AbortError";
       setMessages((prev) => {
@@ -18828,6 +21645,7 @@ function ElioraApp() {
         }
         return copy;
       });
+      return stopped ? "" : "Sorry, I couldn't reach the server. Please try again.";
     } finally {
       chatAbortRef.current = null;
       setBusy(false);
@@ -18886,7 +21704,6 @@ function ElioraApp() {
             [
               ["home", "🏠 Home"],
               ["chat", "💬 Chat"],
-              ["summarize", "📝 Summarize"],
               ["notebook", "📓 Smart Notes"],
               ["practice", "🧠 Practice"],
               ["calendar", "📅 Calendar"],
@@ -18894,6 +21711,7 @@ function ElioraApp() {
               ["progress", "📊 Progress"],
               ["study", "📋 Study"],
               ["together", "👥 Study Together"],
+              ["folder", "🗂️ Shared Folder"],
               ["school", "🏫 School"],
             ] as const
           ).map(([key, label]) => (
@@ -19289,6 +22107,17 @@ function ElioraApp() {
               <h1 style={styles.homeHi}>Hi{heroName} 🌱</h1>
               <p style={styles.homeSub}>What do you want to work on today?</p>
             </div>
+            <TutorPicker
+              selected={tutorId}
+              busy={busy || !!pendingKickoff}
+              materials={materials}
+              materialBusy={materialBusy}
+              materialError={materialError}
+              onSelect={setTutorId}
+              onStart={startTutorChat}
+              onAddMaterial={(s) => void addMaterial(s)}
+              onRemoveMaterial={removeMaterial}
+            />
             <VideoFeed
               topics={Array.from(
                 new Set(
@@ -19363,11 +22192,15 @@ function ElioraApp() {
               {(
                 [
                   ["💬", "New chat", "Talk through anything", () => newChat()],
-                  ["📝", "Summarize notes", "Notes → study set", () => setTab("summarize")],
+                  ["📝", "Summarize notes", "Notes → study set", () => {
+                    setNotesView("summarize");
+                    setTab("notebook");
+                  }],
                   ["🧠", "Practice quiz", "Test what you know", () => setTab("practice")],
                   ["🎯", "My plan", "See your next step", () => setTab("plan")],
                   ["🗺️", "4-year plan", "Map your path", () => setTab("plan")],
                   ["🏫", "Connect school", "Import assignments & grades", () => setTab("school")],
+                  ["🗂️", "Shared folder", "Tests & assignments with a friend", () => setTab("folder")],
                 ] as const
               ).map(([emoji, title, desc, fn]) => (
                 <button
@@ -19463,35 +22296,56 @@ function ElioraApp() {
           </div>
         )}
 
-      {tab === "summarize" && (
-        <Summarizer
-          profile={profile}
-          onAddToChat={(msg) => {
-            setMessages((prev) => [
-              ...prev,
-              {
-                role: "assistant",
-                content: msg.content,
-                flashcards: msg.flashcards,
-                quiz: msg.quiz,
-              },
-            ]);
-            setTab("chat");
-          }}
-          onStudyGuide={studyGuideFromQuiz}
-        />
-      )}
-
       {tab === "notebook" && (
         <div style={{ padding: "8px 16px 24px" }}>
           <h2 style={{ fontSize: 22, fontWeight: 800, color: "var(--accent)", margin: "6px 0 2px" }}>
             📓 Smart Notes
           </h2>
-          <p style={{ color: "var(--muted)", fontSize: 14, margin: "0 0 14px" }}>
-            Your notes — free-form or Cornell, color-code key concepts, link notes
-            with [[title]], and pin sticky notes.
+          <p style={{ color: "var(--muted)", fontSize: 14, margin: "0 0 10px" }}>
+            {notesView === "notes"
+              ? "Your notes — free-form or Cornell, color-code key concepts, link notes with [[title]], and pin sticky notes."
+              : "Paste notes, a link, or a doc and turn it into a summary, study guide, flashcards, or a quiz."}
           </p>
-          <NotesWorkspace ns={ns} />
+          {/* Sub-tabs: the notebook and the summarizer live side by side here. */}
+          <div style={{ ...styles.outputRow, marginBottom: 12 }}>
+            {(
+              [
+                ["notes", "📓 My notes"],
+                ["summarize", "📝 Summarize"],
+              ] as const
+            ).map(([k, label]) => (
+              <button
+                key={k}
+                onClick={() => setNotesView(k)}
+                style={{
+                  ...styles.outChip,
+                  ...(notesView === k ? styles.outChipActive : {}),
+                }}
+              >
+                {label}
+              </button>
+            ))}
+          </div>
+          {notesView === "notes" ? (
+            <NotesWorkspace ns={ns} />
+          ) : (
+            <Summarizer
+              profile={profile}
+              onAddToChat={(msg) => {
+                setMessages((prev) => [
+                  ...prev,
+                  {
+                    role: "assistant",
+                    content: msg.content,
+                    flashcards: msg.flashcards,
+                    quiz: msg.quiz,
+                  },
+                ]);
+                setTab("chat");
+              }}
+              onStudyGuide={studyGuideFromQuiz}
+            />
+          )}
         </div>
       )}
 
@@ -20188,6 +23042,17 @@ function ElioraApp() {
         />
       )}
 
+      {tab === "folder" && (
+        <SharedFolder
+          name={
+            session?.user?.name?.trim() ||
+            profile?.name?.trim() ||
+            session?.user?.email?.split("@")[0] ||
+            "Guest"
+          }
+        />
+      )}
+
       {tab === "chat" && (
         <>
       <PlanStrip
@@ -20500,6 +23365,22 @@ function ElioraApp() {
         />
         {speechSupported && (
           <button
+            type="button"
+            onClick={() => {
+              recognitionRef.current?.stop();
+              stopSpeaking();
+              setVoiceMode(true);
+            }}
+            disabled={busy}
+            style={styles.micBtn}
+            aria-label="Start a voice conversation with Eliora"
+            title="Voice mode — talk out loud and Eliora answers out loud"
+          >
+            📞
+          </button>
+        )}
+        {speechSupported && (
+          <button
             onClick={toggleDictation}
             disabled={busy}
             style={{
@@ -20520,6 +23401,12 @@ function ElioraApp() {
           {busy ? "⏹ Stop" : "Send"}
         </button>
       </div>
+      {voiceMode && (
+        <VoiceChat
+          onSend={(text) => send(text)}
+          onClose={() => setVoiceMode(false)}
+        />
+      )}
         </>
       )}
       </main>
@@ -21668,6 +24555,161 @@ const styles: Record<string, React.CSSProperties> = {
     fontSize: "0.875rem",
     color: "var(--muted)",
     lineHeight: 1.4,
+  },
+  // AI tutors shelf — a wrapping grid of small persona cards.
+  tutorGrid: {
+    display: "grid",
+    // 132px keeps two tutors per row on a phone instead of one tall stack.
+    gridTemplateColumns: "repeat(auto-fill, minmax(132px, 1fr))",
+    gap: 10,
+  },
+  tutorCard: {
+    display: "flex",
+    flexDirection: "column",
+    alignItems: "flex-start",
+    gap: 4,
+    padding: "12px 14px",
+    borderRadius: "var(--radius-md)",
+    borderWidth: 2,
+    borderStyle: "solid",
+    borderColor: "var(--border)",
+    background: "var(--surface)",
+    color: "var(--text)",
+    cursor: "pointer",
+    textAlign: "left",
+    transition: "transform 0.15s ease, border-color 0.15s ease",
+  },
+  tutorCardActive: {
+    borderColor: "var(--accent)",
+    background: "var(--accent-soft)",
+  },
+  tutorAvatar: {
+    width: 36,
+    height: 36,
+    borderRadius: "var(--radius-md)",
+    background: "var(--accent-soft)",
+    display: "grid",
+    placeItems: "center",
+    fontSize: 20,
+    marginBottom: 2,
+  },
+  tutorName: { fontSize: 15, fontWeight: 800, color: "var(--text)" },
+  tutorSubject: { fontSize: 12, fontWeight: 700, color: "var(--accent)" },
+  tutorTagline: { fontSize: 12, color: "var(--muted)", lineHeight: 1.35 },
+  tutorActions: {
+    display: "flex",
+    flexWrap: "wrap",
+    gap: 8,
+    marginTop: 14,
+  },
+  tutorStartBtn: {
+    background: "var(--accent)",
+    color: "#fff",
+    border: "none",
+    borderRadius: 12,
+    padding: "10px 16px",
+    fontSize: 15,
+    fontWeight: 700,
+    cursor: "pointer",
+  },
+  tutorVoiceBtn: {
+    background: "var(--surface)",
+    color: "var(--text)",
+    border: "1px solid var(--border)",
+    borderRadius: 12,
+    padding: "10px 14px",
+    fontSize: 14,
+    fontWeight: 600,
+    cursor: "pointer",
+  },
+  // "Teach from my textbook" — the uploaded-material shelf inside the card.
+  tutorMaterial: {
+    marginTop: 16,
+    paddingTop: 14,
+    borderTop: "1px solid var(--border)",
+  },
+  tutorMaterialHead: {
+    display: "flex",
+    alignItems: "center",
+    justifyContent: "space-between",
+    gap: 8,
+  },
+  tutorMaterialTitle: { fontSize: 15, fontWeight: 800, color: "var(--text)" },
+  materialRow: { marginBottom: 8, position: "relative" },
+  materialRowMain: {
+    display: "flex",
+    alignItems: "center",
+    gap: 10,
+    width: "100%",
+    padding: "10px 34px 10px 12px",
+    borderRadius: "var(--radius-md)",
+    border: "1px solid var(--border)",
+    background: "var(--surface)",
+    color: "var(--text)",
+    cursor: "pointer",
+    fontSize: 14,
+  },
+  materialTitle: {
+    display: "block",
+    fontWeight: 700,
+    overflow: "hidden",
+    whiteSpace: "nowrap",
+    textOverflow: "ellipsis",
+  },
+  materialMeta: {
+    display: "block",
+    color: "var(--muted)",
+    fontSize: 12,
+    marginTop: 2,
+    overflow: "hidden",
+    whiteSpace: "nowrap",
+    textOverflow: "ellipsis",
+  },
+  materialRemove: {
+    position: "absolute",
+    top: 8,
+    right: 8,
+    border: "none",
+    background: "transparent",
+    color: "var(--muted)",
+    fontSize: 18,
+    lineHeight: 1,
+    cursor: "pointer",
+    padding: 4,
+  },
+  materialDetail: {
+    padding: "8px 12px 4px",
+    fontSize: 13,
+    color: "var(--muted)",
+  },
+  materialTopicList: { margin: 0, paddingLeft: 20, lineHeight: 1.6 },
+  materialReading: {
+    padding: "10px 12px",
+    borderRadius: "var(--radius-md)",
+    background: "var(--accent-soft)",
+    color: "var(--text)",
+    fontSize: 13,
+    marginBottom: 8,
+  },
+  materialError: {
+    padding: "10px 12px",
+    borderRadius: "var(--radius-md)",
+    border: "1px solid var(--border)",
+    color: "var(--muted)",
+    fontSize: 13,
+    marginBottom: 8,
+  },
+  materialTextarea: {
+    width: "100%",
+    minHeight: 120,
+    padding: 12,
+    borderRadius: "var(--radius-md)",
+    border: "1px solid var(--border)",
+    background: "var(--surface)",
+    color: "var(--text)",
+    fontFamily: "inherit",
+    fontSize: 14,
+    resize: "vertical",
   },
   formPage: {
     maxWidth: 560,
@@ -24738,6 +27780,89 @@ const styles: Record<string, React.CSSProperties> = {
     background: "#fdecea",
     borderColor: "#e5534b",
   },
+  // Voice mode — the full-screen "talking with Eliora" overlay.
+  voiceOverlay: {
+    position: "fixed",
+    inset: 0,
+    background: "rgba(20,28,24,0.72)",
+    backdropFilter: "blur(3px)",
+    display: "flex",
+    alignItems: "center",
+    justifyContent: "center",
+    padding: 16,
+    zIndex: 60,
+  },
+  voiceCard: {
+    background: "var(--bg)",
+    borderRadius: 22,
+    padding: "18px 20px 20px",
+    width: "100%",
+    maxWidth: 440,
+    maxHeight: "90dvh",
+    overflowY: "auto",
+    display: "flex",
+    flexDirection: "column",
+    alignItems: "center",
+    gap: 12,
+    boxShadow: "var(--shadow-e3)",
+    textAlign: "center",
+  },
+  voiceHead: {
+    display: "flex",
+    alignItems: "center",
+    justifyContent: "space-between",
+    width: "100%",
+  },
+  voiceTitle: { fontSize: 16, fontWeight: 600, color: "var(--accent)" },
+  voiceOrb: {
+    width: 116,
+    height: 116,
+    borderRadius: "50%",
+    display: "flex",
+    alignItems: "center",
+    justifyContent: "center",
+    fontSize: 46,
+    background: "var(--surface)",
+    borderWidth: 2,
+    borderStyle: "solid",
+    borderColor: "var(--accent)",
+    marginTop: 6,
+  },
+  voiceStatus: { fontSize: 17, fontWeight: 600, color: "var(--text)" },
+  voiceHeard: {
+    margin: 0,
+    fontSize: 15,
+    lineHeight: 1.45,
+    color: "var(--muted)",
+    minHeight: 44,
+  },
+  voiceReply: {
+    margin: 0,
+    fontSize: 15,
+    lineHeight: 1.5,
+    color: "var(--text)",
+    background: "var(--surface)",
+    borderRadius: 14,
+    padding: "10px 12px",
+    maxHeight: 180,
+    overflowY: "auto",
+    textAlign: "left",
+    width: "100%",
+  },
+  voiceError: {
+    margin: 0,
+    fontSize: 15,
+    lineHeight: 1.5,
+    color: "var(--text)",
+  },
+  voiceControls: {
+    display: "flex",
+    flexWrap: "wrap",
+    gap: 8,
+    justifyContent: "center",
+    width: "100%",
+  },
+  voiceHint: { margin: 0, fontSize: 12.5, color: "var(--muted)" },
   // Chat attachments (composer staging strip + in-bubble thumbnails)
   attachStrip: {
     display: "flex",

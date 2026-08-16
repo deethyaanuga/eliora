@@ -3,6 +3,7 @@ import {
   ELIORA_SUMMARY_MODEL,
   notesPolishSystemPrompt,
   type NotesPolishMode,
+  type NotesFormat,
   type LearnerProfile,
 } from "@eliora/shared";
 
@@ -26,9 +27,9 @@ const POLISH_TOOL: OpenAI.Chat.Completions.ChatCompletionTool = {
         cleaned: {
           type: "string",
           description:
-            "The tidied notes as markdown (## headings, - bullets, **bold**), " +
-            "with the most important phrase in each section wrapped in " +
-            "==double equals== to highlight it.",
+            "The tidied notes as markdown, structured in the FORMAT the system " +
+            "prompt asks for, with the most important phrase in each section " +
+            "wrapped in ==double equals== to highlight it.",
         },
         keyIdeas: {
           type: "array",
@@ -59,6 +60,7 @@ const POLISH_TOOL: OpenAI.Chat.Completions.ChatCompletionTool = {
 
 type NotesPolishBody = {
   mode?: NotesPolishMode;
+  format?: NotesFormat;
   text?: string;
   fileBase64?: string;
   fileMediaType?: string;
@@ -81,16 +83,30 @@ export async function POST(req: Request) {
     body.mode === "handwriting" || body.mode === "highlight"
       ? body.mode
       : "clean";
+  const format: NotesFormat =
+    body.format === "cornell" ||
+    body.format === "paragraph" ||
+    body.format === "qa"
+      ? body.format
+      : "outline";
   const text = (body.text ?? "").trim();
   const hasFile = !!body.fileBase64;
   if (!text && !hasFile) {
     return Response.json({ error: "missing_notes" }, { status: 400 });
   }
 
+  const formatAsk: Record<NotesFormat, string> = {
+    outline: "as an outline (## headings with - bullets)",
+    cornell:
+      "in Cornell style — ## Cues, ## Notes, and ## Summary sections, all three required",
+    paragraph: "as flowing paragraphs of prose (no bullet lists)",
+    qa: "as **Q:** / **A:** pairs for self-quizzing",
+  };
   const intro =
-    mode === "handwriting"
-      ? "Transcribe and tidy up the handwritten notes below."
-      : "Clean up and organize the notes below.";
+    (mode === "handwriting"
+      ? "Transcribe and tidy up the handwritten notes below"
+      : "Clean up and organize the notes below") +
+    `, formatting the cleaned notes ${formatAsk[format]}.`;
 
   type UserContent =
     OpenAI.Chat.Completions.ChatCompletionUserMessageParam["content"];
@@ -128,7 +144,10 @@ export async function POST(req: Request) {
       model: ELIORA_SUMMARY_MODEL,
       max_completion_tokens: 2500,
       messages: [
-        { role: "system", content: notesPolishSystemPrompt(mode, body.profile) },
+        {
+          role: "system",
+          content: notesPolishSystemPrompt(mode, body.profile, format),
+        },
         { role: "user", content: userContent },
       ],
       tools: [POLISH_TOOL],

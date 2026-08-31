@@ -1,7 +1,9 @@
 import OpenAI from "openai";
 import {
   ELIORA_SUMMARY_MODEL,
+  LESSON_VISUAL_SCHEMA,
   lessonPrompt,
+  parseLessonVisual,
   type Lesson,
   type LessonRequest,
   type LessonSize,
@@ -71,8 +73,20 @@ const LESSON_TOOL: OpenAI.Chat.Completions.ChatCompletionTool = {
                 description:
                   "One multiple-choice question testing JUST this step, answered before advancing.",
               },
+              visual: {
+                ...LESSON_VISUAL_SCHEMA,
+                description:
+                  "The diagram drawn on this step's slide. Omit when the step " +
+                  "has no structure worth drawing.",
+              },
+              narration: {
+                type: "string",
+                description:
+                  "2–3 sentences teaching this step out loud, as plain spoken " +
+                  "prose (no markdown). Read aloud in slide mode.",
+              },
             },
-            required: ["heading", "body", "check"],
+            required: ["heading", "body", "check", "narration"],
           },
           description:
             "The teach-then-check steps, in learning order (simplest first).",
@@ -206,11 +220,21 @@ export async function POST(req: Request) {
         str(s?.heading) && str(s?.body),
       )
       .slice(0, 8)
-      .map((s: { heading?: unknown; body?: unknown; check?: unknown }) => ({
-        heading: String(s.heading).trim(),
-        body: String(s.body).trim(),
-        check: parseCheck(s.check),
-      }));
+      .map(
+        (s: {
+          heading?: unknown;
+          body?: unknown;
+          check?: unknown;
+          visual?: unknown;
+          narration?: unknown;
+        }) => ({
+          heading: String(s.heading).trim(),
+          body: String(s.body).trim(),
+          check: parseCheck(s.check),
+          visual: parseLessonVisual(s.visual),
+          narration: str(s.narration),
+        }),
+      );
     const keyTerms = (Array.isArray(args.keyTerms) ? args.keyTerms : [])
       .filter((t: { term?: unknown; definition?: unknown }) =>
         str(t?.term) && str(t?.definition),

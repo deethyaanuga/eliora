@@ -5,8 +5,8 @@ import {
   type LearnerProfile,
 } from "@eliora/shared";
 
-// Turns one calendar month of the learner's tracked activity (effort/XP, study
-// hours, active days, streak, goal progress, GPA snapshot, mistakes, what's due)
+// Turns one calendar month of the learner's tracked activity (study hours,
+// active days, goal progress, GPA snapshot, mistakes, what's due)
 // into a warm monthly recap + a few forward focuses. Returns { message, focus }.
 // Forces a tool call for clean, structured output — same shape as /api/reflection.
 export const runtime = "nodejs";
@@ -41,12 +41,9 @@ const REPORT_TOOL: OpenAI.Chat.Completions.ChatCompletionTool = {
 type MonthlyReportRequest = {
   monthLabel?: string; // e.g. "July 2026"
   career?: string;
-  xp?: number; // total XP earned in the month
   studyHours?: number; // hours studied in the month
   activeDays?: number; // days with any activity
   daysInMonth?: number;
-  bestDayXp?: number;
-  streak?: number; // current day streak (as of now)
   gpa?: number; // current weighted GPA
   projectedGpa?: number; // projected weighted GPA
   goalsActive?: number;
@@ -84,7 +81,6 @@ export async function POST(req: Request) {
     body.monthLabel?.trim() ? `Month: ${body.monthLabel.trim()}` : "",
     body.career?.trim() ? `Career goal: ${body.career.trim()}` : "",
     body.quiet ? "This was a QUIET month — little or no tracked activity." : "",
-    n(body.xp) ? `Effort this month: ${body.xp} XP` : "",
     n(body.studyHours)
       ? `Time studied: ${body.studyHours} hour${body.studyHours === 1 ? "" : "s"}`
       : "",
@@ -92,12 +88,6 @@ export async function POST(req: Request) {
       ? `Active days: ${body.activeDays}${
           n(body.daysInMonth) ? ` of ${body.daysInMonth}` : ""
         }`
-      : "",
-    n(body.bestDayXp) && body.bestDayXp! > 0
-      ? `Best single day: ${body.bestDayXp} XP`
-      : "",
-    n(body.streak) && body.streak! > 0
-      ? `Current streak: ${body.streak} day${body.streak === 1 ? "" : "s"}`
       : "",
     n(body.gpa) ? `Weighted GPA so far: ${body.gpa!.toFixed(2)}` : "",
     n(body.projectedGpa)

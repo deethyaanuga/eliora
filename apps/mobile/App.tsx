@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import {
   ActivityIndicator,
   Alert,
@@ -210,6 +210,8 @@ const PLANNING_OPTIONS = [
   "I mentally plan it",
   "I don't plan at all",
 ];
+// Grade / year is a number, so it's a pick-one instead of free text.
+const GRADE_YEAR_OPTIONS = ["Grade 9", "Grade 10", "Grade 11", "Grade 12"];
 const SESSION_LENGTH_OPTIONS = [
   "Less than 30 minutes",
   "30–60 minutes",
@@ -233,7 +235,6 @@ const WANTED_FEATURE_OPTIONS = [
   "Automatic study schedules",
   "Reminders and notifications",
   "Progress tracking",
-  "Gamification (points, rewards)",
   "Focus timers",
 ];
 const PLAN_BLOCKER_OPTIONS = [
@@ -334,9 +335,9 @@ const KIND_COLOR: Record<EventKind, string> = {
   exam: "#b8742a",
   final: "#c0392b",
   quiz: "#2f6f8f",
-  assignment: "#5b6660",
+  assignment: "#6b6280",
   project: "#7a5c9e",
-  other: "#5b6660",
+  other: "#6b6280",
 };
 
 function formatDate(iso: string): string {
@@ -372,7 +373,7 @@ const SCHEDULE_KINDS: {
   label: string;
   color: string;
 }[] = [
-  { key: "study", emoji: "📚", label: "Study", color: "#2f6f4f" },
+  { key: "study", emoji: "📚", label: "Study", color: "#7b4bd0" },
   { key: "break", emoji: "☕", label: "Break", color: "#d98a2b" },
   { key: "class", emoji: "🏫", label: "Class", color: "#3a6ea5" },
   { key: "other", emoji: "📝", label: "Other", color: "#8a8a8a" },
@@ -577,7 +578,7 @@ function ConcernField({
           if ((draft.trim() || "") !== (value ?? "")) onCommit(draft);
         }}
         placeholder="What's worrying you about this?"
-        placeholderTextColor="#9aa39d"
+        placeholderTextColor="#9b93b3"
         returnKeyType="done"
       />
     </View>
@@ -624,7 +625,7 @@ function AssignmentsPanel({
           value={title}
           onChangeText={setTitle}
           placeholder="Add an assignment…"
-          placeholderTextColor="#9aa39d"
+          placeholderTextColor="#9b93b3"
           onSubmitEditing={add}
           returnKeyType="done"
         />
@@ -637,7 +638,7 @@ function AssignmentsPanel({
         value={subject}
         onChangeText={setSubject}
         placeholder="Subject (optional)"
-        placeholderTextColor="#9aa39d"
+        placeholderTextColor="#9b93b3"
       />
       {subjects.length > 0 && (
         <ScrollView
@@ -780,7 +781,7 @@ function GoalBuilder({
         value={value}
         onChangeText={setValue}
         placeholder={placeholder}
-        placeholderTextColor="#9aa39d"
+        placeholderTextColor="#9b93b3"
         keyboardType={numeric ? "number-pad" : "default"}
       />
     </View>
@@ -1063,7 +1064,7 @@ function ClassSurvey({
         value={klass}
         onChangeText={setKlass}
         placeholder="e.g. Chemistry, Algebra 2, Spanish 3"
-        placeholderTextColor="#9aa39d"
+        placeholderTextColor="#9b93b3"
       />
       <Text style={styles.classSurveyLabel}>
         What do you struggle with in this class?
@@ -1073,7 +1074,7 @@ function ClassSurvey({
         value={struggles}
         onChangeText={setStruggles}
         placeholder="e.g. balancing equations, word problems"
-        placeholderTextColor="#9aa39d"
+        placeholderTextColor="#9b93b3"
       />
       <Text style={styles.classSurveyLabel}>What do you want to get done?</Text>
       <TextInput
@@ -1081,7 +1082,7 @@ function ClassSurvey({
         value={goal}
         onChangeText={setGoal}
         placeholder="e.g. pass the unit test Friday"
-        placeholderTextColor="#9aa39d"
+        placeholderTextColor="#9b93b3"
       />
       <View style={styles.classSurveyActions}>
         <TouchableOpacity style={styles.classSurveyCancel} onPress={onCancel}>
@@ -1206,7 +1207,7 @@ function PlanPathMap({
                     width: len,
                     height: 4,
                     borderRadius: 2,
-                    backgroundColor: walkedSeg ? "#2f6f4f" : "#e2e6e0",
+                    backgroundColor: walkedSeg ? "#7b4bd0" : "#e2e6e0",
                     transform: [{ rotate: `${angle}deg` }],
                   }}
                 />
@@ -1222,21 +1223,21 @@ function PlanPathMap({
               const bg = isDone
                 ? cp
                   ? "#b8742a"
-                  : "#2f6f4f"
+                  : "#7b4bd0"
                 : isCurrent
                   ? "#fff"
                   : cp
                     ? "#f3e7d7"
-                    : "#eef1ee";
-              const borderColor = cp ? "#b8742a" : "#2f6f4f";
+                    : "#f3ebfd";
+              const borderColor = cp ? "#b8742a" : "#7b4bd0";
               const borderW = isCurrent ? 3 : isDone ? 0 : 2;
               const fg = isDone
                 ? "#fff"
                 : isCurrent
                   ? cp
                     ? "#b8742a"
-                    : "#2f6f4f"
-                  : "#5b6660";
+                    : "#7b4bd0"
+                  : "#6b6280";
               return (
                 <View key={`node${i}`}>
                   {isCurrent && (
@@ -1299,7 +1300,7 @@ function PlanPathMap({
                       fontSize: 12,
                       lineHeight: 15,
                       fontWeight: isCurrent ? "700" : "500",
-                      color: isDone ? "#5b6660" : "#1c2421",
+                      color: isDone ? "#6b6280" : "#2a2350",
                     }}
                   >
                     {m.title}
@@ -1318,10 +1319,10 @@ function PlanPathMap({
                 borderRadius: 27,
                 alignItems: "center",
                 justifyContent: "center",
-                backgroundColor: pct === 100 ? "#eef1ee" : "#f7f5f0",
+                backgroundColor: pct === 100 ? "#f3ebfd" : "#fdf4f2",
                 borderWidth: 2,
                 borderStyle: pct === 100 ? "solid" : "dashed",
-                borderColor: pct === 100 ? "#2f6f4f" : "#d9ddd8",
+                borderColor: pct === 100 ? "#7b4bd0" : "#efe4f0",
               }}
             >
               <Text style={{ fontSize: 24 }}>🏆</Text>
@@ -1335,7 +1336,7 @@ function PlanPathMap({
                 textAlign: "center",
                 fontSize: 12,
                 fontWeight: "700",
-                color: pct === 100 ? "#2f6f4f" : "#5b6660",
+                color: pct === 100 ? "#7b4bd0" : "#6b6280",
               }}
             >
               {pct === 100 ? "Plan complete!" : "Finish"}
@@ -1460,7 +1461,7 @@ function PlanPanel({
             value={step}
             onChangeText={setStep}
             placeholder="Add your own step…"
-            placeholderTextColor="#9aa39d"
+            placeholderTextColor="#9b93b3"
             onSubmitEditing={addStep}
             returnKeyType="done"
           />
@@ -1500,7 +1501,7 @@ function MonthGrid({
   for (const e of events)
     (dotsByDate[e.date] ||= []).push(KIND_COLOR[e.kind ?? "other"]);
   for (const a of assignments)
-    if (a.due) (dotsByDate[a.due] ||= []).push("#2f6f4f");
+    if (a.due) (dotsByDate[a.due] ||= []).push("#7b4bd0");
   const cells: (number | null)[] = [];
   for (let i = 0; i < startWeekday; i++) cells.push(null);
   for (let d = 1; d <= daysInMonth; d++) cells.push(d);
@@ -1687,12 +1688,12 @@ function DeadlineCountdown({
         </View>
         <View style={{ flex: 1 }}>
           <Text
-            style={{ fontSize: 15, fontWeight: "700", color: "#1c2421" }}
+            style={{ fontSize: 15, fontWeight: "700", color: "#2a2350" }}
             numberOfLines={1}
           >
             {next.emoji} {next.title}
           </Text>
-          <Text style={{ fontSize: 12, color: "#5b6660", marginTop: 2 }}>
+          <Text style={{ fontSize: 12, color: "#6b6280", marginTop: 2 }}>
             {next.tag} · {countdownBig(next.days)}
           </Text>
         </View>
@@ -1718,12 +1719,12 @@ function DeadlineCountdown({
             {countdownBig(it.days)}
           </Text>
           <Text
-            style={{ flex: 1, fontSize: 13, color: "#1c2421" }}
+            style={{ flex: 1, fontSize: 13, color: "#2a2350" }}
             numberOfLines={1}
           >
             {it.emoji} {it.title}
           </Text>
-          <Text style={{ fontSize: 11, color: "#8a938d" }}>{it.tag}</Text>
+          <Text style={{ fontSize: 11, color: "#8b83a3" }}>{it.tag}</Text>
         </View>
       ))}
     </View>
@@ -1774,14 +1775,14 @@ function CalendarPanel({
             value={title}
             onChangeText={setTitle}
             placeholder="e.g. Biology final"
-            placeholderTextColor="#8a938d"
+            placeholderTextColor="#8b83a3"
           />
           <TextInput
             style={styles.calInput}
             value={date}
             onChangeText={setDate}
             placeholder="Date — YYYY-MM-DD"
-            placeholderTextColor="#8a938d"
+            placeholderTextColor="#8b83a3"
             keyboardType="numbers-and-punctuation"
           />
           <View style={styles.kindRow}>
@@ -1876,7 +1877,7 @@ function Summarizer({
 }) {
   const [tab, setTab] = useState<"text" | "video" | "doc">("text");
   const [output, setOutput] = useState<
-    "summary" | "studyguide" | "flashcards" | "quiz"
+    "summary" | "studyguide" | "modules" | "videonotes" | "flashcards" | "quiz"
   >("summary");
   // Which flashcard format to generate (only used when output = "flashcards").
   const [flashStyle, setFlashStyle] = useState<FlashcardStyle>("basic");
@@ -2010,7 +2011,7 @@ function Summarizer({
               value={text}
               onChangeText={setText}
               placeholder="Paste your notes or any text here…"
-              placeholderTextColor="#8a938d"
+              placeholderTextColor="#8b83a3"
               multiline
             />
           )}
@@ -2021,7 +2022,7 @@ function Summarizer({
                 value={url}
                 onChangeText={setUrl}
                 placeholder="Paste a YouTube link…"
-                placeholderTextColor="#8a938d"
+                placeholderTextColor="#8b83a3"
                 autoCapitalize="none"
               />
               <Text style={styles.calEmpty}>
@@ -2048,6 +2049,8 @@ function Summarizer({
               [
                 ["summary", "📝 Summary"],
                 ["studyguide", "📚 Study guide"],
+                ["modules", "🧩 Modules"],
+                ["videonotes", "🎬 Video notes"],
                 ["flashcards", "🃏 Flashcards"],
                 ["quiz", "📋 Quiz"],
               ] as const
@@ -2100,9 +2103,13 @@ function Summarizer({
                   ? "Summarize"
                   : output === "studyguide"
                     ? "Make study guide"
-                    : output === "flashcards"
-                      ? "Make flashcards"
-                      : "Make quiz"}
+                    : output === "modules"
+                      ? "Break into modules"
+                      : output === "videonotes"
+                        ? "Take video notes"
+                        : output === "flashcards"
+                          ? "Make flashcards"
+                          : "Make quiz"}
             </Text>
           </TouchableOpacity>
 
@@ -2300,7 +2307,7 @@ function SmartNotes({ profile }: { profile: LearnerProfile }) {
             ? "Upload a photo below — or type any notes to tidy up…"
             : "Paste your messy notes here…"
         }
-        placeholderTextColor="#8a938d"
+        placeholderTextColor="#8b83a3"
         multiline
       />
       <TouchableOpacity style={[styles.secondaryBtn, { marginTop: 8 }]} onPress={pickFile}>
@@ -2368,7 +2375,13 @@ function SmartNotes({ profile }: { profile: LearnerProfile }) {
 // a Khan-Academy-style lesson: teach-then-check steps you work through one at a
 // time, plus key terms and a recap.
 type LessonSize = "mini" | "regular";
-type LessonStep = { heading: string; body: string; check?: QuizQuestion };
+type LessonStep = {
+  heading: string;
+  body: string;
+  check?: QuizQuestion;
+  visual?: LessonVisual;
+  narration?: string;
+};
 type Lesson = {
   title: string;
   size: LessonSize;
@@ -2379,6 +2392,256 @@ type Lesson = {
   recap?: string;
   note?: string;
 };
+
+// The diagram for a step. The lesson builder picks one of these shapes and
+// supplies the labels; the layout is ours. Web draws them as SVG — here they're
+// plain Views, so no native drawing dependency is needed.
+type LessonVisualKind =
+  | "steps"
+  | "compare"
+  | "parts"
+  | "cycle"
+  | "timeline"
+  | "hierarchy"
+  | "formula";
+type LessonVisualItem = { label: string; detail?: string; value?: number };
+type LessonVisual = {
+  kind: LessonVisualKind;
+  title?: string;
+  items: LessonVisualItem[];
+  caption?: string;
+};
+
+// One screen in slide mode (mirrors lessonSlides in @eliora/shared).
+type LessonSlide =
+  | { kind: "title"; title: string; body: string; narration: string }
+  | {
+      kind: "teach";
+      stepIndex: number;
+      title: string;
+      body: string;
+      visual?: LessonVisual;
+      narration: string;
+    }
+  | { kind: "check"; stepIndex: number; title: string; check: QuizQuestion }
+  | {
+      kind: "terms";
+      title: string;
+      terms: { term: string; definition: string }[];
+      narration: string;
+    }
+  | { kind: "recap"; title: string; body: string; narration: string };
+
+// Markdown stripped down to something the voice can read without saying
+// "asterisk asterisk" out loud. stripMd keeps bullet dots, which sound wrong
+// when spoken, so narration gets its own pass.
+function speakable(md: string): string {
+  return md
+    .replace(/==(.+?)==/g, "$1")
+    .replace(/\*\*(.+?)\*\*/g, "$1")
+    .replace(/\*(.+?)\*/g, "$1")
+    .replace(/`(.+?)`/g, "$1")
+    .replace(/^\s*[-*]\s+/gm, "")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function lessonSlides(lesson: Lesson): LessonSlide[] {
+  const slides: LessonSlide[] = [
+    {
+      kind: "title",
+      title: lesson.title,
+      body: lesson.intro,
+      narration: speakable(lesson.intro || lesson.title),
+    },
+  ];
+  lesson.steps.forEach((step, stepIndex) => {
+    slides.push({
+      kind: "teach",
+      stepIndex,
+      title: step.heading,
+      body: step.body,
+      visual: step.visual,
+      narration: speakable(step.narration || step.body),
+    });
+    if (step.check)
+      slides.push({
+        kind: "check",
+        stepIndex,
+        title: step.heading,
+        check: step.check,
+      });
+  });
+  if (lesson.keyTerms.length > 0)
+    slides.push({
+      kind: "terms",
+      title: "Key terms",
+      terms: lesson.keyTerms,
+      narration: speakable(
+        lesson.keyTerms.map((t) => `${t.term}: ${t.definition}`).join(". "),
+      ),
+    });
+  if (lesson.recap)
+    slides.push({
+      kind: "recap",
+      title: "Recap",
+      body: lesson.recap,
+      narration: speakable(lesson.recap),
+    });
+  return slides;
+}
+
+// ---------------------------------------------------------------------------
+// Lesson diagrams, drawn with plain Views.
+//
+// Each shape gets a layout tuned to what it means: a process reads as a column
+// of stages with arrows between them, a comparison as side-by-side columns, a
+// split as a proportional bar. Portrait phones are narrow, so anything the web
+// lays out horizontally stacks vertically here.
+// ---------------------------------------------------------------------------
+function DiagramBox({ item, tint }: { item: LessonVisualItem; tint?: boolean }) {
+  return (
+    <View style={[styles.dgBox, tint && styles.dgBoxTint]}>
+      <Text style={styles.dgLabel}>{item.label}</Text>
+      {!!item.detail && <Text style={styles.dgDetail}>{item.detail}</Text>}
+    </View>
+  );
+}
+
+function LessonDiagram({ visual }: { visual: LessonVisual }) {
+  const { kind, items } = visual;
+  if (items.length === 0) return null;
+
+  let body: React.ReactNode;
+
+  if (kind === "steps" || kind === "cycle") {
+    // Both are sequences; a cycle just loops back, which the closing row says.
+    body = (
+      <View>
+        {items.map((item, i) => (
+          <View key={i}>
+            <DiagramBox item={item} tint />
+            {i < items.length - 1 && <Text style={styles.dgArrow}>↓</Text>}
+          </View>
+        ))}
+        {kind === "cycle" && (
+          <Text style={styles.dgLoop}>↻ back to {items[0].label}</Text>
+        )}
+      </View>
+    );
+  } else if (kind === "compare") {
+    body = (
+      <View style={styles.dgRow}>
+        {items.map((item, i) => (
+          <View key={i} style={styles.dgCol}>
+            <View style={styles.dgColHead}>
+              <Text style={styles.dgLabel}>{item.label}</Text>
+            </View>
+            {!!item.detail && <Text style={styles.dgColBody}>{item.detail}</Text>}
+          </View>
+        ))}
+      </View>
+    );
+  } else if (kind === "parts") {
+    const values = items.map((it) => (it.value && it.value > 0 ? it.value : 1));
+    const sum = values.reduce((a, b) => a + b, 0);
+    body = (
+      <View>
+        <View style={styles.dgBar}>
+          {items.map((item, i) => (
+            <View
+              key={i}
+              style={[
+                styles.dgBarSeg,
+                { flex: values[i], opacity: 0.9 - i * 0.15 },
+                i === 0 && styles.dgBarSegFirst,
+                i === items.length - 1 && styles.dgBarSegLast,
+              ]}
+            />
+          ))}
+        </View>
+        {items.map((item, i) => (
+          <View key={i} style={styles.dgLegendRow}>
+            <View style={[styles.dgSwatch, { opacity: 0.9 - i * 0.15 }]} />
+            <Text style={styles.dgLegendText}>
+              <Text style={styles.dgLegendWord}>{item.label}</Text>
+              {`  ${Math.round((values[i] / sum) * 100)}%`}
+              {item.detail ? ` — ${item.detail}` : ""}
+            </Text>
+          </View>
+        ))}
+      </View>
+    );
+  } else if (kind === "timeline") {
+    body = (
+      <View>
+        {items.map((item, i) => (
+          <View key={i} style={styles.dgTimeRow}>
+            <View style={styles.dgTimeRail}>
+              <View style={styles.dgTimeDot} />
+              {i < items.length - 1 && <View style={styles.dgTimeLine} />}
+            </View>
+            <View style={styles.dgTimeBody}>
+              <Text style={styles.dgLabel}>{item.label}</Text>
+              {!!item.detail && <Text style={styles.dgDetail}>{item.detail}</Text>}
+            </View>
+          </View>
+        ))}
+      </View>
+    );
+  } else if (kind === "hierarchy") {
+    body = (
+      <View>
+        {!!visual.title && (
+          <View style={styles.dgRoot}>
+            <Text style={styles.dgRootText}>{visual.title}</Text>
+          </View>
+        )}
+        <Text style={styles.dgArrow}>↓</Text>
+        <View style={styles.dgRow}>
+          {items.map((item, i) => (
+            <View key={i} style={styles.dgCol}>
+              <Text style={styles.dgLabel}>{item.label}</Text>
+              {!!item.detail && <Text style={styles.dgDetail}>{item.detail}</Text>}
+            </View>
+          ))}
+        </View>
+      </View>
+    );
+  } else {
+    body = (
+      <View>
+        {!!visual.title && (
+          <View style={styles.dgFormula}>
+            <Text style={styles.dgFormulaText}>{visual.title}</Text>
+          </View>
+        )}
+        {items.map((item, i) => (
+          <View key={i} style={styles.dgLegendRow}>
+            <View style={styles.dgSymbol}>
+              <Text style={styles.dgSymbolText}>{item.label.slice(0, 3)}</Text>
+            </View>
+            <Text style={styles.dgLegendText}>
+              <Text style={styles.dgLegendWord}>{item.label}</Text>
+              {item.detail ? ` — ${item.detail}` : ""}
+            </Text>
+          </View>
+        ))}
+      </View>
+    );
+  }
+
+  return (
+    <View style={styles.dgWrap}>
+      {/* hierarchy and formula render the title inside the drawing itself. */}
+      {!!visual.title && kind !== "hierarchy" && kind !== "formula" && (
+        <Text style={styles.dgTitle}>{visual.title}</Text>
+      )}
+      {body}
+      {!!visual.caption && <Text style={styles.dgCaption}>{visual.caption}</Text>}
+    </View>
+  );
+}
 
 // One check question inside the lesson player: the learner picks an option and
 // taps Check, then sees whether they were right plus the explanation. Reports a
@@ -2538,6 +2801,7 @@ function LessonPlayer({
       </Text>
 
       <Text style={[styles.cardClass, { marginTop: 10 }]}>{step.heading}</Text>
+      {!!step.visual && <LessonDiagram visual={step.visual} />}
       <Text style={styles.resultText}>{stripMd(step.body)}</Text>
 
       {step.check && (
@@ -2563,6 +2827,181 @@ function LessonPlayer({
   );
 }
 
+// Slide mode: the lesson as a narrated deck. One idea per screen, read aloud,
+// advancing on its own when the voice finishes — closer to watching a short
+// video than reading a page — but it stops at every check question until the
+// learner answers, so it stays a lesson rather than a lecture.
+function LessonSlideshow({
+  lesson,
+  onMissed,
+}: {
+  lesson: Lesson;
+  onMissed: (topic: string) => void;
+}) {
+  const slides = useMemo(() => lessonSlides(lesson), [lesson]);
+  const [i, setI] = useState(0);
+  const [playing, setPlaying] = useState(true);
+  const [answered, setAnswered] = useState<Record<number, boolean>>({});
+  const slide = slides[i];
+  // Marks the narration currently being spoken, so a clip that finishes after
+  // the learner has already moved on can't advance the deck a second time.
+  const token = useRef(0);
+
+  const blocked = slide.kind === "check" && !(i in answered);
+
+  useEffect(() => {
+    if (!playing || blocked) return;
+    if (slide.kind === "check") {
+      // Answered check: give the learner a beat to read the feedback, then
+      // move on — there's no narration to pace this slide.
+      const timer = setTimeout(() => {
+        if (i + 1 < slides.length) setI(i + 1);
+        else setPlaying(false);
+      }, 1200);
+      return () => clearTimeout(timer);
+    }
+    const mine = ++token.current;
+    const advance = () => {
+      if (mine !== token.current) return;
+      token.current += 1;
+      // Pace the deck to the voice rather than to a fixed timer.
+      if (i + 1 < slides.length) setI(i + 1);
+      else setPlaying(false);
+    };
+    Speech.stop();
+    Speech.speak(slide.narration, {
+      rate: 0.95,
+      onDone: advance,
+      onError: advance,
+      onStopped: advance,
+    });
+    return () => {
+      token.current += 1;
+      Speech.stop();
+    };
+  }, [i, playing, blocked, slide, slides.length]);
+
+  // Don't leave the phone talking after the learner navigates away.
+  useEffect(
+    () => () => {
+      Speech.stop();
+    },
+    [],
+  );
+
+  function go(delta: number) {
+    token.current += 1;
+    Speech.stop();
+    setI((prev) => Math.min(slides.length - 1, Math.max(0, prev + delta)));
+  }
+
+  return (
+    <View style={styles.resultBox}>
+      <View style={styles.slideBar}>
+        <Text style={styles.calEmpty}>
+          {i + 1} / {slides.length}
+        </Text>
+        <View style={styles.lessonProgressTrack}>
+          <View
+            style={[
+              styles.lessonProgressFill,
+              { width: `${((i + 1) / slides.length) * 100}%` },
+            ]}
+          />
+        </View>
+      </View>
+
+      <View style={styles.slideCard}>
+        {slide.kind === "title" && (
+          <>
+            <Text style={styles.slideKicker}>
+              {lesson.size === "mini" ? "⚡ MINI LESSON" : "📖 LESSON"} · ~
+              {lesson.minutes} MIN
+            </Text>
+            <Text style={styles.slideBigTitle}>{slide.title}</Text>
+            {!!slide.body && <Text style={styles.slideLead}>{slide.body}</Text>}
+          </>
+        )}
+
+        {slide.kind === "teach" && (
+          <>
+            <Text style={styles.slideTitle}>{slide.title}</Text>
+            {!!slide.visual && <LessonDiagram visual={slide.visual} />}
+            <Text style={styles.slideBody}>{stripMd(slide.body)}</Text>
+          </>
+        )}
+
+        {slide.kind === "check" && (
+          <>
+            <Text style={styles.slideTitle}>Your turn</Text>
+            <LessonCheck
+              key={i}
+              q={slide.check}
+              onMissed={onMissed}
+              onResolved={(ok) => setAnswered((a) => ({ ...a, [i]: ok }))}
+            />
+          </>
+        )}
+
+        {slide.kind === "terms" && (
+          <>
+            <Text style={styles.slideTitle}>📚 Key terms</Text>
+            {slide.terms.map((t, ti) => (
+              <Text key={ti} style={styles.slideBody}>
+                <Text style={{ fontWeight: "700" }}>{t.term}</Text> — {t.definition}
+              </Text>
+            ))}
+          </>
+        )}
+
+        {slide.kind === "recap" && (
+          <>
+            <Text style={styles.slideTitle}>🎉 Recap</Text>
+            <Text style={styles.slideLead}>{slide.body}</Text>
+            {!!lesson.note && <Text style={styles.slideNote}>{lesson.note}</Text>}
+          </>
+        )}
+      </View>
+
+      <View style={styles.slideControls}>
+        <TouchableOpacity
+          style={[styles.secondaryBtn, styles.slideNav, i === 0 && styles.primaryBtnDisabled]}
+          disabled={i === 0}
+          onPress={() => go(-1)}
+        >
+          <Text style={styles.secondaryBtnText}>‹ Back</Text>
+        </TouchableOpacity>
+        <TouchableOpacity
+          style={[styles.primaryBtn, styles.slideNav]}
+          onPress={() => {
+            setPlaying((p) => {
+              if (p) {
+                token.current += 1;
+                Speech.stop();
+              }
+              return !p;
+            });
+          }}
+        >
+          <Text style={styles.primaryBtnText}>{playing ? "⏸ Pause" : "▶ Play"}</Text>
+        </TouchableOpacity>
+        <TouchableOpacity
+          style={[
+            styles.secondaryBtn,
+            styles.slideNav,
+            (i + 1 >= slides.length || blocked) && styles.primaryBtnDisabled,
+          ]}
+          disabled={i + 1 >= slides.length || blocked}
+          onPress={() => go(1)}
+        >
+          <Text style={styles.secondaryBtnText}>Next ›</Text>
+        </TouchableOpacity>
+      </View>
+      {blocked && <Text style={styles.calEmpty}>Answer to continue</Text>}
+    </View>
+  );
+}
+
 function LessonBuilder({
   profile,
   onMissed,
@@ -2580,6 +3019,7 @@ function LessonBuilder({
   } | null>(null);
   const [loading, setLoading] = useState(false);
   const [lesson, setLesson] = useState<Lesson | null>(null);
+  const [mode, setMode] = useState<"slides" | "read">("slides");
   const [err, setErr] = useState("");
   const canSubmit = (text.trim().length >= 20 || !!file) && !loading;
 
@@ -2643,7 +3083,8 @@ function LessonBuilder({
     ["regular", "📖 Regular · ~20–30 min"],
   ] as const;
 
-  // Once a lesson is built, hand off to the interactive player.
+  // Once a lesson is built, hand off to whichever player the learner picked:
+  // narrated slides to watch, or the self-paced step view to read.
   if (lesson && lesson.steps.length > 0) {
     return (
       <View style={styles.card}>
@@ -2653,7 +3094,38 @@ function LessonBuilder({
             Exit
           </Text>
         </View>
-        <LessonPlayer lesson={lesson} onMissed={onMissed} onRestart={() => setLesson(null)} />
+        <View style={styles.outputRow}>
+          {(
+            [
+              ["slides", "🎬 Slides"],
+              ["read", "📄 Read"],
+            ] as const
+          ).map(([key, label]) => (
+            <TouchableOpacity
+              key={key}
+              style={[styles.outChip, mode === key && styles.outChipActive]}
+              onPress={() => setMode(key)}
+            >
+              <Text
+                style={[
+                  styles.outChipText,
+                  mode === key && styles.outChipTextActive,
+                ]}
+              >
+                {label}
+              </Text>
+            </TouchableOpacity>
+          ))}
+        </View>
+        {mode === "slides" ? (
+          <LessonSlideshow lesson={lesson} onMissed={onMissed} />
+        ) : (
+          <LessonPlayer
+            lesson={lesson}
+            onMissed={onMissed}
+            onRestart={() => setLesson(null)}
+          />
+        )}
       </View>
     );
   }
@@ -2686,7 +3158,7 @@ function LessonBuilder({
         value={text}
         onChangeText={setText}
         placeholder="Paste your notes, a handout, or any material here…"
-        placeholderTextColor="#8a938d"
+        placeholderTextColor="#8b83a3"
         multiline
       />
       <TouchableOpacity style={[styles.secondaryBtn, { marginTop: 8 }]} onPress={pickFile}>
@@ -2710,6 +3182,308 @@ function LessonBuilder({
       {!!err && <Text style={[styles.resultText, { color: "#c0392b" }]}>{err}</Text>}
       {lesson && lesson.steps.length === 0 && !!lesson.note && (
         <Text style={[styles.resultText, { marginTop: 8 }]}>{lesson.note}</Text>
+      )}
+    </View>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Lesson plan from the first session.
+//
+// A tutor's first session is diagnostic: you talk, you listen for what they
+// already have, and you leave with a plan. /api/lesson-plan reads the first
+// session's transcript back and returns what it revealed plus an ordered course
+// of sessions. Mirrors LessonPlan in @eliora/shared.
+// ---------------------------------------------------------------------------
+
+type SessionRead = {
+  level: string;
+  strengths: string[];
+  gaps: string[];
+  pace: string;
+};
+type PlannedSession = {
+  number: number;
+  title: string;
+  focus: string;
+  objectives: string[];
+  activities: string[];
+  homework?: string;
+  checkpoint?: boolean;
+};
+type LessonPlanResult = {
+  title: string;
+  subject?: string;
+  summary: string;
+  read: SessionRead;
+  sessions: PlannedSession[];
+  nextSession: string;
+  note?: string;
+};
+
+const PLAN_LENGTHS = [4, 6, 8] as const;
+
+function SessionLessonPlan({
+  session,
+  profile,
+  onAdopt,
+  onAsk,
+}: {
+  // The first conversation with real content — null until they've talked.
+  session: { title: string; messages: Message[] } | null;
+  profile: LearnerProfile;
+  onAdopt: (steps: IncomingMilestone[]) => void;
+  onAsk: (message: string) => void;
+}) {
+  const [goal, setGoal] = useState("");
+  const [count, setCount] = useState<number>(6);
+  const [loading, setLoading] = useState(false);
+  const [plan, setPlan] = useState<LessonPlanResult | null>(null);
+  const [err, setErr] = useState("");
+  const [adopted, setAdopted] = useState(false);
+  // One session open at a time — six sessions of objectives all expanded is the
+  // wall of text this app exists to avoid.
+  const [open, setOpen] = useState<number | null>(1);
+
+  const turns = session?.messages.filter((m) => m.role === "user").length ?? 0;
+  const ready = turns >= 2;
+  const canSubmit = ready && !loading;
+
+  // The build round-trip can outlive this screen; don't set state into a
+  // component the user has already navigated away from.
+  const mounted = useRef(true);
+  useEffect(
+    () => () => {
+      mounted.current = false;
+    },
+    [],
+  );
+
+  async function build() {
+    if (!canSubmit || !session) return;
+    setLoading(true);
+    setErr("");
+    setPlan(null);
+    setAdopted(false);
+    try {
+      const res = await expoFetch(`${API_BASE_URL}/api/lesson-plan`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          messages: session.messages.map((m) => ({
+            role: m.role,
+            content: m.content,
+          })),
+          goal: goal.trim() || undefined,
+          sessionCount: count,
+          profile,
+        }),
+      });
+      const data = await res.json();
+      if (!mounted.current) return;
+      if (data.plan) {
+        setPlan(data.plan as LessonPlanResult);
+        setOpen(1);
+      } else setErr(data.error || "Couldn't build that plan — try again.");
+    } catch {
+      if (mounted.current) setErr("Couldn't reach the server. Please try again.");
+    } finally {
+      if (mounted.current) setLoading(false);
+    }
+  }
+
+  // Each planned session becomes one milestone, so the course lands where
+  // they'll actually see it and can tick it off.
+  function adopt() {
+    if (!plan) return;
+    onAdopt(
+      plan.sessions.map((s) => ({
+        title: `Session ${s.number} · ${s.title}`,
+        detail: [s.focus, s.homework ? `Homework: ${s.homework}` : ""]
+          .filter(Boolean)
+          .join(" "),
+        checkpoint: s.checkpoint,
+      })),
+    );
+    setAdopted(true);
+  }
+
+  function startSession(s: PlannedSession) {
+    onAsk(
+      `Let's do session ${s.number} of my lesson plan: ${s.title}.\n\nThe focus: ${
+        s.focus
+      }\nBy the end I should be able to:\n${s.objectives
+        .map((o) => `- ${o}`)
+        .join("\n")}\n\nTeach it to me one piece at a time, and check I've got it before moving on.`,
+    );
+  }
+
+  return (
+    <View style={styles.card}>
+      <View style={styles.cardHead}>
+        <Text style={styles.cardClass}>🗺️ Lesson plan from our first session</Text>
+      </View>
+      <Text style={styles.calEmpty}>
+        {ready
+          ? `I'll read back our first conversation${
+              session?.title ? ` (“${session.title}”)` : ""
+            } — what you already had, what tripped you up — and plan the sessions ahead from it.`
+          : "Once we've worked through something together, I'll read that first session back and build your plan from what it showed me."}
+      </Text>
+      {ready && (
+        <>
+          <TextInput
+            style={[styles.formInput, styles.formTextarea, { marginTop: 8 }]}
+            value={goal}
+            onChangeText={setGoal}
+            placeholder="Where do you want to get to? (optional)"
+            placeholderTextColor="#8b83a3"
+            multiline
+          />
+          <View style={[styles.outputRow, { marginTop: 8 }]}>
+            {PLAN_LENGTHS.map((n) => (
+              <TouchableOpacity
+                key={n}
+                onPress={() => setCount(n)}
+                style={[styles.outChip, count === n && styles.outChipActive]}
+              >
+                <Text
+                  style={[
+                    styles.outChipText,
+                    count === n && styles.outChipTextActive,
+                  ]}
+                >
+                  {n} sessions
+                </Text>
+              </TouchableOpacity>
+            ))}
+          </View>
+        </>
+      )}
+      <TouchableOpacity
+        onPress={build}
+        disabled={!canSubmit}
+        style={[
+          styles.primaryBtn,
+          { marginTop: 10 },
+          !canSubmit && styles.primaryBtnDisabled,
+        ]}
+      >
+        <Text style={styles.primaryBtnText}>
+          {loading
+            ? "Reading our first session…"
+            : ready
+              ? "🗺️ Build my lesson plan"
+              : "💬 Talk with me first"}
+        </Text>
+      </TouchableOpacity>
+      {!!err && <Text style={[styles.resultText, { color: "#c0392b", marginTop: 8 }]}>{err}</Text>}
+      {plan && (
+        <View style={{ marginTop: 14 }}>
+          <Text style={styles.planTitle}>{plan.title}</Text>
+          {!!plan.summary && (
+            <Text style={[styles.resultText, { marginTop: 6 }]}>{plan.summary}</Text>
+          )}
+
+          <Text style={styles.lpSecHead}>🔎 What that session showed me</Text>
+          {!!plan.read.level && <Text style={styles.lpItem}>{plan.read.level}</Text>}
+          {plan.read.strengths.length > 0 && (
+            <>
+              <Text style={styles.lpSecHead}>💪 You already have</Text>
+              {plan.read.strengths.map((s, i) => (
+                <Text key={i} style={styles.lpItem}>
+                  • {s}
+                </Text>
+              ))}
+            </>
+          )}
+          {plan.read.gaps.length > 0 && (
+            <>
+              <Text style={styles.lpSecHead}>🎯 What we'll fix, in order</Text>
+              {plan.read.gaps.map((g, i) => (
+                <Text key={i} style={styles.lpItem}>
+                  {i + 1}. {g}
+                </Text>
+              ))}
+            </>
+          )}
+          {!!plan.read.pace && <Text style={styles.lpNote}>{plan.read.pace}</Text>}
+
+          <Text style={styles.lpSecHead}>📚 The sessions ahead</Text>
+          {plan.sessions.map((s) => {
+            const isOpen = open === s.number;
+            return (
+              <TouchableOpacity
+                key={s.number}
+                activeOpacity={0.8}
+                style={styles.lpSession}
+                onPress={() => setOpen(isOpen ? null : s.number)}
+              >
+                <View style={styles.lpSessionHead}>
+                  <View style={styles.lpNum}>
+                    <Text style={styles.lpNumText}>{s.number}</Text>
+                  </View>
+                  <Text style={styles.lpSessionTitle}>{s.title}</Text>
+                  {s.checkpoint && (
+                    <Text style={styles.checkpointBadge}>🚩</Text>
+                  )}
+                </View>
+                <Text style={styles.lpFocus}>{s.focus}</Text>
+                {isOpen && (
+                  <>
+                    {s.objectives.length > 0 && (
+                      <>
+                        <Text style={styles.lpSecHead}>By the end you can</Text>
+                        {s.objectives.map((o, i) => (
+                          <Text key={i} style={styles.lpItem}>
+                            • {o}
+                          </Text>
+                        ))}
+                      </>
+                    )}
+                    {s.activities.length > 0 && (
+                      <>
+                        <Text style={styles.lpSecHead}>What we'll do</Text>
+                        {s.activities.map((a, i) => (
+                          <Text key={i} style={styles.lpItem}>
+                            • {a}
+                          </Text>
+                        ))}
+                      </>
+                    )}
+                    {!!s.homework && (
+                      <Text style={styles.lpHint}>📩 Between sessions: {s.homework}</Text>
+                    )}
+                    <TouchableOpacity
+                      style={[styles.secondaryBtn, { marginTop: 8 }]}
+                      onPress={() => startSession(s)}
+                    >
+                      <Text style={styles.secondaryBtnText}>▶️ Start this session</Text>
+                    </TouchableOpacity>
+                  </>
+                )}
+              </TouchableOpacity>
+            );
+          })}
+
+          {!!plan.nextSession && (
+            <Text style={styles.lpHint}>🎯 Next time we'll start with: {plan.nextSession}</Text>
+          )}
+          {!!plan.note && <Text style={styles.lpNote}>{plan.note}</Text>}
+          <TouchableOpacity
+            onPress={adopt}
+            disabled={adopted}
+            style={[
+              styles.primaryBtn,
+              { marginTop: 10 },
+              adopted && styles.primaryBtnDisabled,
+            ]}
+          >
+            <Text style={styles.primaryBtnText}>
+              {adopted ? "✓ Added to your study plan" : "📌 Add these to my study plan"}
+            </Text>
+          </TouchableOpacity>
+        </View>
       )}
     </View>
   );
@@ -2774,7 +3548,7 @@ function nbRenderLine(
         out.push(
           <Text
             key={`${keyBase}-${i}`}
-            style={{ backgroundColor: NB_HIGHLIGHTS[color], color: "#1f2a24" }}
+            style={{ backgroundColor: NB_HIGHLIGHTS[color], color: "#2a2350" }}
           >
             {label}
           </Text>,
@@ -2785,7 +3559,7 @@ function nbRenderLine(
           <Text
             key={`${keyBase}-${i}`}
             onPress={() => onLink(title)}
-            style={{ color: "#2f6f4f", fontWeight: "600", textDecorationLine: "underline" }}
+            style={{ color: "#7b4bd0", fontWeight: "600", textDecorationLine: "underline" }}
           >
             {title}
           </Text>,
@@ -2819,7 +3593,7 @@ function NBPreview({
               style={{
                 fontWeight: "800",
                 fontSize: lvl === 1 ? 18 : lvl === 2 ? 16 : 14.5,
-                color: "#2f6f4f",
+                color: "#7b4bd0",
                 marginTop: 8,
                 marginBottom: 2,
               }}
@@ -2830,14 +3604,14 @@ function NBPreview({
         }
         if ((m = line.match(/^\s*[-*]\s+(.*)$/))) {
           return (
-            <Text key={i} style={{ fontSize: 14.5, color: "#25332c", lineHeight: 21 }}>
+            <Text key={i} style={{ fontSize: 14.5, color: "#2a2350", lineHeight: 21 }}>
               {"•  "}
               {nbRenderLine(m[1], onLink, String(i))}
             </Text>
           );
         }
         return (
-          <Text key={i} style={{ fontSize: 14.5, color: "#25332c", lineHeight: 21 }}>
+          <Text key={i} style={{ fontSize: 14.5, color: "#2a2350", lineHeight: 21 }}>
             {nbRenderLine(line, onLink, String(i))}
           </Text>
         );
@@ -2974,11 +3748,11 @@ function NotesWorkspace() {
                   backgroundColor: d.id === activeId ? "#eef4ef" : "transparent",
                 }}
               >
-                <Text style={{ flex: 1, fontSize: 15, color: "#25332c", fontWeight: d.id === activeId ? "700" : "500" }}>
+                <Text style={{ flex: 1, fontSize: 15, color: "#2a2350", fontWeight: d.id === activeId ? "700" : "500" }}>
                   {d.template === "cornell" ? "📐 " : "📝 "}
                   {d.title || "Untitled"}
                 </Text>
-                <Text onPress={() => removeDoc(d.id)} style={{ color: "#8a938d", fontSize: 18, paddingHorizontal: 6 }}>
+                <Text onPress={() => removeDoc(d.id)} style={{ color: "#8b83a3", fontSize: 18, paddingHorizontal: 6 }}>
                   ×
                 </Text>
               </TouchableOpacity>
@@ -2993,13 +3767,13 @@ function NotesWorkspace() {
             value={active.title}
             onChangeText={(t) => patch(active.id, { title: t })}
             placeholder="Note title"
-            placeholderTextColor="#8a938d"
-            style={{ fontSize: 19, fontWeight: "800", color: "#2f6f4f", paddingVertical: 4, borderBottomWidth: 1, borderBottomColor: "#e2e8e4" }}
+            placeholderTextColor="#8b83a3"
+            style={{ fontSize: 19, fontWeight: "800", color: "#7b4bd0", paddingVertical: 4, borderBottomWidth: 1, borderBottomColor: "#efe4f0" }}
           />
 
           {/* Color-code toolbar (wraps the current selection in the notes field) */}
           <View style={{ flexDirection: "row", alignItems: "center", gap: 8, marginTop: 10, flexWrap: "wrap" }}>
-            <Text style={{ fontSize: 12.5, color: "#6b7770", fontWeight: "600" }}>Color:</Text>
+            <Text style={{ fontSize: 12.5, color: "#6b6280", fontWeight: "600" }}>Color:</Text>
             {NB_COLORS.map((c) => (
               <TouchableOpacity
                 key={c}
@@ -3009,9 +3783,9 @@ function NotesWorkspace() {
             ))}
             <TouchableOpacity
               onPress={() => wrapSelection("**", "**")}
-              style={{ paddingHorizontal: 10, paddingVertical: 3, borderRadius: 8, borderWidth: 1, borderColor: "#e2e8e4" }}
+              style={{ paddingHorizontal: 10, paddingVertical: 3, borderRadius: 8, borderWidth: 1, borderColor: "#efe4f0" }}
             >
-              <Text style={{ fontWeight: "800", color: "#25332c" }}>B</Text>
+              <Text style={{ fontWeight: "800", color: "#2a2350" }}>B</Text>
             </TouchableOpacity>
           </View>
 
@@ -3022,7 +3796,7 @@ function NotesWorkspace() {
                 value={active.cue}
                 onChangeText={(t) => patch(active.id, { cue: t })}
                 placeholder="Key questions, cues, keywords…"
-                placeholderTextColor="#8a938d"
+                placeholderTextColor="#8b83a3"
                 multiline
                 style={[styles.formInput, styles.formTextarea, { minHeight: 90 }]}
               />
@@ -3032,7 +3806,7 @@ function NotesWorkspace() {
                 onChangeText={(t) => patch(active.id, { body: t })}
                 onSelectionChange={(e) => setSel(e.nativeEvent.selection)}
                 placeholder="Main notes from class or reading…"
-                placeholderTextColor="#8a938d"
+                placeholderTextColor="#8b83a3"
                 multiline
                 style={[styles.formInput, styles.formTextarea, { minHeight: 140 }]}
               />
@@ -3041,7 +3815,7 @@ function NotesWorkspace() {
                 value={active.summary}
                 onChangeText={(t) => patch(active.id, { summary: t })}
                 placeholder="Sum it up in a sentence or two…"
-                placeholderTextColor="#8a938d"
+                placeholderTextColor="#8b83a3"
                 multiline
                 style={[styles.formInput, styles.formTextarea, { minHeight: 70 }]}
               />
@@ -3052,7 +3826,7 @@ function NotesWorkspace() {
               onChangeText={(t) => patch(active.id, { body: t })}
               onSelectionChange={(e) => setSel(e.nativeEvent.selection)}
               placeholder="Write your notes… use ## headings, - bullets, and [[links]]."
-              placeholderTextColor="#8a938d"
+              placeholderTextColor="#8b83a3"
               multiline
               style={[styles.formInput, styles.formTextarea, { minHeight: 160, marginTop: 10 }]}
             />
@@ -3060,19 +3834,19 @@ function NotesWorkspace() {
 
           {(active.body.trim() || active.cue.trim() || active.summary.trim()) && (
             <View style={{ marginTop: 12, padding: 12, borderRadius: 12, backgroundColor: "#f3f7f4" }}>
-              <Text style={{ fontSize: 11.5, fontWeight: "800", color: "#6b7770", marginBottom: 6 }}>
+              <Text style={{ fontSize: 11.5, fontWeight: "800", color: "#6b6280", marginBottom: 6 }}>
                 PREVIEW
               </Text>
               {active.template === "cornell" && !!active.cue.trim() && (
                 <View style={{ marginBottom: 6 }}>
-                  <Text style={{ fontWeight: "800", color: "#2f6f4f", fontSize: 13 }}>Cues</Text>
+                  <Text style={{ fontWeight: "800", color: "#7b4bd0", fontSize: 13 }}>Cues</Text>
                   <NBPreview text={active.cue} onLink={openByTitle} />
                 </View>
               )}
               <NBPreview text={active.body} onLink={openByTitle} />
               {active.template === "cornell" && !!active.summary.trim() && (
-                <View style={{ marginTop: 6, paddingTop: 6, borderTopWidth: 1, borderTopColor: "#e2e8e4" }}>
-                  <Text style={{ fontWeight: "800", color: "#2f6f4f", fontSize: 13 }}>Summary</Text>
+                <View style={{ marginTop: 6, paddingTop: 6, borderTopWidth: 1, borderTopColor: "#efe4f0" }}>
+                  <Text style={{ fontWeight: "800", color: "#7b4bd0", fontSize: 13 }}>Summary</Text>
                   <NBPreview text={active.summary} onLink={openByTitle} />
                 </View>
               )}
@@ -3082,7 +3856,7 @@ function NotesWorkspace() {
           {/* Sticky notes (mobile: colored cards; drag is web-only) */}
           <View style={{ marginTop: 12 }}>
             <View style={{ flexDirection: "row", justifyContent: "space-between", alignItems: "center", marginBottom: 6 }}>
-              <Text style={{ fontWeight: "700", fontSize: 14, color: "#25332c" }}>🗒️ Sticky notes</Text>
+              <Text style={{ fontWeight: "700", fontSize: 14, color: "#2a2350" }}>🗒️ Sticky notes</Text>
               <TouchableOpacity
                 onPress={() =>
                   patch(active.id, {
@@ -3093,7 +3867,7 @@ function NotesWorkspace() {
                   })
                 }
               >
-                <Text style={{ color: "#2f6f4f", fontWeight: "700", fontSize: 13 }}>＋ Add</Text>
+                <Text style={{ color: "#7b4bd0", fontWeight: "700", fontSize: 13 }}>＋ Add</Text>
               </TouchableOpacity>
             </View>
             <View style={{ flexDirection: "row", flexWrap: "wrap", gap: 8 }}>
@@ -3107,7 +3881,7 @@ function NotesWorkspace() {
                       onPress={() =>
                         patch(active.id, { stickies: active.stickies.filter((x) => x.id !== s.id) })
                       }
-                      style={{ fontSize: 15, color: "#1f2a24" }}
+                      style={{ fontSize: 15, color: "#2a2350" }}
                     >
                       ×
                     </Text>
@@ -3120,9 +3894,9 @@ function NotesWorkspace() {
                       })
                     }
                     placeholder="Note…"
-                    placeholderTextColor="#6b7770"
+                    placeholderTextColor="#6b6280"
                     multiline
-                    style={{ fontSize: 13, color: "#1f2a24", minHeight: 44 }}
+                    style={{ fontSize: 13, color: "#2a2350", minHeight: 44 }}
                   />
                 </View>
               ))}
@@ -3265,7 +4039,7 @@ function QuizView({
             let bg = "#fff";
             if (checked && correct) bg = "#d8efe0";
             else if (checked && picked && !correct) bg = "#f6dcdc";
-            else if (picked) bg = "#eef1ee";
+            else if (picked) bg = "#f3ebfd";
             return (
               <TouchableOpacity
                 key={oi}
@@ -3566,7 +4340,7 @@ function SubjectsPanel({
           value={name}
           onChangeText={setName}
           placeholder="Add a subject (e.g. Algebra 1)…"
-          placeholderTextColor="#9aa39d"
+          placeholderTextColor="#9b93b3"
           onSubmitEditing={add}
           returnKeyType="done"
         />
@@ -3599,10 +4373,25 @@ function greetingFor(p: LearnerProfile): Message {
   return {
     role: "assistant",
     content:
-      `Hi${name} 🌱 Thanks for sharing all that — I've got your info for ` +
+      `Hi${name} 💡 Thanks for sharing all that — I've got your info for ` +
       `${p.klass.trim()}. Want me to build your learning plan and find a few ` +
       `study videos to get started?`,
   };
+}
+
+// Additive merge: KEEP every existing milestone and append only new titles, so
+// adopting a lesson plan never wipes the steps already on the study plan.
+function appendPlan(prev: Milestone[], incoming: IncomingMilestone[]): Milestone[] {
+  const have = new Set(prev.map((p) => p.title));
+  const fresh = incoming
+    .filter((m) => !have.has(m.title))
+    .map((m) => ({
+      title: m.title,
+      detail: m.detail,
+      checkpoint: m.checkpoint,
+      done: false,
+    }));
+  return [...prev, ...fresh];
 }
 
 function mergePlan(prev: Milestone[], incoming: IncomingMilestone[]): Milestone[] {
@@ -3776,7 +4565,7 @@ function SignUp({
         value={value}
         onChangeText={setter}
         placeholder={placeholder}
-        placeholderTextColor="#8a938d"
+        placeholderTextColor="#8b83a3"
         multiline={multiline}
         autoCorrect
         spellCheck
@@ -3788,7 +4577,7 @@ function SignUp({
     <View style={styles.container}>
       <StatusBar style="dark" />
       <ScrollView contentContainerStyle={styles.formScroll}>
-        <Text style={styles.formTitle}>Welcome to Eliora 🌱</Text>
+        <Text style={styles.formTitle}>Welcome to Eliora 💡</Text>
         <Text style={styles.formIntro}>
           A few quick questions so I can build a learning plan that fits you. Only
           the class is required — share what you like.
@@ -3844,11 +4633,11 @@ function SignUp({
           setBiggestChallenge,
         )}
 
-        {field(
+        {choiceGroup(
           "What grade or year are you currently in?",
+          GRADE_YEAR_OPTIONS,
           gradeYear,
           setGradeYear,
-          "e.g. 10th grade, sophomore, Year 11",
         )}
 
         {field(
@@ -4254,7 +5043,7 @@ function ScheduleCard({
         onPress={onGenerate}
       >
         {generating ? (
-          <ActivityIndicator color="#2f6f4f" />
+          <ActivityIndicator color="#7b4bd0" />
         ) : (
           <Text style={styles.schedBuildBtnText}>
             ✨ Build my study schedule
@@ -4273,7 +5062,7 @@ function ScheduleCard({
               style={[
                 styles.schedRow,
                 isNow && styles.schedRowNow,
-                { borderLeftColor: hasText ? kind.color : "#d9ddd8" },
+                { borderLeftColor: hasText ? kind.color : "#efe4f0" },
               ]}
             >
               <View style={styles.schedTimeWrap}>
@@ -4295,7 +5084,7 @@ function ScheduleCard({
                 style={styles.schedInput}
                 value={b?.text ?? ""}
                 placeholder={isNow ? "Now — what's the plan?" : "—"}
-                placeholderTextColor="#9aa39d"
+                placeholderTextColor="#9b93b3"
                 onChangeText={(text) => onSet(h, { text })}
               />
               {hasText &&
@@ -4428,547 +5217,17 @@ function CheckInCard({
   );
 }
 
-// --- Study Together ----------------------------------------------------------
-// Shared study rooms: focus alongside other learners with a synced pomodoro,
-// live presence, and a room chat. The app has no realtime backend, so the client
-// polls the web /api/rooms endpoints a few times a second and derives the
-// countdown locally from the server clock (mirrors @eliora/shared TogetherRoom).
-type TogetherTimerMode = "focus" | "break" | "idle";
-type TogetherTimer = {
-  mode: TogetherTimerMode;
-  running: boolean;
-  startedAt?: number;
-  durationSec: number;
-  remainingSec?: number;
-  updatedBy?: string;
-};
-type TogetherMember = { id: string; name: string; lastSeen: number };
-type TogetherMessage = {
-  id: string;
-  memberId: string;
-  name: string;
-  text: string;
-  at: number;
-};
-type TogetherRoom = {
-  code: string;
-  name: string;
-  topic?: string;
-  createdAt: number;
-  timer: TogetherTimer;
-  members: TogetherMember[];
-  messages: TogetherMessage[];
-};
-
-const TOGETHER_PRESENCE_MS = 20_000;
-const TOGETHER_ID_KEY = "eliora-together-id";
-const TOGETHER_LAST_KEY = "eliora-together-last";
-
-function togetherRemaining(timer: TogetherTimer, now: number): number {
-  if (timer.mode === "idle") return 0;
-  if (!timer.running) return timer.remainingSec ?? timer.durationSec;
-  if (!timer.startedAt) return timer.durationSec;
-  return Math.max(0, timer.durationSec - Math.floor((now - timer.startedAt) / 1000));
-}
-function togetherClock(sec: number): string {
-  const s = Math.max(0, Math.floor(sec));
-  return `${Math.floor(s / 60)}:${String(s % 60).padStart(2, "0")}`;
-}
-
-function StudyTogether({ profile }: { profile: LearnerProfile | null }) {
-  const name = profile?.name?.trim() || "Guest";
-  const [room, setRoom] = useState<TogetherRoom | null>(null);
-  const [now, setNow] = useState<number>(() => Date.now());
-  const [busy, setBusy] = useState(false);
-  const [err, setErr] = useState("");
-  const [createTopic, setCreateTopic] = useState("");
-  const [joinCode, setJoinCode] = useState("");
-  const [draft, setDraft] = useState("");
-  const memberIdRef = useRef<string>("");
-  const roomRef = useRef<TogetherRoom | null>(null);
-  roomRef.current = room;
-
-  // Stable per-device member id (async load), then auto-rejoin the last room.
-  useEffect(() => {
-    let cancelled = false;
-    (async () => {
-      let id = await AsyncStorage.getItem(TOGETHER_ID_KEY);
-      if (!id) {
-        id = nbId() + nbId();
-        await AsyncStorage.setItem(TOGETHER_ID_KEY, id);
-      }
-      if (cancelled) return;
-      memberIdRef.current = id;
-      const last = await AsyncStorage.getItem(TOGETHER_LAST_KEY);
-      if (last && !cancelled) enter("join", { code: last }, true);
-    })();
-    return () => {
-      cancelled = true;
-    };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
-
-  // Local 1s tick so the countdown moves smoothly between polls.
-  useEffect(() => {
-    const t = setInterval(() => setNow(Date.now()), 1000);
-    return () => clearInterval(t);
-  }, []);
-
-  // Poll while in a room: refresh presence + pull the latest state.
-  const code = room?.code;
-  useEffect(() => {
-    if (!code) return;
-    let alive = true;
-    const poll = async () => {
-      try {
-        const res = await fetch(
-          `${API_BASE_URL}/api/rooms/${code}?memberId=${encodeURIComponent(
-            memberIdRef.current,
-          )}&name=${encodeURIComponent(name)}`,
-        );
-        if (!alive) return;
-        if (res.status === 404) {
-          await AsyncStorage.removeItem(TOGETHER_LAST_KEY);
-          setRoom(null);
-          setErr("That room has ended.");
-          return;
-        }
-        const data = (await res.json()) as { room?: TogetherRoom };
-        if (data.room && alive) {
-          setRoom(data.room);
-          setNow(Date.now());
-        }
-      } catch {
-        /* transient — next tick retries */
-      }
-    };
-    poll();
-    const t = setInterval(poll, 2500);
-    return () => {
-      alive = false;
-      clearInterval(t);
-    };
-  }, [code, name]);
-
-  async function enter(
-    action: "create" | "join",
-    extra: { name?: string; topic?: string; code?: string },
-    silent = false,
-  ) {
-    if (!memberIdRef.current) return;
-    if (!silent) {
-      setBusy(true);
-      setErr("");
-    }
-    try {
-      const res = await fetch(`${API_BASE_URL}/api/rooms`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          action,
-          memberId: memberIdRef.current,
-          memberName: name,
-          ...extra,
-        }),
-      });
-      const data = (await res.json()) as { room?: TogetherRoom; error?: string };
-      if (data.room) {
-        setRoom(data.room);
-        setNow(Date.now());
-        await AsyncStorage.setItem(TOGETHER_LAST_KEY, data.room.code);
-        setJoinCode("");
-        setCreateTopic("");
-      } else if (!silent) {
-        setErr(data.error || "Couldn't reach that room — try again.");
-      } else {
-        await AsyncStorage.removeItem(TOGETHER_LAST_KEY);
-      }
-    } catch {
-      if (!silent) setErr("Couldn't reach the server. Please try again.");
-    } finally {
-      if (!silent) setBusy(false);
-    }
-  }
-
-  // Fire a room action and adopt the returned state for a snappy response.
-  async function act(body: Record<string, unknown>) {
-    const current = roomRef.current;
-    if (!current) return;
-    try {
-      const res = await fetch(`${API_BASE_URL}/api/rooms/${current.code}`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ memberId: memberIdRef.current, name, ...body }),
-      });
-      const data = (await res.json()) as { room?: TogetherRoom };
-      if (data.room) {
-        setRoom(data.room);
-        setNow(Date.now());
-      }
-    } catch {
-      /* the poll loop will reconcile */
-    }
-  }
-
-  function sendChat() {
-    const text = draft.trim();
-    if (!text) return;
-    setDraft("");
-    act({ action: "message", text });
-  }
-
-  async function leave() {
-    const current = roomRef.current;
-    await AsyncStorage.removeItem(TOGETHER_LAST_KEY);
-    setRoom(null);
-    setDraft("");
-    if (current) {
-      try {
-        await fetch(`${API_BASE_URL}/api/rooms/${current.code}`, {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ action: "leave", memberId: memberIdRef.current }),
-        });
-      } catch {
-        /* presence timeout will drop us anyway */
-      }
-    }
-  }
-
-  // ---- Landing: create or join --------------------------------------------
-  if (!room) {
-    return (
-      <View style={{ gap: 12 }}>
-        <View style={styles.card}>
-          <View style={styles.cardHead}>
-            <Text style={styles.cardClass}>👥 Study Together</Text>
-          </View>
-          <Text style={[styles.cardRow, { color: "#5b6660" }]}>
-            Focus alongside other learners. Start a room and share the code, or
-            join one — you&apos;ll share a pomodoro timer and a room chat.
-          </Text>
-          {err ? <Text style={togetherStyles.err}>{err}</Text> : null}
-
-          <Text style={togetherStyles.colTitle}>Start a room</Text>
-          <TextInput
-            style={togetherStyles.field}
-            placeholder="What are you working on? (optional)"
-            placeholderTextColor="#8a938d"
-            value={createTopic}
-            maxLength={120}
-            onChangeText={setCreateTopic}
-          />
-          <TouchableOpacity
-            style={[styles.primaryBtn, busy && styles.primaryBtnDisabled]}
-            disabled={busy}
-            onPress={() =>
-              enter("create", {
-                name: `${name.split(" ")[0]}'s room`,
-                topic: createTopic.trim() || undefined,
-              })
-            }
-          >
-            <Text style={styles.primaryBtnText}>
-              {busy ? "Creating…" : "Create room"}
-            </Text>
-          </TouchableOpacity>
-
-          <Text style={[togetherStyles.colTitle, { marginTop: 14 }]}>Join a room</Text>
-          <TextInput
-            style={[togetherStyles.field, togetherStyles.codeField]}
-            placeholder="ENTER CODE"
-            placeholderTextColor="#8a938d"
-            value={joinCode}
-            autoCapitalize="characters"
-            autoCorrect={false}
-            maxLength={6}
-            onChangeText={(t) =>
-              setJoinCode(t.toUpperCase().replace(/[^A-Z0-9]/g, ""))
-            }
-          />
-          <TouchableOpacity
-            style={[styles.ghostBtn, { alignItems: "center" }]}
-            disabled={busy || joinCode.length !== 6}
-            onPress={() => enter("join", { code: joinCode })}
-          >
-            <Text
-              style={[
-                styles.ghostBtnText,
-                (busy || joinCode.length !== 6) && { opacity: 0.5 },
-              ]}
-            >
-              Join room
-            </Text>
-          </TouchableOpacity>
-        </View>
-      </View>
-    );
-  }
-
-  // ---- In a room -----------------------------------------------------------
-  const present = room.members
-    .filter((m) => now - m.lastSeen < TOGETHER_PRESENCE_MS)
-    .sort((a, b) => b.lastSeen - a.lastSeen);
-  const remaining = togetherRemaining(room.timer, now);
-  const running = room.timer.running && room.timer.mode !== "idle";
-  const paused = !room.timer.running && room.timer.mode !== "idle";
-  const isFocus = room.timer.mode === "focus";
-  const timeUp = running && remaining <= 0;
-
-  return (
-    <View style={{ gap: 12 }}>
-      {/* Header */}
-      <View style={styles.card}>
-        <View style={styles.cardHead}>
-          <Text style={styles.cardClass}>👥 {room.name}</Text>
-          <TouchableOpacity onPress={leave}>
-            <Text style={styles.linkBtn}>Leave</Text>
-          </TouchableOpacity>
-        </View>
-        {room.topic ? (
-          <Text style={[styles.cardRow, { color: "#5b6660" }]}>{room.topic}</Text>
-        ) : null}
-        <View style={togetherStyles.codeRow}>
-          <Text style={{ color: "#5b6660", fontSize: 13 }}>Room code</Text>
-          <View style={togetherStyles.codeChip}>
-            <Text style={togetherStyles.codeChipText}>{room.code}</Text>
-          </View>
-        </View>
-      </View>
-
-      {/* Shared timer */}
-      <View style={styles.card}>
-        <View style={styles.cardHead}>
-          <Text style={styles.cardClass}>⏱️ Shared timer</Text>
-          {room.timer.mode !== "idle" ? (
-            <View
-              style={[
-                togetherStyles.phasePill,
-                { backgroundColor: isFocus ? "#2f6f4f" : "#3b9e6f" },
-              ]}
-            >
-              <Text style={togetherStyles.phasePillText}>
-                {isFocus ? "Focus" : "Break"}
-              </Text>
-            </View>
-          ) : null}
-        </View>
-        <Text style={[togetherStyles.clock, timeUp && { fontSize: 30, color: "#2f6f4f" }]}>
-          {timeUp ? "Time's up!" : togetherClock(remaining)}
-        </Text>
-        <View style={togetherStyles.timerBtns}>
-          {room.timer.mode === "idle" || timeUp ? (
-            <>
-              <TouchableOpacity
-                style={[styles.primaryBtn, { flex: 1, alignItems: "center" }]}
-                onPress={() => act({ action: "timer", timer: "focus" })}
-              >
-                <Text style={styles.primaryBtnText}>Focus · 25m</Text>
-              </TouchableOpacity>
-              <TouchableOpacity
-                style={[styles.ghostBtn, { alignItems: "center" }]}
-                onPress={() => act({ action: "timer", timer: "break" })}
-              >
-                <Text style={styles.ghostBtnText}>Break · 5m</Text>
-              </TouchableOpacity>
-            </>
-          ) : (
-            <>
-              {running ? (
-                <TouchableOpacity
-                  style={[styles.ghostBtn, { flex: 1, alignItems: "center" }]}
-                  onPress={() => act({ action: "timer", timer: "pause" })}
-                >
-                  <Text style={styles.ghostBtnText}>Pause</Text>
-                </TouchableOpacity>
-              ) : (
-                <TouchableOpacity
-                  style={[styles.primaryBtn, { flex: 1, alignItems: "center" }]}
-                  onPress={() => act({ action: "timer", timer: "resume" })}
-                >
-                  <Text style={styles.primaryBtnText}>Resume</Text>
-                </TouchableOpacity>
-              )}
-              <TouchableOpacity
-                style={[styles.ghostBtn, { alignItems: "center" }]}
-                onPress={() => act({ action: "timer", timer: "reset" })}
-              >
-                <Text style={styles.ghostBtnText}>Reset</Text>
-              </TouchableOpacity>
-            </>
-          )}
-        </View>
-        {room.timer.updatedBy ? (
-          <Text style={{ color: "#8a938d", fontSize: 12, marginTop: 8 }}>
-            {paused ? "Paused" : "Set"} by {room.timer.updatedBy}
-          </Text>
-        ) : null}
-      </View>
-
-      {/* Presence */}
-      <View style={styles.card}>
-        <View style={styles.cardHead}>
-          <Text style={styles.cardClass}>🟢 Studying now · {present.length}</Text>
-        </View>
-        <View style={togetherStyles.avatars}>
-          {present.map((m) => (
-            <View key={m.id} style={togetherStyles.avatar}>
-              <View style={togetherStyles.avatarDot} />
-              <Text style={togetherStyles.avatarText}>{m.name}</Text>
-            </View>
-          ))}
-        </View>
-      </View>
-
-      {/* Chat */}
-      <View style={styles.card}>
-        <View style={styles.cardHead}>
-          <Text style={styles.cardClass}>💬 Room chat</Text>
-        </View>
-        <View style={{ gap: 10, marginTop: 8 }}>
-          {room.messages.length === 0 ? (
-            <Text style={{ color: "#8a938d", fontSize: 13.5 }}>
-              Say hi 👋 — messages are visible to everyone in the room.
-            </Text>
-          ) : (
-            room.messages.slice(-30).map((m) => {
-              const mine = m.memberId === memberIdRef.current;
-              return (
-                <View
-                  key={m.id}
-                  style={{ alignItems: mine ? "flex-end" : "flex-start" }}
-                >
-                  <Text style={togetherStyles.msgMeta}>{mine ? "You" : m.name}</Text>
-                  <View
-                    style={[
-                      togetherStyles.msgBubble,
-                      mine
-                        ? { backgroundColor: "#2f6f4f" }
-                        : { backgroundColor: "#eef1ee" },
-                    ]}
-                  >
-                    <Text style={{ color: mine ? "#fff" : "#1c2421", fontSize: 14.5 }}>
-                      {m.text}
-                    </Text>
-                  </View>
-                </View>
-              );
-            })
-          )}
-        </View>
-        <View style={togetherStyles.chatRow}>
-          <TextInput
-            style={styles.input}
-            placeholder="Message the room…"
-            placeholderTextColor="#8a938d"
-            value={draft}
-            maxLength={500}
-            onChangeText={setDraft}
-            onSubmitEditing={sendChat}
-            returnKeyType="send"
-          />
-          <TouchableOpacity
-            style={[styles.sendBtn, !draft.trim() && styles.primaryBtnDisabled]}
-            disabled={!draft.trim()}
-            onPress={sendChat}
-          >
-            <Text style={styles.sendText}>Send</Text>
-          </TouchableOpacity>
-        </View>
-      </View>
-    </View>
-  );
-}
-
-const togetherStyles = StyleSheet.create({
-  err: {
-    backgroundColor: "#eef1ee",
-    color: "#2f6f4f",
-    borderRadius: 10,
-    padding: 10,
-    fontSize: 14,
-    marginTop: 8,
-  },
-  colTitle: {
-    fontSize: 12,
-    fontWeight: "700",
-    color: "#5b6660",
-    textTransform: "uppercase",
-    letterSpacing: 0.5,
-    marginTop: 12,
-    marginBottom: 6,
-  },
-  field: {
-    fontSize: 16,
-    backgroundColor: "#fff",
-    borderRadius: 12,
-    borderWidth: 1,
-    borderColor: "#d9ddd8",
-    paddingHorizontal: 14,
-    paddingVertical: 10,
-    marginBottom: 8,
-    color: "#1c2421",
-  },
-  codeField: { textTransform: "uppercase", letterSpacing: 3, fontWeight: "700" },
-  codeRow: {
-    flexDirection: "row",
-    alignItems: "center",
-    justifyContent: "space-between",
-    marginTop: 8,
-  },
-  codeChip: {
-    backgroundColor: "#eef1ee",
-    borderWidth: 1,
-    borderColor: "#d9ddd8",
-    borderRadius: 10,
-    paddingHorizontal: 14,
-    paddingVertical: 6,
-  },
-  codeChipText: {
-    fontSize: 20,
-    fontWeight: "800",
-    letterSpacing: 3,
-    color: "#2f6f4f",
-  },
-  clock: {
-    fontSize: 48,
-    fontWeight: "800",
-    textAlign: "center",
-    color: "#1c2421",
-    paddingVertical: 12,
-  },
-  phasePill: { borderRadius: 999, paddingHorizontal: 10, paddingVertical: 3 },
-  phasePillText: { color: "#fff", fontSize: 12, fontWeight: "700" },
-  timerBtns: { flexDirection: "row", gap: 10, justifyContent: "center" },
-  avatars: { flexDirection: "row", flexWrap: "wrap", gap: 8, marginTop: 8 },
-  avatar: {
-    flexDirection: "row",
-    alignItems: "center",
-    gap: 6,
-    backgroundColor: "#eef1ee",
-    borderWidth: 1,
-    borderColor: "#d9ddd8",
-    borderRadius: 999,
-    paddingHorizontal: 12,
-    paddingVertical: 5,
-  },
-  avatarDot: { width: 8, height: 8, borderRadius: 4, backgroundColor: "#37b26b" },
-  avatarText: { fontSize: 13.5, fontWeight: "600", color: "#1c2421" },
-  msgMeta: { fontSize: 11, color: "#8a938d", marginBottom: 2, marginHorizontal: 4 },
-  msgBubble: {
-    maxWidth: "85%",
-    paddingHorizontal: 12,
-    paddingVertical: 8,
-    borderRadius: 14,
-  },
-  chatRow: { flexDirection: "row", gap: 8, marginTop: 12, alignItems: "flex-end" },
-});
-
 export default function App() {
   const [chats, setChats] = useState<Chat[]>([]);
   const [activeChatId, setActiveChatId] = useState<string>("");
   const activeChat = chats.find((c) => c.id === activeChatId);
   const messages = activeChat?.messages ?? [];
+  // The "first session": the oldest conversation where they actually worked on
+  // something. Chats are appended in order, so the first with two real turns is
+  // it — a one-line "hi" chat isn't a session anyone could plan from.
+  const firstSession =
+    chats.find((c) => c.messages.filter((m) => m.role === "user").length >= 2) ??
+    null;
   const setMessages = (
     updater: Message[] | ((prev: Message[]) => Message[]),
   ) => {
@@ -5050,7 +5309,7 @@ export default function App() {
   const [editing, setEditing] = useState(false);
   const [summarizing, setSummarizing] = useState(false);
   const [tab, setTab] = useState<
-    "chat" | "study" | "practice" | "calendar" | "plan" | "notebook" | "together"
+    "chat" | "study" | "practice" | "calendar" | "plan" | "notebook"
   >("chat");
   const [input, setInput] = useState("");
   const [busy, setBusy] = useState(false);
@@ -5566,7 +5825,7 @@ export default function App() {
         {
           role: "assistant",
           content:
-            `Hi${name} 🌱 Thanks for sharing all that — give me a sec to look ` +
+            `Hi${name} 💡 Thanks for sharing all that — give me a sec to look ` +
             `over your answers.`,
         },
       ]);
@@ -6028,16 +6287,6 @@ export default function App() {
             🧠 Practice
           </Text>
         </TouchableOpacity>
-        <TouchableOpacity
-          style={[styles.viewTab, tab === "together" && styles.viewTabActive]}
-          onPress={() => setTab("together")}
-        >
-          <Text
-            style={[styles.viewTabText, tab === "together" && styles.viewTabTextActive]}
-          >
-            👥 Study Together
-          </Text>
-        </TouchableOpacity>
       </ScrollView>
 
       {tab === "plan" ? (
@@ -6148,7 +6397,7 @@ export default function App() {
               <View style={styles.cardHead}>
                 <Text style={styles.cardClass}>🎯 Your learning plan</Text>
               </View>
-              <Text style={{ color: "#5b6660", marginVertical: 8 }}>
+              <Text style={{ color: "#6b6280", marginVertical: 8 }}>
                 No plan yet. Eliora can build one from your conversation — the
                 topics you've talked about and what you're stuck on.
               </Text>
@@ -6161,7 +6410,7 @@ export default function App() {
                   🎯 Build my plan from our chat
                 </Text>
               </TouchableOpacity>
-              <Text style={{ color: "#5b6660", marginTop: 12, marginBottom: 4 }}>
+              <Text style={{ color: "#6b6280", marginTop: 12, marginBottom: 4 }}>
                 …or add your own steps:
               </Text>
               <PlanPanel
@@ -6234,6 +6483,15 @@ export default function App() {
               ))}
             </View>
           </View>
+          <SessionLessonPlan
+            session={firstSession}
+            profile={profile}
+            onAdopt={(steps) => setPlan((prev) => appendPlan(prev, steps))}
+            onAsk={(msg) => {
+              setTab("chat");
+              send(msg);
+            }}
+          />
           <SmartNotes profile={profile} />
           <LessonBuilder profile={profile} onMissed={addMissed} />
         </ScrollView>
@@ -6248,10 +6506,6 @@ export default function App() {
             onMissed={addMissed}
             onStudyGuide={studyGuideFromQuiz}
           />
-        </ScrollView>
-      ) : tab === "together" ? (
-        <ScrollView contentContainerStyle={styles.studyScroll}>
-          <StudyTogether profile={profile} />
         </ScrollView>
       ) : tab === "calendar" ? (
         <ScrollView contentContainerStyle={styles.studyScroll}>
@@ -6380,7 +6634,7 @@ export default function App() {
               value={renameText}
               onChangeText={setRenameText}
               placeholder="Chat name…"
-              placeholderTextColor="#8a938d"
+              placeholderTextColor="#8b83a3"
               onSubmitEditing={() => renamingId && renameChat(renamingId, renameText)}
               returnKeyType="done"
             />
@@ -6421,7 +6675,7 @@ export default function App() {
                 value={newFolderText}
                 onChangeText={setNewFolderText}
                 placeholder="New folder…"
-                placeholderTextColor="#8a938d"
+                placeholderTextColor="#8b83a3"
               />
               <TouchableOpacity
                 style={styles.newFolderBtn}
@@ -6519,7 +6773,7 @@ export default function App() {
           value={input}
           onChangeText={setInput}
           placeholder="Message Eliora…"
-          placeholderTextColor="#8a938d"
+          placeholderTextColor="#8b83a3"
           multiline
           autoCorrect
           spellCheck
@@ -6545,13 +6799,13 @@ export default function App() {
 }
 
 const styles = StyleSheet.create({
-  container: { flex: 1, backgroundColor: "#f7f5f0" },
+  container: { flex: 1, backgroundColor: "#fdf4f2" },
   // Sign-up form
   formScroll: { padding: 20, paddingTop: 64, paddingBottom: 48, gap: 16 },
-  formTitle: { fontSize: 26, fontWeight: "700", color: "#2f6f4f" },
-  formIntro: { fontSize: 16, color: "#5b6660", lineHeight: 22 },
+  formTitle: { fontSize: 26, fontWeight: "700", color: "#7b4bd0" },
+  formIntro: { fontSize: 16, color: "#6b6280", lineHeight: 22 },
   field: { gap: 6 },
-  fieldLabel: { fontSize: 16, fontWeight: "600", color: "#1c2421" },
+  fieldLabel: { fontSize: 16, fontWeight: "600", color: "#2a2350" },
   choiceBtn: {
     flexDirection: "row",
     alignItems: "center",
@@ -6560,47 +6814,47 @@ const styles = StyleSheet.create({
     paddingHorizontal: 14,
     borderRadius: 12,
     borderWidth: 1,
-    borderColor: "#d9ddd8",
+    borderColor: "#efe4f0",
     backgroundColor: "#fff",
     marginTop: 8,
   },
-  choiceBtnSelected: { borderColor: "#2f6f4f", backgroundColor: "#eef4f0" },
+  choiceBtnSelected: { borderColor: "#7b4bd0", backgroundColor: "#f3ebfd" },
   choiceRadio: {
     width: 18,
     height: 18,
     borderRadius: 9,
     borderWidth: 1.5,
-    borderColor: "#2f6f4f",
+    borderColor: "#7b4bd0",
     backgroundColor: "#fff",
   },
-  choiceRadioSelected: { backgroundColor: "#2f6f4f" },
-  choiceText: { flex: 1, fontSize: 15, color: "#1c2421" },
-  choiceHint: { fontWeight: "400", fontSize: 13, color: "#5b6660" },
+  choiceRadioSelected: { backgroundColor: "#7b4bd0" },
+  choiceText: { flex: 1, fontSize: 15, color: "#2a2350" },
+  choiceHint: { fontWeight: "400", fontSize: 13, color: "#6b6280" },
   choiceCheckbox: {
     width: 18,
     height: 18,
     borderRadius: 5,
     borderWidth: 1.5,
-    borderColor: "#2f6f4f",
+    borderColor: "#7b4bd0",
     backgroundColor: "#fff",
     alignItems: "center",
     justifyContent: "center",
   },
-  choiceCheckboxSelected: { backgroundColor: "#2f6f4f" },
+  choiceCheckboxSelected: { backgroundColor: "#7b4bd0" },
   choiceCheckMark: { color: "#fff", fontSize: 12, fontWeight: "700", lineHeight: 14 },
   formInput: {
     fontSize: 17,
     backgroundColor: "#fff",
     borderRadius: 12,
     borderWidth: 1,
-    borderColor: "#d9ddd8",
+    borderColor: "#efe4f0",
     paddingHorizontal: 14,
     paddingVertical: 12,
   },
   formTextarea: { minHeight: 64, textAlignVertical: "top" },
   formActions: { flexDirection: "row", justifyContent: "flex-end", gap: 10, marginTop: 8 },
   primaryBtn: {
-    backgroundColor: "#2f6f4f",
+    backgroundColor: "#7b4bd0",
     borderRadius: 14,
     paddingHorizontal: 22,
     paddingVertical: 14,
@@ -6609,12 +6863,12 @@ const styles = StyleSheet.create({
   primaryBtnText: { color: "#fff", fontSize: 17, fontWeight: "600" },
   secondaryBtn: {
     borderWidth: 1,
-    borderColor: "#d9ddd8",
+    borderColor: "#efe4f0",
     borderRadius: 14,
     paddingHorizontal: 22,
     paddingVertical: 14,
   },
-  secondaryBtnText: { color: "#5b6660", fontSize: 17 },
+  secondaryBtnText: { color: "#6b6280", fontSize: 17 },
   // Summarizer modal
   modalHead: {
     flexDirection: "row",
@@ -6626,34 +6880,34 @@ const styles = StyleSheet.create({
     flex: 1,
     backgroundColor: "#fff",
     borderWidth: 1,
-    borderColor: "#d9ddd8",
+    borderColor: "#efe4f0",
     borderRadius: 10,
     paddingVertical: 10,
     alignItems: "center",
   },
-  tabActive: { backgroundColor: "#2f6f4f", borderColor: "#2f6f4f" },
-  tabText: { fontSize: 15, color: "#5b6660" },
+  tabActive: { backgroundColor: "#7b4bd0", borderColor: "#7b4bd0" },
+  tabText: { fontSize: 15, color: "#6b6280" },
   tabTextActive: { color: "#fff", fontWeight: "600" },
   resultBox: {
     backgroundColor: "#fff",
     borderWidth: 1,
-    borderColor: "#d9ddd8",
+    borderColor: "#efe4f0",
     borderRadius: 12,
     padding: 14,
     gap: 12,
   },
-  resultText: { fontSize: 16, lineHeight: 24, color: "#1c2421" },
+  resultText: { fontSize: 16, lineHeight: 24, color: "#2a2350" },
   outputRow: { flexDirection: "row", flexWrap: "wrap", gap: 6 },
   outChip: {
     backgroundColor: "#fff",
     borderWidth: 1,
-    borderColor: "#d9ddd8",
+    borderColor: "#efe4f0",
     borderRadius: 999,
     paddingHorizontal: 12,
     paddingVertical: 7,
   },
-  outChipActive: { backgroundColor: "#2f6f4f", borderColor: "#2f6f4f" },
-  outChipText: { fontSize: 13, color: "#5b6660" },
+  outChipActive: { backgroundColor: "#7b4bd0", borderColor: "#7b4bd0" },
+  outChipText: { fontSize: 13, color: "#6b6280" },
   outChipTextActive: { color: "#fff", fontWeight: "600" },
   // Lesson player (Khan-Academy-style stepped lessons)
   lessonProgressTrack: {
@@ -6666,21 +6920,182 @@ const styles = StyleSheet.create({
   lessonProgressFill: {
     height: 8,
     borderRadius: 999,
-    backgroundColor: "#2f6f4f",
+    backgroundColor: "#7b4bd0",
   },
   lessonOpt: {
     borderWidth: 1,
-    borderColor: "#d9ddd8",
+    borderColor: "#efe4f0",
     borderRadius: 12,
     paddingHorizontal: 14,
     paddingVertical: 12,
     marginTop: 8,
     backgroundColor: "#fff",
   },
-  lessonOptText: { fontSize: 16, color: "#1c2421" },
-  lessonOptPicked: { borderColor: "#2f6f4f", backgroundColor: "#eef5f0" },
+  lessonOptText: { fontSize: 16, color: "#2a2350" },
+  lessonOptPicked: { borderColor: "#7b4bd0", backgroundColor: "#f3ebfd" },
   lessonOptCorrect: { borderColor: "#2e7d32", backgroundColor: "#e4f4e6" },
   lessonOptWrong: { borderColor: "#c0392b", backgroundColor: "#fbe9e7" },
+
+  // Lesson diagrams (drawn with Views — no SVG dependency)
+  dgWrap: { marginTop: 10, marginBottom: 2 },
+  dgTitle: {
+    fontSize: 13,
+    fontWeight: "700",
+    color: "#6b6280",
+    textAlign: "center",
+    marginBottom: 8,
+  },
+  dgCaption: {
+    fontSize: 12.5,
+    color: "#6b6280",
+    fontStyle: "italic",
+    textAlign: "center",
+    marginTop: 8,
+  },
+  dgBox: {
+    borderWidth: 1.5,
+    borderColor: "#7b4bd0",
+    borderRadius: 12,
+    paddingHorizontal: 12,
+    paddingVertical: 10,
+    backgroundColor: "#fff",
+  },
+  dgBoxTint: { backgroundColor: "#f3ebfd" },
+  dgLabel: { fontSize: 14.5, fontWeight: "700", color: "#2a2350" },
+  dgDetail: { fontSize: 12.5, color: "#6b6280", marginTop: 2, lineHeight: 17 },
+  dgArrow: {
+    fontSize: 18,
+    color: "#8b83a3",
+    textAlign: "center",
+    marginVertical: 2,
+  },
+  dgLoop: {
+    fontSize: 12.5,
+    color: "#7b4bd0",
+    textAlign: "center",
+    marginTop: 6,
+    fontWeight: "600",
+  },
+  dgRow: { flexDirection: "row", gap: 8 },
+  dgCol: {
+    flex: 1,
+    borderWidth: 1.5,
+    borderColor: "#7b4bd0",
+    borderRadius: 12,
+    backgroundColor: "#fff",
+    overflow: "hidden",
+    paddingBottom: 10,
+  },
+  dgColHead: {
+    backgroundColor: "#f3ebfd",
+    paddingHorizontal: 10,
+    paddingVertical: 8,
+    borderBottomWidth: 1.5,
+    borderBottomColor: "#7b4bd0",
+  },
+  dgColBody: {
+    fontSize: 12.5,
+    color: "#6b6280",
+    lineHeight: 17,
+    paddingHorizontal: 10,
+    paddingTop: 8,
+  },
+  dgBar: {
+    flexDirection: "row",
+    height: 40,
+    borderRadius: 10,
+    overflow: "hidden",
+    borderWidth: 1,
+    borderColor: "#d8c8e2",
+  },
+  dgBarSeg: { backgroundColor: "#7b4bd0" },
+  dgBarSegFirst: { borderTopLeftRadius: 9, borderBottomLeftRadius: 9 },
+  dgBarSegLast: { borderTopRightRadius: 9, borderBottomRightRadius: 9 },
+  dgLegendRow: { flexDirection: "row", alignItems: "center", gap: 10, marginTop: 8 },
+  dgSwatch: {
+    width: 14,
+    height: 14,
+    borderRadius: 4,
+    backgroundColor: "#7b4bd0",
+  },
+  dgLegendText: { flex: 1, fontSize: 13, color: "#6b6280", lineHeight: 18 },
+  dgLegendWord: { fontWeight: "700", color: "#2a2350" },
+  dgTimeRow: { flexDirection: "row", gap: 12 },
+  dgTimeRail: { alignItems: "center", width: 16 },
+  dgTimeDot: {
+    width: 12,
+    height: 12,
+    borderRadius: 6,
+    backgroundColor: "#7b4bd0",
+    marginTop: 4,
+  },
+  dgTimeLine: { flex: 1, width: 2, backgroundColor: "#d8c8e2", marginVertical: 2 },
+  dgTimeBody: { flex: 1, paddingBottom: 14 },
+  dgRoot: {
+    backgroundColor: "#7b4bd0",
+    borderRadius: 12,
+    paddingHorizontal: 14,
+    paddingVertical: 11,
+    alignSelf: "center",
+  },
+  dgRootText: { color: "#fff", fontSize: 15, fontWeight: "700" },
+  dgFormula: {
+    borderWidth: 1.5,
+    borderColor: "#7b4bd0",
+    backgroundColor: "#f3ebfd",
+    borderRadius: 12,
+    paddingHorizontal: 14,
+    paddingVertical: 14,
+    alignItems: "center",
+  },
+  dgFormulaText: {
+    fontSize: 20,
+    fontWeight: "700",
+    color: "#2a2350",
+    fontFamily: Platform.OS === "ios" ? "Menlo" : "monospace",
+  },
+  dgSymbol: {
+    width: 26,
+    height: 26,
+    borderRadius: 13,
+    backgroundColor: "#7b4bd0",
+    alignItems: "center",
+    justifyContent: "center",
+  },
+  dgSymbolText: { color: "#fff", fontSize: 11, fontWeight: "700" },
+
+  // Lesson slide (presentation) mode
+  slideBar: { flexDirection: "row", alignItems: "center", gap: 10 },
+  slideCard: {
+    borderWidth: 1,
+    borderColor: "#efe4f0",
+    borderRadius: 16,
+    backgroundColor: "#fbfaf6",
+    padding: 18,
+    minHeight: 240,
+    justifyContent: "center",
+    gap: 4,
+  },
+  slideKicker: {
+    fontSize: 11.5,
+    fontWeight: "700",
+    letterSpacing: 0.7,
+    color: "#7b4bd0",
+  },
+  slideBigTitle: {
+    fontSize: 25,
+    lineHeight: 31,
+    fontWeight: "800",
+    color: "#2a2350",
+    marginTop: 8,
+  },
+  slideTitle: { fontSize: 19, fontWeight: "800", color: "#2a2350" },
+  slideLead: { fontSize: 15.5, lineHeight: 23, color: "#6b6280", marginTop: 8 },
+  slideBody: { fontSize: 15, lineHeight: 23, color: "#2a2350", marginTop: 8 },
+  slideNote: { fontSize: 13.5, color: "#7b4bd0", marginTop: 10 },
+  slideControls: { flexDirection: "row", gap: 8, alignItems: "center" },
+  slideNav: { flex: 1, marginTop: 0 },
+
   // Chat header
   header: {
     paddingTop: 64,
@@ -6689,8 +7104,8 @@ const styles = StyleSheet.create({
     flexDirection: "row",
     alignItems: "flex-start",
   },
-  title: { fontSize: 28, fontWeight: "700", color: "#2f6f4f" },
-  subtitle: { fontSize: 15, color: "#5b6660", marginTop: 2 },
+  title: { fontSize: 28, fontWeight: "700", color: "#7b4bd0" },
+  subtitle: { fontSize: 15, color: "#6b6280", marginTop: 2 },
   headerBtns: {
     flexDirection: "row",
     flexWrap: "wrap",
@@ -6700,31 +7115,30 @@ const styles = StyleSheet.create({
   },
   ghostBtn: {
     borderWidth: 1,
-    borderColor: "#2f6f4f",
+    borderColor: "#7b4bd0",
     borderRadius: 12,
     paddingHorizontal: 10,
     paddingVertical: 8,
   },
-  ghostBtnText: { color: "#2f6f4f", fontSize: 13, fontWeight: "600" },
+  ghostBtnText: { color: "#7b4bd0", fontSize: 13, fontWeight: "600" },
   timerDisplay: {
     fontSize: 72,
     fontWeight: "700",
     textAlign: "center",
-    color: "#2f6f4f",
+    color: "#7b4bd0",
     marginVertical: 8,
   },
   timerDone: {
     textAlign: "center",
     fontSize: 17,
-    color: "#1c2421",
+    color: "#2a2350",
     marginBottom: 4,
   },
   // Focus garden
-  coins: { fontSize: 16, fontWeight: "700", color: "#2f6f4f" },
   scene: {
     borderRadius: 16,
     borderWidth: 1,
-    borderColor: "#d9ddd8",
+    borderColor: "#efe4f0",
     minHeight: 150,
     alignItems: "center",
     justifyContent: "center",
@@ -6733,7 +7147,7 @@ const styles = StyleSheet.create({
     marginBottom: 4,
   },
   sceneFlower: { fontSize: 60 },
-  sceneNote: { fontSize: 15, color: "#5b6660", textAlign: "center" },
+  sceneNote: { fontSize: 15, color: "#6b6280", textAlign: "center" },
   gardenWrap: {
     flexDirection: "row",
     flexWrap: "wrap",
@@ -6754,18 +7168,18 @@ const styles = StyleSheet.create({
     paddingVertical: 8,
   },
   locEmoji: { fontSize: 22 },
-  locName: { flex: 1, fontSize: 15, fontWeight: "600", color: "#1c2421" },
-  locCurrent: { fontSize: 13, fontWeight: "700", color: "#2f6f4f" },
+  locName: { flex: 1, fontSize: 15, fontWeight: "600", color: "#2a2350" },
+  locCurrent: { fontSize: 13, fontWeight: "700", color: "#7b4bd0" },
   smallGhost: {
     borderWidth: 1,
-    borderColor: "#2f6f4f",
+    borderColor: "#7b4bd0",
     borderRadius: 10,
     paddingHorizontal: 10,
     paddingVertical: 6,
   },
-  smallGhostText: { color: "#2f6f4f", fontSize: 13 },
+  smallGhostText: { color: "#7b4bd0", fontSize: 13 },
   levelChip: {
-    backgroundColor: "#2f6f4f",
+    backgroundColor: "#7b4bd0",
     color: "#fff",
     borderRadius: 999,
     paddingHorizontal: 10,
@@ -6781,14 +7195,14 @@ const styles = StyleSheet.create({
     gap: 8,
     marginTop: 10,
   },
-  customLabel: { fontSize: 14, color: "#5b6660" },
+  customLabel: { fontSize: 14, color: "#6b6280" },
   customInput: {
     width: 70,
     fontSize: 15,
     backgroundColor: "#fff",
     borderRadius: 10,
     borderWidth: 1,
-    borderColor: "#d9ddd8",
+    borderColor: "#efe4f0",
     paddingHorizontal: 10,
     paddingVertical: 8,
     textAlign: "center",
@@ -6805,7 +7219,7 @@ const styles = StyleSheet.create({
   prizeTitle: { fontWeight: "700", fontSize: 16, color: "#3a2a06" },
   prizeText: { fontSize: 13, color: "#3a2a06" },
   achToast: {
-    backgroundColor: "#2f6f4f",
+    backgroundColor: "#7b4bd0",
     borderRadius: 12,
     padding: 12,
     marginBottom: 4,
@@ -6814,22 +7228,22 @@ const styles = StyleSheet.create({
   fbCard: {
     backgroundColor: "#fff",
     borderWidth: 1,
-    borderColor: "#d9ddd8",
+    borderColor: "#efe4f0",
     borderRadius: 14,
     padding: 16,
     marginBottom: 10,
     gap: 8,
   },
-  fbTitle: { fontSize: 17, fontWeight: "700", color: "#2f6f4f" },
-  fbSub: { fontSize: 15, color: "#1c2421" },
+  fbTitle: { fontSize: 17, fontWeight: "700", color: "#7b4bd0" },
+  fbSub: { fontSize: 15, color: "#2a2350" },
   fbInput: {
     borderWidth: 1,
-    borderColor: "#c7cdc5",
+    borderColor: "#d8c8e2",
     borderRadius: 10,
     paddingHorizontal: 12,
     paddingVertical: 10,
     fontSize: 15,
-    color: "#1c2421",
+    color: "#2a2350",
     backgroundColor: "#fff",
   },
   fbMoodRow: { flexDirection: "row", gap: 8 },
@@ -6840,29 +7254,29 @@ const styles = StyleSheet.create({
     paddingVertical: 12,
     borderRadius: 10,
     borderWidth: 1,
-    borderColor: "#d9ddd8",
-    backgroundColor: "#e7efe8",
+    borderColor: "#efe4f0",
+    backgroundColor: "#f3ebfd",
   },
-  fbMoodText: { fontSize: 14, fontWeight: "600", color: "#1c2421" },
-  fbSkip: { color: "#5b6660", fontSize: 14, marginTop: 2 },
+  fbMoodText: { fontSize: 14, fontWeight: "600", color: "#2a2350" },
+  fbSkip: { color: "#6b6280", fontSize: 14, marginTop: 2 },
   achItem: {
     flexDirection: "row",
     alignItems: "center",
     gap: 10,
     backgroundColor: "#fff",
     borderWidth: 1,
-    borderColor: "#d9ddd8",
+    borderColor: "#efe4f0",
     borderRadius: 12,
     padding: 10,
     marginBottom: 6,
   },
   achEmoji: { fontSize: 22 },
-  achName: { fontSize: 14, fontWeight: "600", color: "#1c2421" },
+  achName: { fontSize: 14, fontWeight: "600", color: "#2a2350" },
   // Profile card
   card: {
     backgroundColor: "#fff",
     borderWidth: 1,
-    borderColor: "#d9ddd8",
+    borderColor: "#efe4f0",
     borderRadius: 14,
     padding: 12,
   },
@@ -6872,14 +7286,14 @@ const styles = StyleSheet.create({
     justifyContent: "space-between",
     gap: 8,
   },
-  cardClass: { flex: 1, fontWeight: "700", fontSize: 16, color: "#2f6f4f" },
+  cardClass: { flex: 1, fontWeight: "700", fontSize: 16, color: "#7b4bd0" },
   linkBtn: {
-    color: "#2f6f4f",
+    color: "#7b4bd0",
     fontSize: 14,
     textDecorationLine: "underline",
   },
-  cardRow: { fontSize: 14, color: "#1c2421", marginTop: 6 },
-  cardLabel: { color: "#5b6660" },
+  cardRow: { fontSize: 14, color: "#2a2350", marginTop: 6 },
+  cardLabel: { color: "#6b6280" },
   folderRow: { flexDirection: "row", flexWrap: "wrap", gap: 8, marginTop: 8 },
   folder: {
     flexDirection: "row",
@@ -6892,13 +7306,13 @@ const styles = StyleSheet.create({
     paddingHorizontal: 10,
     paddingVertical: 6,
   },
-  folderText: { fontSize: 14, color: "#1c2421" },
-  folderRemove: { fontSize: 14, color: "#8a938d" },
+  folderText: { fontSize: 14, color: "#2a2350" },
+  folderRemove: { fontSize: 14, color: "#8b83a3" },
   // Plan panel
   plan: {
     backgroundColor: "#fff",
     borderWidth: 1,
-    borderColor: "#d9ddd8",
+    borderColor: "#efe4f0",
     borderRadius: 14,
     padding: 12,
   },
@@ -6907,16 +7321,16 @@ const styles = StyleSheet.create({
     alignItems: "center",
     justifyContent: "space-between",
   },
-  planTitle: { fontWeight: "700", fontSize: 16, color: "#1c2421" },
-  planCount: { fontSize: 14, color: "#5b6660" },
+  planTitle: { fontWeight: "700", fontSize: 16, color: "#2a2350" },
+  planCount: { fontSize: 14, color: "#6b6280" },
   progressTrack: {
     height: 8,
     borderRadius: 6,
-    backgroundColor: "#eef1ee",
+    backgroundColor: "#f3ebfd",
     marginVertical: 10,
     overflow: "hidden",
   },
-  progressFill: { height: "100%", backgroundColor: "#2f6f4f", borderRadius: 6 },
+  progressFill: { height: "100%", backgroundColor: "#7b4bd0", borderRadius: 6 },
   planRow: { flexDirection: "row", alignItems: "flex-start" },
   planItem: {
     flexDirection: "row",
@@ -6929,17 +7343,71 @@ const styles = StyleSheet.create({
     height: 22,
     borderRadius: 6,
     borderWidth: 1.5,
-    borderColor: "#2f6f4f",
+    borderColor: "#7b4bd0",
     alignItems: "center",
     justifyContent: "center",
   },
-  checkboxOn: { backgroundColor: "#2f6f4f" },
+  checkboxOn: { backgroundColor: "#7b4bd0" },
   checkboxCheckpoint: { borderColor: "#b8742a" },
   checkboxOnCheckpoint: { backgroundColor: "#b8742a", borderColor: "#b8742a" },
   checkmark: { color: "#fff", fontSize: 14, lineHeight: 16 },
-  planItemText: { flex: 1, fontSize: 15, color: "#1c2421", lineHeight: 21 },
-  planItemDone: { textDecorationLine: "line-through", color: "#8a938d" },
+  planItemText: { flex: 1, fontSize: 15, color: "#2a2350", lineHeight: 21 },
+  planItemDone: { textDecorationLine: "line-through", color: "#8b83a3" },
   checkpointBadge: { color: "#b8742a", fontWeight: "700", fontSize: 12 },
+
+  // Lesson plan from the first session
+  lpSecHead: {
+    fontSize: 12,
+    fontWeight: "800",
+    color: "#7b4bd0",
+    textTransform: "uppercase",
+    letterSpacing: 0.3,
+    marginTop: 12,
+    marginBottom: 4,
+  },
+  lpItem: { fontSize: 14.5, color: "#2a2350", lineHeight: 21, marginBottom: 3 },
+  lpSession: {
+    marginTop: 10,
+    padding: 12,
+    borderRadius: 12,
+    borderWidth: 1,
+    borderColor: "#e2e6e0",
+    backgroundColor: "#fff",
+  },
+  lpSessionHead: { flexDirection: "row", alignItems: "center", gap: 8 },
+  lpNum: {
+    width: 22,
+    height: 22,
+    borderRadius: 11,
+    backgroundColor: "#7b4bd0",
+    alignItems: "center",
+    justifyContent: "center",
+  },
+  lpNumText: { color: "#fff", fontSize: 12.5, fontWeight: "800" },
+  lpSessionTitle: {
+    flex: 1,
+    fontSize: 15,
+    fontWeight: "700",
+    color: "#2a2350",
+    lineHeight: 20,
+  },
+  lpFocus: { marginTop: 6, fontSize: 14.5, color: "#2a2350", lineHeight: 21 },
+  lpHint: {
+    marginTop: 8,
+    padding: 10,
+    borderRadius: 10,
+    backgroundColor: "#f3ebfd",
+    fontSize: 14,
+    color: "#2a2350",
+    lineHeight: 20,
+  },
+  lpNote: {
+    marginTop: 10,
+    fontSize: 13.5,
+    fontStyle: "italic",
+    color: "#6b6280",
+    lineHeight: 20,
+  },
   // Plan path (snake) view
   pathToggleRow: { flexDirection: "row", gap: 8, marginBottom: 10 },
   pathToggleBtn: {
@@ -6948,20 +7416,20 @@ const styles = StyleSheet.create({
     paddingHorizontal: 10,
     borderRadius: 10,
     borderWidth: 1,
-    borderColor: "#d9ddd8",
+    borderColor: "#efe4f0",
     backgroundColor: "#fff",
     alignItems: "center",
   },
-  pathToggleBtnActive: { backgroundColor: "#2f6f4f", borderColor: "#2f6f4f" },
-  pathToggleText: { fontSize: 13, fontWeight: "700", color: "#5b6660" },
+  pathToggleBtnActive: { backgroundColor: "#7b4bd0", borderColor: "#7b4bd0" },
+  pathToggleText: { fontSize: 13, fontWeight: "700", color: "#6b6280" },
   pathToggleTextActive: { color: "#fff" },
   pathHerePill: {
     fontSize: 11,
     fontWeight: "800",
-    color: "#2f6f4f",
+    color: "#7b4bd0",
     backgroundColor: "#fff",
     borderWidth: 1,
-    borderColor: "#2f6f4f",
+    borderColor: "#7b4bd0",
     borderRadius: 999,
     paddingHorizontal: 8,
     paddingVertical: 2,
@@ -6974,27 +7442,27 @@ const styles = StyleSheet.create({
     backgroundColor: "#fff",
     borderRadius: 10,
     borderWidth: 1,
-    borderColor: "#d9ddd8",
+    borderColor: "#efe4f0",
     paddingHorizontal: 12,
     paddingVertical: 10,
   },
   kindRow: { flexDirection: "row", flexWrap: "wrap", gap: 6 },
   kindChip: {
     borderWidth: 1,
-    borderColor: "#d9ddd8",
+    borderColor: "#efe4f0",
     borderRadius: 14,
     paddingHorizontal: 12,
     paddingVertical: 6,
   },
-  kindChipText: { fontSize: 13, color: "#5b6660", textTransform: "capitalize" },
+  kindChipText: { fontSize: 13, color: "#6b6280", textTransform: "capitalize" },
   calAddBtn: {
-    backgroundColor: "#2f6f4f",
+    backgroundColor: "#7b4bd0",
     borderRadius: 10,
     paddingVertical: 11,
     alignItems: "center",
   },
   calAddBtnText: { color: "#fff", fontSize: 15, fontWeight: "600" },
-  calEmpty: { fontSize: 14, color: "#5b6660", marginTop: 8 },
+  calEmpty: { fontSize: 14, color: "#6b6280", marginTop: 8 },
   calGridWrap: { marginVertical: 10 },
   calNav: {
     flexDirection: "row",
@@ -7007,20 +7475,20 @@ const styles = StyleSheet.create({
     height: 34,
     borderRadius: 8,
     borderWidth: 1,
-    borderColor: "#d9ddd8",
+    borderColor: "#efe4f0",
     alignItems: "center",
     justifyContent: "center",
     backgroundColor: "#fff",
   },
-  calNavBtnText: { fontSize: 20, color: "#2f6f4f", lineHeight: 22 },
-  calMonthLabel: { fontSize: 15, fontWeight: "700", color: "#1c2421" },
+  calNavBtnText: { fontSize: 20, color: "#7b4bd0", lineHeight: 22 },
+  calMonthLabel: { fontSize: 15, fontWeight: "700", color: "#2a2350" },
   calWeekRow: { flexDirection: "row", marginBottom: 4 },
   calWeekday: {
     width: "14.28%",
     textAlign: "center",
     fontSize: 11,
     fontWeight: "600",
-    color: "#5b6660",
+    color: "#6b6280",
   },
   calGrid: { flexDirection: "row", flexWrap: "wrap" },
   calCell: { width: "14.28%", padding: 2 },
@@ -7034,9 +7502,9 @@ const styles = StyleSheet.create({
     justifyContent: "center",
     gap: 2,
   },
-  calBoxToday: { borderColor: "#2f6f4f", borderWidth: 2 },
-  calBoxNum: { fontSize: 13, color: "#1c2421" },
-  calBoxNumToday: { color: "#2f6f4f", fontWeight: "700" },
+  calBoxToday: { borderColor: "#7b4bd0", borderWidth: 2 },
+  calBoxNum: { fontSize: 13, color: "#2a2350" },
+  calBoxNumToday: { color: "#7b4bd0", fontWeight: "700" },
   calDots: { flexDirection: "row", gap: 2, height: 5 },
   calDot: { width: 5, height: 5, borderRadius: 3 },
   calRow: { flexDirection: "row", alignItems: "center", gap: 8, paddingVertical: 6 },
@@ -7047,10 +7515,10 @@ const styles = StyleSheet.create({
     fontWeight: "700",
     textTransform: "capitalize",
   },
-  calDate: { width: 52, fontWeight: "600", fontSize: 14, color: "#1c2421" },
-  calTitle: { flex: 1, fontSize: 14, color: "#1c2421" },
-  calCountdown: { fontSize: 13, color: "#5b6660" },
-  calRemove: { fontSize: 20, color: "#8a938d", paddingHorizontal: 4 },
+  calDate: { width: 52, fontWeight: "600", fontSize: 14, color: "#2a2350" },
+  calTitle: { flex: 1, fontSize: 14, color: "#2a2350" },
+  calCountdown: { fontSize: 13, color: "#6b6280" },
+  calRemove: { fontSize: 20, color: "#8b83a3", paddingHorizontal: 4 },
   // Messages
   tabBar: { flexGrow: 0 },
   tabBarContent: {
@@ -7063,20 +7531,20 @@ const styles = StyleSheet.create({
   viewTab: {
     backgroundColor: "#fff",
     borderWidth: 1,
-    borderColor: "#d9ddd8",
+    borderColor: "#efe4f0",
     borderRadius: 12,
     paddingVertical: 9,
     paddingHorizontal: 14,
     alignItems: "center",
   },
-  viewTabActive: { backgroundColor: "#2f6f4f", borderColor: "#2f6f4f" },
-  viewTabText: { fontSize: 11, fontWeight: "600", color: "#5b6660" },
+  viewTabActive: { backgroundColor: "#7b4bd0", borderColor: "#7b4bd0" },
+  viewTabText: { fontSize: 11, fontWeight: "600", color: "#6b6280" },
   viewTabTextActive: { color: "#fff" },
   studyScroll: { padding: 16, gap: 12 },
   planStrip: {
     backgroundColor: "#fff",
     borderWidth: 1,
-    borderColor: "#2f6f4f",
+    borderColor: "#7b4bd0",
     borderRadius: 14,
     padding: 12,
   },
@@ -7086,19 +7554,19 @@ const styles = StyleSheet.create({
     justifyContent: "space-between",
     marginBottom: 6,
   },
-  planStripLabel: { fontSize: 14, fontWeight: "700", color: "#2f6f4f" },
+  planStripLabel: { fontSize: 14, fontWeight: "700", color: "#7b4bd0" },
   planStripNext: { flexDirection: "row", alignItems: "center", gap: 10 },
   planStripCheck: {
     width: 22,
     height: 22,
     borderRadius: 6,
     borderWidth: 1.5,
-    borderColor: "#2f6f4f",
+    borderColor: "#7b4bd0",
   },
-  planStripNextText: { flex: 1, fontSize: 15, color: "#1c2421" },
-  planStripNextLabel: { color: "#5b6660", fontWeight: "600" },
-  planStripDone: { fontSize: 15, color: "#1c2421" },
-  chatTabs: { maxHeight: 48, backgroundColor: "#f7f5f0" },
+  planStripNextText: { flex: 1, fontSize: 15, color: "#2a2350" },
+  planStripNextLabel: { color: "#6b6280", fontWeight: "600" },
+  planStripDone: { fontSize: 15, color: "#2a2350" },
+  chatTabs: { maxHeight: 48, backgroundColor: "#fdf4f2" },
   chatTabsContent: {
     gap: 6,
     paddingHorizontal: 16,
@@ -7111,14 +7579,14 @@ const styles = StyleSheet.create({
     maxWidth: 170,
     backgroundColor: "#fff",
     borderWidth: 1,
-    borderColor: "#d9ddd8",
+    borderColor: "#efe4f0",
     borderRadius: 999,
     paddingHorizontal: 12,
     paddingVertical: 7,
   },
-  chatTabActive: { borderColor: "#2f6f4f", backgroundColor: "#eef1ee" },
-  chatTabLabel: { fontSize: 13, color: "#5b6660" },
-  chatTabLabelActive: { color: "#1c2421", fontWeight: "600" },
+  chatTabActive: { borderColor: "#7b4bd0", backgroundColor: "#f3ebfd" },
+  chatTabLabel: { fontSize: 13, color: "#6b6280" },
+  chatTabLabelActive: { color: "#2a2350", fontWeight: "600" },
   renameOverlay: {
     flex: 1,
     backgroundColor: "rgba(0,0,0,0.4)",
@@ -7131,21 +7599,21 @@ const styles = StyleSheet.create({
     padding: 20,
     gap: 14,
   },
-  renameTitle: { fontSize: 17, fontWeight: "700", color: "#1c2421" },
+  renameTitle: { fontSize: 17, fontWeight: "700", color: "#2a2350" },
   renameInput: {
     borderWidth: 1,
-    borderColor: "#2f6f4f",
+    borderColor: "#7b4bd0",
     borderRadius: 10,
     paddingHorizontal: 12,
     paddingVertical: 11,
     fontSize: 16,
-    color: "#1c2421",
+    color: "#2a2350",
   },
   renameActions: { flexDirection: "row", justifyContent: "flex-end", gap: 10 },
   renameCancel: { paddingHorizontal: 16, paddingVertical: 10, justifyContent: "center" },
-  renameCancelText: { color: "#5b6660", fontSize: 15, fontWeight: "600" },
+  renameCancelText: { color: "#6b6280", fontSize: 15, fontWeight: "600" },
   renameSave: {
-    backgroundColor: "#2f6f4f",
+    backgroundColor: "#7b4bd0",
     borderRadius: 10,
     paddingHorizontal: 18,
     paddingVertical: 10,
@@ -7154,7 +7622,7 @@ const styles = StyleSheet.create({
   renameSubLabel: {
     fontSize: 12,
     fontWeight: "700",
-    color: "#5b6660",
+    color: "#6b6280",
     textTransform: "uppercase",
     letterSpacing: 0.5,
     marginTop: 4,
@@ -7162,28 +7630,28 @@ const styles = StyleSheet.create({
   folderPickRow: { flexDirection: "row", flexWrap: "wrap", gap: 8 },
   folderPick: {
     borderWidth: 1,
-    borderColor: "#d9ddd8",
+    borderColor: "#efe4f0",
     borderRadius: 16,
     paddingHorizontal: 12,
     paddingVertical: 7,
     backgroundColor: "#fff",
   },
-  folderPickActive: { backgroundColor: "#eef4f0", borderColor: "#2f6f4f" },
-  folderPickText: { fontSize: 13, color: "#1c2421" },
-  folderPickTextActive: { color: "#2f6f4f", fontWeight: "600" },
+  folderPickActive: { backgroundColor: "#f3ebfd", borderColor: "#7b4bd0" },
+  folderPickText: { fontSize: 13, color: "#2a2350" },
+  folderPickTextActive: { color: "#7b4bd0", fontWeight: "600" },
   newFolderRow: { flexDirection: "row", gap: 8 },
   newFolderInput: {
     flex: 1,
     borderWidth: 1,
-    borderColor: "#d9ddd8",
+    borderColor: "#efe4f0",
     borderRadius: 10,
     paddingHorizontal: 12,
     paddingVertical: 9,
     fontSize: 14,
-    color: "#1c2421",
+    color: "#2a2350",
   },
   newFolderBtn: {
-    backgroundColor: "#2f6f4f",
+    backgroundColor: "#7b4bd0",
     borderRadius: 10,
     paddingHorizontal: 16,
     justifyContent: "center",
@@ -7197,61 +7665,61 @@ const styles = StyleSheet.create({
   },
   folderChip: {
     borderWidth: 1,
-    borderColor: "#d9ddd8",
+    borderColor: "#efe4f0",
     borderRadius: 14,
     paddingHorizontal: 12,
     paddingVertical: 5,
     backgroundColor: "#fff",
   },
-  folderChipActive: { backgroundColor: "#2f6f4f", borderColor: "#2f6f4f" },
-  folderChipText: { fontSize: 12.5, color: "#5b6660" },
+  folderChipActive: { backgroundColor: "#7b4bd0", borderColor: "#7b4bd0" },
+  folderChipText: { fontSize: 12.5, color: "#6b6280" },
   folderChipTextActive: { color: "#fff", fontWeight: "600" },
-  chatTabClose: { fontSize: 13, color: "#8a938d" },
+  chatTabClose: { fontSize: 13, color: "#8b83a3" },
   chatTabNew: {
     width: 32,
     height: 32,
     borderRadius: 16,
-    backgroundColor: "#2f6f4f",
+    backgroundColor: "#7b4bd0",
     alignItems: "center",
     justifyContent: "center",
   },
   chatTabNewText: { color: "#fff", fontSize: 18, lineHeight: 20 },
   list: { padding: 16, gap: 12 },
   bubble: { maxWidth: "85%", padding: 14, borderRadius: 18 },
-  userBubble: { alignSelf: "flex-end", backgroundColor: "#2f6f4f" },
-  assistantBubble: { alignSelf: "flex-start", backgroundColor: "#eef1ee" },
+  userBubble: { alignSelf: "flex-end", backgroundColor: "#7b4bd0" },
+  assistantBubble: { alignSelf: "flex-start", backgroundColor: "#f3ebfd" },
   userText: { color: "#fff", fontSize: 17, lineHeight: 24 },
-  assistantText: { color: "#1c2421", fontSize: 17, lineHeight: 24 },
-  link: { color: "#2f6f4f", textDecorationLine: "underline" },
+  assistantText: { color: "#2a2350", fontSize: 17, lineHeight: 24 },
+  link: { color: "#7b4bd0", textDecorationLine: "underline" },
   speakBtn: {
     borderWidth: 1,
-    borderColor: "#d9ddd8",
+    borderColor: "#efe4f0",
     borderRadius: 10,
     paddingHorizontal: 10,
     paddingVertical: 4,
     alignSelf: "flex-start",
   },
-  speakBtnText: { color: "#2f6f4f", fontSize: 13 },
+  speakBtnText: { color: "#7b4bd0", fontSize: 13 },
   videoWrap: { flexDirection: "row", flexWrap: "wrap", gap: 10, maxWidth: "90%" },
   videoCard: {
     width: 150,
     backgroundColor: "#fff",
     borderRadius: 12,
     borderWidth: 1,
-    borderColor: "#d9ddd8",
+    borderColor: "#efe4f0",
     overflow: "hidden",
   },
   videoThumb: { width: "100%", height: 84, backgroundColor: "#e3e7e2" },
   videoMeta: { padding: 8 },
-  videoTitle: { fontSize: 13, fontWeight: "600", color: "#1c2421", lineHeight: 17 },
-  videoChannel: { fontSize: 11, color: "#5b6660", marginTop: 4 },
+  videoTitle: { fontSize: 13, fontWeight: "600", color: "#2a2350", lineHeight: 17 },
+  videoChannel: { fontSize: 11, color: "#6b6280", marginTop: 4 },
   socialWrap: { flexDirection: "row", flexWrap: "wrap", gap: 10, maxWidth: "90%" },
   socialCard: {
     width: 170,
     backgroundColor: "#fff",
     borderRadius: 12,
     borderWidth: 1,
-    borderColor: "#d9ddd8",
+    borderColor: "#efe4f0",
     padding: 10,
     gap: 6,
   },
@@ -7262,15 +7730,15 @@ const styles = StyleSheet.create({
     paddingHorizontal: 8,
   },
   socialBadgeText: { color: "#fff", fontSize: 11, fontWeight: "700" },
-  socialTitle: { fontSize: 13, fontWeight: "600", color: "#1c2421", lineHeight: 17 },
-  socialNote: { fontSize: 11, color: "#5b6660", lineHeight: 15 },
-  socialOpen: { fontSize: 12, fontWeight: "600", color: "#2f6f4f" },
+  socialTitle: { fontSize: 13, fontWeight: "600", color: "#2a2350", lineHeight: 17 },
+  socialNote: { fontSize: 11, color: "#6b6280", lineHeight: 15 },
+  socialOpen: { fontSize: 12, fontWeight: "600", color: "#7b4bd0" },
   // Study tools (flashcards + quiz)
   toolBox: {
     maxWidth: "90%",
     backgroundColor: "#fff",
     borderWidth: 1,
-    borderColor: "#d9ddd8",
+    borderColor: "#efe4f0",
     borderRadius: 14,
     padding: 14,
   },
@@ -7280,26 +7748,26 @@ const styles = StyleSheet.create({
     justifyContent: "space-between",
     marginBottom: 10,
   },
-  toolTitle: { fontWeight: "700", fontSize: 16, color: "#1c2421" },
+  toolTitle: { fontWeight: "700", fontSize: 16, color: "#2a2350" },
   flashcard: {
     minHeight: 120,
     alignItems: "center",
     justifyContent: "center",
     gap: 6,
-    backgroundColor: "#eef1ee",
+    backgroundColor: "#f3ebfd",
     borderWidth: 1,
-    borderColor: "#d9ddd8",
+    borderColor: "#efe4f0",
     borderRadius: 12,
     padding: 16,
   },
-  flashcardLabel: { fontSize: 11, letterSpacing: 1, color: "#5b6660" },
+  flashcardLabel: { fontSize: 11, letterSpacing: 1, color: "#6b6280" },
   flashcardText: {
     fontSize: 19,
     fontWeight: "600",
-    color: "#1c2421",
+    color: "#2a2350",
     textAlign: "center",
   },
-  flashcardHint: { fontSize: 12, color: "#8a938d" },
+  flashcardHint: { fontSize: 12, color: "#8b83a3" },
   flashNav: {
     flexDirection: "row",
     alignItems: "center",
@@ -7308,50 +7776,50 @@ const styles = StyleSheet.create({
   },
   smallBtn: {
     borderWidth: 1,
-    borderColor: "#d9ddd8",
+    borderColor: "#efe4f0",
     borderRadius: 10,
     paddingHorizontal: 14,
     paddingVertical: 8,
   },
-  smallBtnText: { color: "#1c2421", fontSize: 14 },
-  quizQ: { fontWeight: "600", fontSize: 16, marginBottom: 6, color: "#1c2421" },
+  smallBtnText: { color: "#2a2350", fontSize: 14 },
+  quizQ: { fontWeight: "600", fontSize: 16, marginBottom: 6, color: "#2a2350" },
   quizOpt: {
     borderWidth: 1,
-    borderColor: "#d9ddd8",
+    borderColor: "#efe4f0",
     borderRadius: 10,
     paddingHorizontal: 12,
     paddingVertical: 10,
     marginBottom: 6,
   },
-  quizOptText: { fontSize: 15, color: "#1c2421" },
-  quizExplain: { fontSize: 14, color: "#5b6660", marginTop: 4 },
-  quizDone: { fontSize: 15, color: "#1c2421", marginTop: 8, fontWeight: "600" },
+  quizOptText: { fontSize: 15, color: "#2a2350" },
+  quizExplain: { fontSize: 14, color: "#6b6280", marginTop: 4 },
+  quizDone: { fontSize: 15, color: "#2a2350", marginTop: 8, fontWeight: "600" },
   // Quick-action chips
-  chips: { maxHeight: 52, backgroundColor: "#f7f5f0" },
+  chips: { maxHeight: 52, backgroundColor: "#fdf4f2" },
   chipsContent: { gap: 8, paddingHorizontal: 12, paddingVertical: 8 },
   chip: {
     borderWidth: 1,
-    borderColor: "#2f6f4f",
+    borderColor: "#7b4bd0",
     borderRadius: 16,
     paddingHorizontal: 14,
     paddingVertical: 8,
     backgroundColor: "#fff",
   },
-  chipText: { color: "#2f6f4f", fontSize: 14 },
+  chipText: { color: "#7b4bd0", fontSize: 14 },
   assignAddRow: { flexDirection: "row", gap: 8, marginTop: 8 },
   assignInput: {
     flex: 1,
     borderWidth: 1,
-    borderColor: "#d9ddd8",
+    borderColor: "#efe4f0",
     borderRadius: 10,
     paddingHorizontal: 12,
     paddingVertical: 10,
     fontSize: 15,
-    color: "#1c2421",
+    color: "#2a2350",
     backgroundColor: "#fff",
   },
   assignAddBtn: {
-    backgroundColor: "#2f6f4f",
+    backgroundColor: "#7b4bd0",
     borderRadius: 10,
     paddingHorizontal: 16,
     justifyContent: "center",
@@ -7360,18 +7828,18 @@ const styles = StyleSheet.create({
   assignSubjRow: { flexDirection: "row", gap: 6, paddingVertical: 2 },
   assignSubjChip: {
     borderWidth: 1,
-    borderColor: "#d9ddd8",
+    borderColor: "#efe4f0",
     borderRadius: 14,
     paddingHorizontal: 12,
     paddingVertical: 6,
     backgroundColor: "#fff",
   },
-  assignSubjChipActive: { backgroundColor: "#2f6f4f", borderColor: "#2f6f4f" },
-  assignSubjChipText: { fontSize: 13, color: "#5b6660" },
+  assignSubjChipActive: { backgroundColor: "#7b4bd0", borderColor: "#7b4bd0" },
+  assignSubjChipText: { fontSize: 13, color: "#6b6280" },
   assignSubjChipTextActive: { color: "#fff" },
-  assignEmpty: { color: "#5b6660", fontSize: 14, marginTop: 10 },
-  subjectsCount: { fontSize: 13, color: "#5b6660", fontWeight: "600" },
-  schedHint: { color: "#5b6660", fontSize: 13, marginTop: 4, marginBottom: 10 },
+  assignEmpty: { color: "#6b6280", fontSize: 14, marginTop: 10 },
+  subjectsCount: { fontSize: 13, color: "#6b6280", fontWeight: "600" },
+  schedHint: { color: "#6b6280", fontSize: 13, marginTop: 4, marginBottom: 10 },
   schedBuildRow: {
     flexDirection: "row",
     alignItems: "center",
@@ -7379,27 +7847,27 @@ const styles = StyleSheet.create({
     gap: 10,
     marginBottom: 8,
   },
-  schedBuildLabel: { fontSize: 14, color: "#1c2421", fontWeight: "600" },
+  schedBuildLabel: { fontSize: 14, color: "#2a2350", fontWeight: "600" },
   schedStepper: {
     flexDirection: "row",
     alignItems: "center",
     gap: 4,
     borderWidth: 1,
-    borderColor: "#d9ddd8",
+    borderColor: "#efe4f0",
     borderRadius: 10,
     padding: 2,
   },
   schedStepBtn: { paddingHorizontal: 12, paddingVertical: 4 },
-  schedStepBtnText: { fontSize: 18, color: "#2f6f4f", fontWeight: "700" },
+  schedStepBtnText: { fontSize: 18, color: "#7b4bd0", fontWeight: "700" },
   schedStepVal: {
     fontSize: 14,
     fontWeight: "700",
-    color: "#1c2421",
+    color: "#2a2350",
     minWidth: 74,
     textAlign: "center",
   },
   schedBuildBtn: {
-    backgroundColor: "#eaf3ec",
+    backgroundColor: "#f3ebfd",
     borderWidth: 1,
     borderColor: "#bcd9c4",
     borderRadius: 12,
@@ -7407,9 +7875,9 @@ const styles = StyleSheet.create({
     alignItems: "center",
     marginBottom: 12,
   },
-  schedBuildBtnText: { color: "#2f6f4f", fontWeight: "700", fontSize: 14 },
+  schedBuildBtnText: { color: "#7b4bd0", fontWeight: "700", fontSize: 14 },
   schedSetupBtn: {
-    backgroundColor: "#2f6f4f",
+    backgroundColor: "#7b4bd0",
     borderRadius: 12,
     paddingVertical: 11,
     alignItems: "center",
@@ -7427,20 +7895,20 @@ const styles = StyleSheet.create({
     paddingRight: 6,
     paddingLeft: 8,
     borderLeftWidth: 4,
-    borderLeftColor: "#d9ddd8",
+    borderLeftColor: "#efe4f0",
   },
   schedRowNow: {
-    backgroundColor: "#eaf3ec",
+    backgroundColor: "#f3ebfd",
     borderWidth: 1,
-    borderColor: "#2f6f4f",
+    borderColor: "#7b4bd0",
     borderLeftWidth: 4,
   },
   schedTimeWrap: { width: 66, flexShrink: 0 },
-  schedTime: { fontSize: 12, fontWeight: "700", color: "#5b6660" },
+  schedTime: { fontSize: 12, fontWeight: "700", color: "#6b6280" },
   schedNowDot: {
     fontSize: 9,
     fontWeight: "800",
-    color: "#2f6f4f",
+    color: "#7b4bd0",
     letterSpacing: 0.4,
   },
   schedKind: { flexShrink: 0, padding: 2 },
@@ -7449,7 +7917,7 @@ const styles = StyleSheet.create({
     flex: 1,
     minWidth: 0,
     fontSize: 14,
-    color: "#1c2421",
+    color: "#2a2350",
     paddingVertical: 6,
     paddingHorizontal: 4,
   },
@@ -7458,23 +7926,23 @@ const styles = StyleSheet.create({
     flexDirection: "row",
     alignItems: "center",
     gap: 2,
-    backgroundColor: "#eaf3ec",
+    backgroundColor: "#f3ebfd",
     borderRadius: 999,
     paddingHorizontal: 4,
     paddingVertical: 2,
   },
   schedTimerBtn: { paddingHorizontal: 4, paddingVertical: 2 },
-  schedTimerBtnText: { fontSize: 13, color: "#2f6f4f", fontWeight: "700" },
+  schedTimerBtnText: { fontSize: 13, color: "#7b4bd0", fontWeight: "700" },
   schedTimerTime: {
     fontSize: 13,
     fontWeight: "700",
-    color: "#2f6f4f",
+    color: "#7b4bd0",
     minWidth: 40,
     textAlign: "center",
   },
-  schedTimerDone: { color: "#2f6f4f" },
+  schedTimerDone: { color: "#7b4bd0" },
   schedTimerClear: { paddingHorizontal: 4, paddingVertical: 2 },
-  schedTimerClearText: { fontSize: 12, color: "#5b6660" },
+  schedTimerClearText: { fontSize: 12, color: "#6b6280" },
   schedTimerStart: { flexShrink: 0, paddingHorizontal: 6, paddingVertical: 4 },
   schedTimerStartText: { fontSize: 16, opacity: 0.6 },
   schedClearRow: { marginTop: 10, alignSelf: "flex-end" },
@@ -7484,29 +7952,29 @@ const styles = StyleSheet.create({
     gap: 10,
     paddingVertical: 10,
     borderTopWidth: 1,
-    borderTopColor: "#eceae3",
+    borderTopColor: "#f2e7ee",
   },
   assignCheck: {
     width: 24,
     height: 24,
     borderRadius: 7,
     borderWidth: 1.5,
-    borderColor: "#2f6f4f",
+    borderColor: "#7b4bd0",
     backgroundColor: "#fff",
     alignItems: "center",
     justifyContent: "center",
   },
-  assignCheckDone: { backgroundColor: "#2f6f4f" },
+  assignCheckDone: { backgroundColor: "#7b4bd0" },
   assignCheckMark: { color: "#fff", fontSize: 14, fontWeight: "700" },
-  assignTitle: { fontSize: 15, color: "#1c2421" },
+  assignTitle: { fontSize: 15, color: "#2a2350" },
   assignTitleDone: {
     fontSize: 15,
-    color: "#9aa39d",
+    color: "#9b93b3",
     textDecorationLine: "line-through",
   },
-  assignMeta: { fontSize: 12.5, color: "#5b6660", marginTop: 2 },
-  assignRemove: { color: "#9aa39d", fontSize: 22, paddingHorizontal: 4 },
-  concernAdd: { fontSize: 12.5, color: "#9aa39d", marginTop: 5 },
+  assignMeta: { fontSize: 12.5, color: "#6b6280", marginTop: 2 },
+  assignRemove: { color: "#9b93b3", fontSize: 22, paddingHorizontal: 4 },
+  concernAdd: { fontSize: 12.5, color: "#9b93b3", marginTop: 5 },
   concernRow: {
     flexDirection: "row",
     alignItems: "center",
@@ -7517,12 +7985,12 @@ const styles = StyleSheet.create({
   concernInput: {
     flex: 1,
     borderWidth: 1,
-    borderColor: "#d9ddd8",
+    borderColor: "#efe4f0",
     borderRadius: 8,
     paddingHorizontal: 8,
     paddingVertical: 4,
     fontSize: 12.5,
-    color: "#1c2421",
+    color: "#2a2350",
     backgroundColor: "#fff",
   },
   // SMART goals
@@ -7537,13 +8005,13 @@ const styles = StyleSheet.create({
     flex: 1,
     fontSize: 13,
     fontWeight: "600",
-    color: "#1c2421",
+    color: "#2a2350",
   },
   goalLetter: {
     width: 20,
     height: 20,
     borderRadius: 6,
-    backgroundColor: "#2f6f4f",
+    backgroundColor: "#7b4bd0",
     color: "#fff",
     fontSize: 12,
     fontWeight: "700",
@@ -7554,15 +8022,15 @@ const styles = StyleSheet.create({
   goalItem: {
     paddingVertical: 12,
     borderTopWidth: 1,
-    borderTopColor: "#eceae3",
+    borderTopColor: "#f2e7ee",
   },
   goalTop: { flexDirection: "row", alignItems: "flex-start", gap: 10 },
-  goalTitle: { fontSize: 15.5, fontWeight: "600", color: "#1c2421" },
+  goalTitle: { fontSize: 15.5, fontWeight: "600", color: "#2a2350" },
   goalDue: {
     fontSize: 12,
     fontWeight: "600",
-    color: "#2f6f4f",
-    backgroundColor: "#eef4f0",
+    color: "#7b4bd0",
+    backgroundColor: "#f3ebfd",
     borderRadius: 8,
     paddingHorizontal: 8,
     paddingVertical: 2,
@@ -7586,18 +8054,18 @@ const styles = StyleSheet.create({
     alignItems: "center",
     justifyContent: "center",
   },
-  goalStepText: { fontSize: 18, color: "#1c2421", lineHeight: 20 },
+  goalStepText: { fontSize: 18, color: "#2a2350", lineHeight: 20 },
   goalTrack: {
     flex: 1,
     height: 8,
     borderRadius: 6,
-    backgroundColor: "#eceae3",
+    backgroundColor: "#f2e7ee",
     overflow: "hidden",
   },
-  goalFill: { height: "100%", backgroundColor: "#2f6f4f" },
+  goalFill: { height: "100%", backgroundColor: "#7b4bd0" },
   goalCount: {
     fontSize: 12.5,
-    color: "#5b6660",
+    color: "#6b6280",
     minWidth: 38,
     textAlign: "right",
   },
@@ -7607,10 +8075,10 @@ const styles = StyleSheet.create({
     borderRadius: 10,
     borderWidth: 1,
     borderStyle: "dashed",
-    borderColor: "#2f6f4f",
+    borderColor: "#7b4bd0",
     alignItems: "center",
   },
-  goalNewBtnText: { color: "#2f6f4f", fontSize: 14, fontWeight: "600" },
+  goalNewBtnText: { color: "#7b4bd0", fontSize: 14, fontWeight: "600" },
   goalBreakBtn: {
     marginTop: 10,
     marginLeft: 34,
@@ -7618,14 +8086,14 @@ const styles = StyleSheet.create({
     paddingVertical: 6,
     paddingHorizontal: 12,
     borderRadius: 8,
-    backgroundColor: "#e7efe8",
+    backgroundColor: "#f3ebfd",
   },
-  goalBreakBtnText: { color: "#2f6f4f", fontSize: 13, fontWeight: "600" },
+  goalBreakBtnText: { color: "#7b4bd0", fontSize: 13, fontWeight: "600" },
   goalTasks: { marginTop: 10, marginLeft: 34 },
   goalTasksHead: {
     fontSize: 11,
     fontWeight: "700",
-    color: "#5b6660",
+    color: "#6b6280",
     letterSpacing: 0.3,
     marginBottom: 4,
   },
@@ -7641,15 +8109,15 @@ const styles = StyleSheet.create({
     alignItems: "flex-start",
     gap: 8,
   },
-  goalTaskText: { flex: 1, fontSize: 14.5, color: "#1c2421" },
+  goalTaskText: { flex: 1, fontSize: 14.5, color: "#2a2350" },
   goalTaskHelp: {
     paddingVertical: 3,
     paddingHorizontal: 10,
     borderRadius: 999,
     borderWidth: 1,
-    borderColor: "#2f6f4f",
+    borderColor: "#7b4bd0",
   },
-  goalTaskHelpText: { color: "#2f6f4f", fontSize: 12.5, fontWeight: "600" },
+  goalTaskHelpText: { color: "#7b4bd0", fontSize: 12.5, fontWeight: "600" },
   studyToolsGrid: {
     flexDirection: "row",
     flexWrap: "wrap",
@@ -7659,24 +8127,24 @@ const styles = StyleSheet.create({
   studyToolBtn: {
     width: "48%",
     borderWidth: 1,
-    borderColor: "#2f6f4f",
+    borderColor: "#7b4bd0",
     borderRadius: 12,
     paddingVertical: 14,
     alignItems: "center",
     backgroundColor: "#fff",
   },
-  studyToolBtnText: { color: "#2f6f4f", fontSize: 15, fontWeight: "600" },
+  studyToolBtnText: { color: "#7b4bd0", fontSize: 15, fontWeight: "600" },
   nbLabel: {
     fontSize: 12.5,
     fontWeight: "800",
-    color: "#2f6f4f",
+    color: "#7b4bd0",
     textTransform: "uppercase",
     marginTop: 8,
     marginBottom: 4,
   },
   planBuildBtn: {
     borderWidth: 1,
-    borderColor: "#2f6f4f",
+    borderColor: "#7b4bd0",
     borderRadius: 12,
     paddingVertical: 14,
     paddingHorizontal: 12,
@@ -7686,27 +8154,27 @@ const styles = StyleSheet.create({
   planRebuildBtn: {
     alignSelf: "flex-start",
     borderWidth: 1,
-    borderColor: "#2f6f4f",
+    borderColor: "#7b4bd0",
     borderRadius: 10,
     paddingVertical: 8,
     paddingHorizontal: 12,
     backgroundColor: "#fff",
   },
-  planRebuildBtnText: { color: "#2f6f4f", fontSize: 13.5, fontWeight: "600" },
+  planRebuildBtnText: { color: "#7b4bd0", fontSize: 13.5, fontWeight: "600" },
   reminderRow: {
     flexDirection: "row",
     alignItems: "center",
     gap: 10,
     paddingVertical: 8,
     borderTopWidth: 1,
-    borderTopColor: "#eceae3",
+    borderTopColor: "#f2e7ee",
   },
   reminderCheck: {
     width: 22,
     height: 22,
     borderRadius: 6,
     borderWidth: 1.5,
-    borderColor: "#2f6f4f",
+    borderColor: "#7b4bd0",
     backgroundColor: "#fff",
   },
   reminderTap: {
@@ -7715,8 +8183,8 @@ const styles = StyleSheet.create({
     alignItems: "center",
     gap: 10,
   },
-  reminderText: { flex: 1, fontSize: 14, color: "#1c2421" },
-  reminderChevron: { color: "#9aa39d", fontSize: 18 },
+  reminderText: { flex: 1, fontSize: 14, color: "#2a2350" },
+  reminderChevron: { color: "#9b93b3", fontSize: 18 },
   addClassRow: {
     flexDirection: "row",
     alignItems: "center",
@@ -7724,12 +8192,12 @@ const styles = StyleSheet.create({
     gap: 10,
     paddingHorizontal: 2,
   },
-  addClassLabel: { fontSize: 13.5, color: "#5b6660", flexShrink: 1 },
+  addClassLabel: { fontSize: 13.5, color: "#6b6280", flexShrink: 1 },
   addClassPlus: {
     width: 34,
     height: 34,
     borderRadius: 17,
-    backgroundColor: "#2f6f4f",
+    backgroundColor: "#7b4bd0",
     alignItems: "center",
     justifyContent: "center",
   },
@@ -7737,7 +8205,7 @@ const styles = StyleSheet.create({
   classSurveyLabel: {
     fontSize: 13.5,
     fontWeight: "600",
-    color: "#1c2421",
+    color: "#2a2350",
     marginTop: 10,
     marginBottom: 4,
   },
@@ -7749,12 +8217,12 @@ const styles = StyleSheet.create({
   },
   classSurveyCancel: {
     borderWidth: 1,
-    borderColor: "#d9ddd8",
+    borderColor: "#efe4f0",
     borderRadius: 10,
     paddingHorizontal: 16,
     justifyContent: "center",
   },
-  classSurveyCancelText: { color: "#5b6660", fontSize: 15, fontWeight: "600" },
+  classSurveyCancelText: { color: "#6b6280", fontSize: 15, fontWeight: "600" },
   composer: {
     flexDirection: "row",
     alignItems: "flex-end",
@@ -7762,8 +8230,8 @@ const styles = StyleSheet.create({
     padding: 12,
     paddingBottom: 28,
     borderTopWidth: 1,
-    borderTopColor: "#d9ddd8",
-    backgroundColor: "#f7f5f0",
+    borderTopColor: "#efe4f0",
+    backgroundColor: "#fdf4f2",
   },
   input: {
     flex: 1,
@@ -7772,12 +8240,12 @@ const styles = StyleSheet.create({
     backgroundColor: "#fff",
     borderRadius: 14,
     borderWidth: 1,
-    borderColor: "#d9ddd8",
+    borderColor: "#efe4f0",
     paddingHorizontal: 14,
     paddingVertical: 10,
   },
   sendBtn: {
-    backgroundColor: "#2f6f4f",
+    backgroundColor: "#7b4bd0",
     borderRadius: 14,
     paddingHorizontal: 20,
     paddingVertical: 14,

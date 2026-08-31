@@ -8,6 +8,9 @@
     "apps/*"
   ],
   "scripts": {
+    "dev": "npm --workspace @eliora/web run dev",
+    "build": "npm --workspace @eliora/web run build",
+    "start": "npm --workspace @eliora/web run start",
     "web": "npm --workspace @eliora/web run dev",
     "mobile": "npm --workspace @eliora/mobile run start"
   },

@@ -64,6 +64,19 @@ export const { handlers, auth, signIn, signOut } = NextAuth({
         },
       },
     }),
+    // One-click demo from the landing page's Demo tab. No password: authorize
+    // always returns the same fixed identity, and since app data is namespaced
+    // by email, every demo visitor lands in the same shared demo workspace.
+    Credentials({
+      id: "demo",
+      name: "Demo",
+      credentials: {},
+      authorize: async () => ({
+        id: "demo@eliora.app",
+        email: "demo@eliora.app",
+        name: "Demo Student",
+      }),
+    }),
     Credentials({
       name: "Email",
       credentials: {

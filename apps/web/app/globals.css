@@ -16,23 +16,29 @@
 
 :root {
   /* ---- App / brand semantic tokens ---- */
-  --bg: #f6f4ee;
+  /* Palette lifted from the logo: blush-cream paper, a violet→pink wordmark
+     gradient, deep indigo ink, and the lightbulb's gold as the warm accent. */
+  --bg: #fdf4f2;              /* the logo's blush paper */
   --surface: #ffffff;
-  --elevated: #fbfaf6;        /* popovers / dropdowns / active drawer */
-  --text: #1b2421;
-  --accent: #2c6b4c;          /* brand green (AA on white) */
-  --accent-hover: #255b40;
-  --accent-soft: #e7efe8;     /* active nav, soft badges, tints */
-  --muted: #566560;           /* secondary text (AA) */
-  --border: #dfe2dc;
-  --border-strong: #c7cdc5;
-  --success: #2c6b4c;
-  --warning: #9a6a16;
-  --warning-soft: #fff5e3;
-  --user-bubble: #2c6b4c;
+  --elevated: #fdf6fb;        /* popovers / dropdowns / active drawer */
+  --text: #2a2350;            /* logo's indigo ink */
+  --accent: #7b4bd0;          /* brand violet (AA on white) */
+  --accent-hover: #6a3bbd;
+  --accent-2: #e857a0;        /* the pink half of the wordmark gradient */
+  --accent-soft: #f3ebfd;     /* active nav, soft badges, tints */
+  --muted: #6b6280;           /* secondary text (AA) */
+  --border: #efe4f0;
+  --border-strong: #d8c8e2;
+  --success: #2e8f68;
+  --warning: #a9700c;         /* bulb gold, darkened to AA for text */
+  --warning-soft: #fdf3dd;
+  --user-bubble: #7b4bd0;
   --user-text: #ffffff;
-  --assistant-bubble: #eef1ee;
-  --assistant-text: #1b2421;
+  --assistant-bubble: #f5eefb;
+  --assistant-text: #2a2350;
+  /* The wordmark / hero gradient, straight off the logo lettering. */
+  --brand-gradient: linear-gradient(95deg, #8b5cd6 0%, #b95fc4 45%, #f0619f 100%);
+  --bulb: #f7c14b;            /* the lightbulb gold, used at full strength */
 
   /* ---- shadcn/ui tokens (mapped to the theme) ---- */
   --background: var(--bg);
@@ -43,34 +49,39 @@
   --popover-foreground: var(--text);
   --primary: var(--accent);
   --primary-foreground: #ffffff;
-  --secondary: #eef1ee;
+  --secondary: #f5eefb;
   --secondary-foreground: var(--text);
   --muted-foreground: var(--muted);
   --accent-foreground: var(--text);
   --destructive: #b3261e;
   --input: var(--border-strong);
   --ring: var(--accent);
-  --radius: 0.875rem;
+  --radius: 1rem;
 }
 
 .dark {
-  --bg: #101513;
-  --surface: #19201d;
-  --elevated: #212a26;
-  --text: #e6ece8;
-  --accent: #74cf9b;          /* light green for dark contrast */
-  --accent-hover: #86d8a8;
-  --accent-soft: #1c2c24;
-  --muted: #9eaaa3;
-  --border: #2a332e;
-  --border-strong: #3a463f;
-  --success: #74cf9b;
-  --warning: #e0b25a;
-  --warning-soft: #2a2113;
-  --user-bubble: #2c6b4c;
+  /* Night version of the same brand: the indigo ink becomes the paper, and the
+     violet/pink lift to the light end so they still read against it. */
+  --bg: #15101f;
+  --surface: #1d1730;
+  --elevated: #271f3d;
+  --text: #ece7f7;
+  --accent: #c4a2ff;          /* light lavender for dark contrast */
+  --accent-hover: #d4baff;
+  --accent-2: #ff8ec0;
+  --accent-soft: #2a2140;
+  --muted: #a79ec0;
+  --border: #2e2647;
+  --border-strong: #453a63;
+  --success: #6ed3a5;
+  --warning: #f0c470;
+  --warning-soft: #2c2213;
+  --user-bubble: #6d43bd;
   --user-text: #ffffff;
-  --assistant-bubble: #232b2e;
-  --assistant-text: #e6ece8;
+  --assistant-bubble: #262038;
+  --assistant-text: #ece7f7;
+  --brand-gradient: linear-gradient(95deg, #b79bff 0%, #d78ce0 45%, #ff8ec0 100%);
+  --bulb: #f7c14b;
 
   --background: var(--bg);
   --foreground: var(--text);
@@ -79,8 +90,8 @@
   --popover: var(--elevated);
   --popover-foreground: var(--text);
   --primary: var(--accent);
-  --primary-foreground: #0b1410;
-  --secondary: #232b2e;
+  --primary-foreground: #1a1029;
+  --secondary: #262038;
   --secondary-foreground: var(--text);
   --muted-foreground: var(--muted);
   --accent-foreground: var(--text);
@@ -92,6 +103,8 @@
 /* ---- Extra themes (set via data-theme on <html>) ---- */
 /* Neon: dark base + bright glow accent (also gets the .dark class). */
 [data-theme="neon"] {
+  --brand-gradient: linear-gradient(95deg, var(--accent), var(--accent-2));
+  --accent-2: #4dd8ff;
   --bg: #0a0b12;
   --surface: #12131f;
   --elevated: #1a1c2e;
@@ -114,6 +127,8 @@
 }
 /* Pastel: soft, airy light theme with a lavender accent. */
 [data-theme="pastel"] {
+  --brand-gradient: linear-gradient(95deg, var(--accent), var(--accent-2));
+  --accent-2: #e08ad0;
   --bg: #fdf4fb;
   --surface: #ffffff;
   --elevated: #fdf0f7;
@@ -134,6 +149,8 @@
 }
 /* Minimalist: clean monochrome, near-black accent. */
 [data-theme="minimalist"] {
+  --brand-gradient: linear-gradient(95deg, var(--accent), var(--accent-2));
+  --accent-2: #3d3d3d;
   --bg: #ffffff;
   --surface: #ffffff;
   --elevated: #fafafa;
@@ -154,6 +171,8 @@
 }
 /* Anime: vibrant, playful purple/pink pop on a soft sky base. */
 [data-theme="anime"] {
+  --brand-gradient: linear-gradient(95deg, var(--accent), var(--accent-2));
+  --accent-2: #ff5c8a;
   --bg: #f2f5ff;
   --surface: #ffffff;
   --elevated: #f3f0ff;
@@ -175,7 +194,7 @@
 
 /* Expose the theme to Tailwind / shadcn utilities. shadcn's own
    --accent / --muted are intentionally remapped to soft tints so
-   they don't fight the brand green that inline styles use. */
+   they don't fight the brand violet that inline styles use. */
 @theme inline {
   --color-background: var(--background);
   --color-foreground: var(--foreground);
@@ -214,11 +233,13 @@
   --text-h3: 1.15rem;
   --text-body-lg: 1.0625rem;
 
-  /* elevation */
-  --shadow-e1: 0 1px 2px rgba(20, 30, 25, 0.04),
-    0 1px 3px rgba(20, 30, 25, 0.06);
-  --shadow-e2: 0 4px 12px rgba(20, 30, 25, 0.08);
-  --shadow-e3: 0 12px 32px rgba(20, 30, 25, 0.14);
+  /* elevation — softer, wider falloff so cards float instead of stamping */
+  --shadow-e1: 0 1px 2px rgba(52, 30, 72, 0.05),
+    0 2px 6px -2px rgba(52, 30, 72, 0.06);
+  --shadow-e2: 0 2px 4px rgba(52, 30, 72, 0.04),
+    0 8px 20px -6px rgba(52, 30, 72, 0.12);
+  --shadow-e3: 0 4px 8px rgba(52, 30, 72, 0.05),
+    0 20px 48px -12px rgba(52, 30, 72, 0.2);
 
   --font-sans: "Atkinson Hyperlegible", -apple-system, BlinkMacSystemFont,
     "Segoe UI", Roboto, sans-serif;
@@ -236,23 +257,86 @@ body {
   height: 100%;
 }
 
-/* Paint the page background on <html> too — the browser propagates the
-   root element's background across the ENTIRE window canvas, so there's
-   never a black/blank gap below short content regardless of viewport
-   quirks. (The dark class lives on <html>, so this follows the theme.) */
+/* The page background lives on <html>, not <body> — the browser propagates the
+   root element's background across the ENTIRE window canvas, so there's never a
+   black/blank gap below short content regardless of viewport quirks. Putting the
+   washes here matters too: `background-attachment: fixed` still clips to the
+   element's own box, so on <body> they'd cut off at the end of the content and
+   leave a visible seam. (The dark class lives on <html>, so this follows the
+   theme.)
+
+   Three soft washes over the paper base, echoing the logo: the violet arc on the
+   left, its pink half on the right, and the lightbulb's gold glow up the middle.
+   Enough to keep large empty areas from reading as flat, not enough to tint
+   content. */
 html {
-  background: var(--bg);
+  background-color: var(--bg);
+  background-image:
+    radial-gradient(
+      1200px 800px at 6% -20%,
+      color-mix(in srgb, var(--accent) 7%, transparent),
+      transparent 70%
+    ),
+    radial-gradient(
+      900px 640px at 96% -10%,
+      color-mix(in srgb, var(--accent-2) 6%, transparent),
+      transparent 66%
+    ),
+    radial-gradient(
+      700px 520px at 50% -14%,
+      color-mix(in srgb, var(--bulb) 9%, transparent),
+      transparent 62%
+    );
+  background-attachment: fixed;
+  background-repeat: no-repeat;
 }
 
 body {
   min-height: 100vh;
-  background: var(--bg);
+  background: transparent;
   color: var(--text);
   font-family: var(--font-sans);
   font-size: clamp(17px, 0.45vw + 16px, 19px);
   line-height: 1.6;
+  letter-spacing: -0.005em;
   -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  text-rendering: optimizeLegibility;
   transition: background-color 0.2s ease, color 0.2s ease;
+}
+
+/* Display headings get the serif's tighter optical fit. */
+h1,
+h2,
+h3 {
+  letter-spacing: -0.015em;
+}
+
+::selection {
+  background: color-mix(in srgb, var(--accent) 22%, transparent);
+}
+
+/* Slim, themed scrollbars — the default chrome bars break the palette. */
+* {
+  scrollbar-width: thin;
+  scrollbar-color: var(--border-strong) transparent;
+}
+*::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+*::-webkit-scrollbar-track {
+  background: transparent;
+}
+*::-webkit-scrollbar-thumb {
+  background: color-mix(in srgb, var(--muted) 28%, transparent);
+  border: 3px solid transparent;
+  background-clip: content-box;
+  border-radius: 999px;
+}
+*::-webkit-scrollbar-thumb:hover {
+  background: color-mix(in srgb, var(--muted) 48%, transparent);
+  background-clip: content-box;
 }
 
 /* Dark mode uses deeper shadows so elevation still reads. */
@@ -304,13 +388,13 @@ button {
 
 @keyframes orbListen {
   0% {
-    box-shadow: 0 0 0 0 rgba(44, 107, 76, 0.4);
+    box-shadow: 0 0 0 0 color-mix(in srgb, var(--accent) 45%, transparent);
   }
   70% {
-    box-shadow: 0 0 0 24px rgba(44, 107, 76, 0);
+    box-shadow: 0 0 0 24px color-mix(in srgb, var(--accent) 0%, transparent);
   }
   100% {
-    box-shadow: 0 0 0 0 rgba(44, 107, 76, 0);
+    box-shadow: 0 0 0 0 color-mix(in srgb, var(--accent) 0%, transparent);
   }
 }
 
@@ -357,10 +441,10 @@ body.a11y-contrast {
   --bg: #ffffff;
   --surface: #ffffff;
   --text: #000000;
-  --accent: #0a5c3b;
+  --accent: #4a1d8f;
   --muted: #2b2b2b;
   --border: #000000;
-  --user-bubble: #0a3d2a;
+  --user-bubble: #3b1573;
   --user-text: #ffffff;
   --assistant-bubble: #e6e6e6;
   --assistant-text: #000000;
@@ -410,6 +494,19 @@ body.a11y-reduce-motion *::after {
     transform: none;
     box-shadow: none;
   }
+  /* …except in full-screen (AI tutor) mode, where the rail folds back into a
+     drawer and its ☰ returns, so the session has the whole window. */
+  .eliora-shell.immersive .eliora-side-toggle {
+    display: flex;
+  }
+  .eliora-shell.immersive .eliora-sidebar {
+    position: fixed;
+    transform: translateX(-100%);
+    box-shadow: var(--shadow-e3);
+  }
+  .eliora-shell.immersive .eliora-sidebar.open {
+    transform: none;
+  }
 }
 
 /* Home quick-action cards: 2 columns, stack to 1 on narrow screens. */
@@ -444,4 +541,208 @@ body.a11y-reduce-motion *::after {
   outline: none;
   border-color: var(--accent);
   box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 25%, transparent);
+}
+
+/* ============================================================
+   Sidebar navigation
+   ============================================================ */
+
+/* Nav rows: a quiet tint on hover, and an accent bar + soft wash when
+   active, so the current tab reads at a glance instead of by weight alone. */
+.eliora-nav-item {
+  position: relative;
+  transition: background-color 0.15s ease, color 0.15s ease;
+}
+.eliora-nav-item:hover {
+  background: color-mix(in srgb, var(--accent) 7%, transparent);
+}
+.eliora-nav-item:focus-visible {
+  outline: 2px solid var(--ring);
+  outline-offset: -2px;
+}
+.eliora-nav-item[aria-current="page"]::before {
+  content: "";
+  position: absolute;
+  left: 0;
+  top: 50%;
+  translate: 0 -50%;
+  width: 3px;
+  height: 18px;
+  border-radius: 0 3px 3px 0;
+  background: var(--accent);
+}
+/* The emoji glyph sits in its own tile so the labels align on a grid. */
+.eliora-nav-ico {
+  width: 26px;
+  flex-shrink: 0;
+  display: inline-grid;
+  place-items: center;
+  font-size: 15px;
+  line-height: 1;
+}
+
+/* Chat rows in the sidebar list. */
+.eliora-side-chat:hover {
+  background: color-mix(in srgb, var(--accent) 6%, transparent);
+}
+
+/* ============================================================
+   Motion & micro-interactions
+   ============================================================ */
+
+/* Buttons settle rather than snap. Scoped to the app's own controls so it
+   doesn't fight shadcn's own transitions. */
+button {
+  transition: background-color 0.15s ease, border-color 0.15s ease,
+    color 0.15s ease, box-shadow 0.15s ease, transform 0.12s ease;
+}
+button:not(:disabled):active {
+  transform: translateY(1px);
+}
+
+/* Chat bubbles ease in as they arrive. */
+@media (prefers-reduced-motion: no-preference) {
+  .eliora-bubble {
+    animation: bubbleIn 220ms cubic-bezier(0.22, 1, 0.36, 1);
+  }
+}
+@keyframes bubbleIn {
+  from {
+    opacity: 0;
+    transform: translateY(8px) scale(0.985);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+
+/* Composer lifts slightly while focused. */
+.eliora-composer:focus-within {
+  border-top-color: color-mix(in srgb, var(--accent) 35%, var(--border));
+}
+
+/* Notes workspace: the written-up notes read as a document on the left, with
+   the chat about them docked alongside. Below tablet width there's no room for
+   two columns, so the chat drops underneath the notes and stops sticking. */
+.eliora-note-ws {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 380px;
+  gap: 16px;
+  align-items: start;
+}
+.eliora-note-chat {
+  position: sticky;
+  top: 12px;
+}
+@media (max-width: 900px) {
+  .eliora-note-ws {
+    grid-template-columns: minmax(0, 1fr);
+  }
+  .eliora-note-chat {
+    position: static;
+  }
+}
+
+/* Narrow screens can't fit the textarea plus four controls on one row — it
+   squeezed the message field down to a couple of characters. Give the field
+   its own row and let the buttons sit underneath it. */
+@media (max-width: 620px) {
+  .eliora-composer {
+    flex-wrap: wrap;
+  }
+  /* !important: the textarea carries an inline `flex: 1`, which would
+     otherwise pin its basis to 0 and keep it on the buttons' row. */
+  .eliora-composer > textarea {
+    order: -1;
+    flex: 1 0 100% !important;
+  }
+}
+
+/* ============================================================
+   Brand lockup
+   ------------------------------------------------------------
+   The wordmark is the logo's violet→pink lettering, so it's a
+   gradient clipped to the text rather than a flat colour. The
+   mark beside it is the bulb-over-book, drawn as SVG so it stays
+   crisp at nav size. Both follow --brand-gradient, which each
+   alternate theme redefines from its own accents.
+   ============================================================ */
+
+.eliora-wordmark {
+  background: var(--brand-gradient);
+  -webkit-background-clip: text;
+  background-clip: text;
+  color: transparent;
+  /* Safari drops the clip if the text is also given a colour; the fallback
+     below only applies where background-clip:text isn't supported. */
+  -webkit-text-fill-color: transparent;
+}
+@supports not ((background-clip: text) or (-webkit-background-clip: text)) {
+  .eliora-wordmark {
+    color: var(--accent);
+    -webkit-text-fill-color: currentColor;
+  }
+}
+
+/* The mark's filament glow — a soft gold halo, matching the logo's rays. */
+.eliora-mark {
+  flex-shrink: 0;
+  filter: drop-shadow(0 1px 5px color-mix(in srgb, var(--bulb) 45%, transparent));
+}
+
+/* The full lockup: mark, wordmark, and (optionally) the tagline underneath. */
+.eliora-lockup {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+.eliora-tagline {
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  color: var(--muted);
+}
+
+/* ============================================================
+   Landing feature slides
+   ------------------------------------------------------------
+   The signed-out feature demos ride in a horizontal scroll-snap
+   strip: one slide at a time, native swipe on touch, arrows and
+   dots for pointers. Widths live here rather than inline so the
+   slide can narrow on small screens.
+   ============================================================ */
+
+.eliora-slides {
+  display: flex;
+  gap: 18px;
+  overflow-x: auto;
+  overflow-y: hidden;
+  scroll-snap-type: x mandatory;
+  scroll-behavior: smooth;
+  /* Room for the card's focus ring and shadow inside the scroller. */
+  padding: 4px;
+  /* Peek: the neighbouring slide's edge hints that the strip scrolls. */
+  scroll-padding-inline: 4px;
+  scrollbar-width: none;
+}
+.eliora-slides::-webkit-scrollbar {
+  display: none;
+}
+@media (prefers-reduced-motion: reduce) {
+  .eliora-slides {
+    scroll-behavior: auto;
+  }
+}
+
+.eliora-slide {
+  flex: 0 0 min(420px, 82%);
+  scroll-snap-align: center;
+  scroll-snap-stop: always;
+  /* Cards stretch so every slide is the same height as the tallest. */
+  display: flex;
+}
+.eliora-slide > * {
+  flex: 1;
 }

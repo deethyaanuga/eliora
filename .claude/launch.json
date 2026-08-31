@@ -9,6 +9,12 @@
       "autoPort": true
     },
     {
+      "name": "signup demo (static)",
+      "runtimeExecutable": "/bin/zsh",
+      "runtimeArgs": ["-c", "cd /Users/deethyaanuga/eliora/demos/signup && exec python3 -m http.server 4321"],
+      "port": 4321
+    },
+    {
       "name": "mobile (Expo)",
       "runtimeExecutable": "/bin/zsh",
       "runtimeArgs": ["-c", "export PATH=\"/opt/homebrew/bin:$PATH\"; exec npm run mobile"],

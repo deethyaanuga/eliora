@@ -3,8 +3,8 @@ import path from "path";
 import crypto from "crypto";
 import type { StudentExample } from "@eliora/shared";
 
-// Where anonymized peer examples live. Like lib/rooms.ts and lib/users.ts, this
-// is a local JSON file matching Eliora's no-database setup — NOT meant for
+// Where anonymized peer examples live. Like lib/folders.ts and lib/users.ts,
+// this is a local JSON file matching Eliora's no-database setup — NOT meant for
 // production scale; a real cross-user deployment should move this to a shared
 // datastore. Eliora searches this bank (find_student_examples) to show the
 // learner how OTHER students worked through a similar problem, and appends to it

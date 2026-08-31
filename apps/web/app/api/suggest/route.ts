@@ -5,10 +5,12 @@ import {
   daySchedulePrompt,
   dateSuggestionsPrompt,
   focusSuggestionsPrompt,
+  studySessionPrompt,
   todoSuggestionsPrompt,
   toolSuggestionsPrompt,
   weekPlanPrompt,
   type LearnerProfile,
+  type StudyMaterial,
 } from "@eliora/shared";
 
 // A family of AI "suggestion" helpers behind one route, chosen by `kind`:
@@ -19,13 +21,33 @@ import {
 //   "todos"    → { suggestions: [{title, subject, due}] }   (prep to-dos)
 //   "tools"    → { suggestions: [{type, topic, why}] }      (flashcards/quizzes)
 //   "focus"    → { suggestions: [{topic, why, subject}] }   (what to study next)
+//   "session"  → { steps: [{title, minutes, kind, from, how}] } (one sit-down session
+//                                                    over their material + mistakes)
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 
-type Kind = "daily" | "schedule" | "week" | "dates" | "todos" | "tools" | "focus";
+type Kind =
+  | "daily"
+  | "schedule"
+  | "week"
+  | "dates"
+  | "todos"
+  | "tools"
+  | "focus"
+  | "session";
 type EventLike = { title?: string; date?: string; kind?: string };
 type GoalLike = { specific?: string; statement?: string; timeBound?: string };
 type AsgLike = { title?: string; subject?: string; due?: string };
+// A logged mistake, as the client stores it (page.tsx `Mistake`). Only the parts
+// worth spending prompt tokens on.
+type MistakeLike = {
+  concept?: string;
+  subject?: string;
+  why?: string;
+  fix?: string;
+  count?: number;
+  resolved?: boolean;
+};
 
 type SuggestRequest = {
   kind?: Kind;
@@ -39,8 +61,12 @@ type SuggestRequest = {
   tasks?: string[]; // today's open daily tasks (~10–20 min each), in priority order
   homeHour?: number; // hour (24h) the learner gets home / is free to study
   budgetMin?: number; // scheduled study minutes today — cap for the tasks' estMin total
+  needMin?: number; // minutes today's open tasks add up to — how much the day must hold
   focusNote?: string; // free-form "what today's schedule should prioritize" (from the setup survey)
   missed?: string[];
+  mistakes?: MistakeLike[]; // logged mistakes (concept + misconception + fix)
+  materials?: StudyMaterial[]; // the PDFs / pasted material they've uploaded
+  sessionMin?: number; // how long the study session should run (kind "session")
   existing?: string[];
   profile?: LearnerProfile;
 };
@@ -69,8 +95,13 @@ const TOOLS: Record<Kind, OpenAI.Chat.Completions.ChatCompletionTool> = {
                   enum: ["study", "break", "class", "other"],
                 },
                 text: { type: "string" },
+                min: {
+                  type: "integer",
+                  description:
+                    "How many minutes of actual work this block holds — the sum of its tasks' estimates. Multiple of 5, 5–60. Size it by the work, not by the hour.",
+                },
               },
-              required: ["hour", "text"],
+              required: ["hour", "text", "min"],
             },
           },
         },
@@ -250,6 +281,50 @@ const TOOLS: Record<Kind, OpenAI.Chat.Completions.ChatCompletionTool> = {
       },
     },
   },
+  session: {
+    type: "function",
+    function: {
+      name: "plan_study_session",
+      description:
+        "Return one ordered study session built from the learner's uploaded material and logged mistakes.",
+      parameters: {
+        type: "object",
+        properties: {
+          steps: {
+            type: "array",
+            items: {
+              type: "object",
+              properties: {
+                title: {
+                  type: "string",
+                  description: "Short name for the step, e.g. \"Redo: mole ratios\".",
+                },
+                minutes: {
+                  type: "integer",
+                  description: "Minutes for this step — multiple of 5, 5–30.",
+                },
+                kind: {
+                  type: "string",
+                  enum: ["read", "redo", "practice", "recap"],
+                },
+                from: {
+                  type: "string",
+                  description:
+                    "What this step is anchored to: the material title + section, or the exact mistake/weak topic. Must come from what the learner provided.",
+                },
+                how: {
+                  type: "string",
+                  description: "One line telling them exactly what to do.",
+                },
+              },
+              required: ["title", "minutes", "kind"],
+            },
+          },
+        },
+        required: ["steps"],
+      },
+    },
+  },
 };
 
 const TOOL_NAMES: Record<Kind, string> = {
@@ -260,6 +335,7 @@ const TOOL_NAMES: Record<Kind, string> = {
   todos: "suggest_todos",
   tools: "suggest_tools",
   focus: "suggest_focus",
+  session: "plan_study_session",
 };
 
 const PROMPTS: Record<Kind, (p?: LearnerProfile) => string> = {
@@ -270,6 +346,7 @@ const PROMPTS: Record<Kind, (p?: LearnerProfile) => string> = {
   todos: todoSuggestionsPrompt,
   tools: toolSuggestionsPrompt,
   focus: focusSuggestionsPrompt,
+  session: studySessionPrompt,
 };
 
 const str = (v: unknown) =>
@@ -328,6 +405,43 @@ export async function POST(req: Request) {
       ? Math.min(720, Math.round(body.budgetMin))
       : undefined;
 
+  // Total minutes today's open tasks need — what the schedule has to hold.
+  const needMin =
+    typeof body.needMin === "number" && body.needMin >= 5
+      ? Math.min(720, Math.round(body.needMin))
+      : undefined;
+
+  // How long the study session should run (kind "session").
+  const sessionMin =
+    typeof body.sessionMin === "number" && body.sessionMin >= 10
+      ? Math.min(180, Math.round(body.sessionMin))
+      : undefined;
+
+  const materials = (body.materials ?? [])
+    .filter((m) => str(m?.title))
+    .slice(0, 5)
+    .map((m) => {
+      const sections = (Array.isArray(m.topics) ? m.topics : [])
+        .map((t) => str(t?.title))
+        .filter(Boolean)
+        .slice(0, 12);
+      return `- ${m.title!.trim()}${
+        str(m.overview) ? ` — ${m.overview!.trim()}` : ""
+      }${sections.length ? ` (sections: ${sections.join("; ")})` : ""}`;
+    });
+
+  const mistakes = (body.mistakes ?? [])
+    .filter((m) => str(m?.concept) && !m.resolved)
+    .slice(0, 10)
+    .map(
+      (m) =>
+        `- ${m.concept!.trim()}${str(m.subject) ? ` (${m.subject!.trim()})` : ""}${
+          str(m.why) ? ` — why it went wrong: ${m.why!.trim()}` : ""
+        }${str(m.fix) ? ` — the fix: ${m.fix!.trim()}` : ""}${
+          typeof m.count === "number" && m.count > 1 ? ` (×${m.count})` : ""
+        }`,
+    );
+
   const detail = [
     `Today is ${today}.`,
     homeHour != null
@@ -335,6 +449,13 @@ export async function POST(req: Request) {
       : "",
     budgetMin != null
       ? `Scheduled study time today: ${budgetMin} minutes (from their schedule). Size the tasks so their estMin together come close to this but never exceed it.`
+      : "",
+    needMin != null
+      ? `Today's open tasks need ${needMin} minutes of work in total. Give the day exactly that much study time — no more (don't pad blocks to fill the clock), no less (don't drop work).${
+          budgetMin != null && needMin > budgetMin
+            ? ` That is more than their ${budgetMin}-minute budget, so schedule the highest-priority tasks first and say in the last block's text what is being pushed to tomorrow.`
+            : ""
+        }`
       : "",
     str(body.focusNote)
       ? `What the learner wants today's schedule to PRIORITIZE (from their setup survey): ${body.focusNote!.trim()}. Weight the study blocks toward this.`
@@ -360,6 +481,15 @@ export async function POST(req: Request) {
       ? `Current assignments:\n${assignments.map((a) => `- ${a}`).join("\n")}`
       : "",
     missed.length ? `Weak topics (got wrong): ${missed.join("; ")}` : "",
+    kind === "session" && sessionMin != null
+      ? `Session length: ${sessionMin} minutes. The steps' minutes must add up to this and never exceed it.`
+      : "",
+    kind === "session" && materials.length
+      ? `Their uploaded material — anchor steps to these:\n${materials.join("\n")}`
+      : "",
+    kind === "session" && mistakes.length
+      ? `Their logged mistakes — at least one step should redo one:\n${mistakes.join("\n")}`
+      : "",
     existing.length ? `Already have (don't repeat): ${existing.join("; ")}` : "",
   ]
     .filter(Boolean)
@@ -389,14 +519,27 @@ export async function POST(req: Request) {
     if (kind === "schedule") {
       const seen = new Set<number>();
       const blocks = (Array.isArray(args.blocks) ? args.blocks : [])
-        .map((b: { hour?: unknown; kind?: unknown; text?: unknown }) => ({
-          hour:
-            typeof b?.hour === "number" ? Math.round(b.hour) : Number(b?.hour),
-          kind: ["study", "break", "class", "other"].includes(b?.kind as string)
-            ? (b!.kind as string)
-            : "study",
-          text: str(b?.text) ?? "",
-        }))
+        .map(
+          (b: { hour?: unknown; kind?: unknown; text?: unknown; min?: unknown }) => {
+            const m = typeof b?.min === "number" ? b.min : Number(b?.min);
+            return {
+              hour:
+                typeof b?.hour === "number"
+                  ? Math.round(b.hour)
+                  : Number(b?.hour),
+              kind: ["study", "break", "class", "other"].includes(
+                b?.kind as string,
+              )
+                ? (b!.kind as string)
+                : "study",
+              text: str(b?.text) ?? "",
+              min:
+                Number.isFinite(m) && m > 0
+                  ? Math.min(60, Math.max(5, Math.round(m)))
+                  : undefined,
+            };
+          },
+        )
         .filter(
           (b: { hour: number; text: string }) =>
             Number.isInteger(b.hour) &&
@@ -475,6 +618,41 @@ export async function POST(req: Request) {
         }));
       return items.length
         ? Response.json({ items })
+        : Response.json({ error: "none" }, { status: 200 });
+    }
+
+    if (kind === "session") {
+      const steps = (Array.isArray(args.steps) ? args.steps : [])
+        .filter((s: { title?: unknown }) => str(s?.title))
+        .slice(0, 6)
+        .map(
+          (s: {
+            title?: unknown;
+            minutes?: unknown;
+            kind?: unknown;
+            from?: unknown;
+            how?: unknown;
+          }) => {
+            const m =
+              typeof s.minutes === "number" ? s.minutes : Number(s.minutes);
+            return {
+              title: String(s.title).trim(),
+              minutes:
+                Number.isFinite(m) && m > 0
+                  ? Math.min(30, Math.max(5, Math.round(m / 5) * 5))
+                  : 10,
+              kind: ["read", "redo", "practice", "recap"].includes(
+                s.kind as string,
+              )
+                ? (s.kind as string)
+                : "practice",
+              from: str(s.from),
+              how: str(s.how),
+            };
+          },
+        );
+      return steps.length
+        ? Response.json({ steps })
         : Response.json({ error: "none" }, { status: 200 });
     }
 

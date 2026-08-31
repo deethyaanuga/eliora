@@ -9,20 +9,27 @@ import {
   voteOnDoubt,
   type DoubtFeed,
 } from "@/lib/doubts";
-import { DOUBT_GLOBAL_SCOPE, isValidGroupCode } from "@eliora/shared";
+import { answerDoubtAsEliora } from "@/lib/elioraAnswer";
+import {
+  DOUBT_GLOBAL_SCOPE,
+  isValidGroupCode,
+  normalizeDoubtKind,
+} from "@eliora/shared";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 
 // The doubts board: ask a question with your working shown, answer other
-// people's, vote, and mark what actually helped. Every doubt lives either in
-// the global feed or inside a private group identified by a join code.
+// people's, vote, and mark what actually helped — or post a problem you already
+// cracked (kind: "solved") so the next person hitting it finds the fix. Every
+// post lives either in the global feed or inside a private group identified by
+// a join code.
 //
 // GET  /api/doubts?scope=global|CODE                       -> { feed }
 // POST /api/doubts                                          -> { feed } | { group }
 //   { action: "create-group", name, memberId, memberName }
 //   { action: "join-group",   code, memberId, memberName }
-//   { action: "ask",     scope, memberId, memberName, title, body, subject?, work? }
+//   { action: "ask",     scope, memberId, memberName, title, body, kind?, subject?, work? }
 //   { action: "reply",   scope, memberId, memberName, doubtId, parentId?, text, work? }
 //   { action: "vote",    scope, memberId, doubtId, replyId?, value: 1 | -1 }
 //   { action: "accept",  scope, memberId, doubtId, replyId }
@@ -59,6 +66,7 @@ export async function POST(req: Request) {
     doubtId?: string;
     replyId?: string;
     parentId?: string;
+    kind?: string;
     title?: string;
     subject?: string;
     text?: string;
@@ -108,23 +116,47 @@ export async function POST(req: Request) {
 
     case "ask": {
       const title = (body.title ?? "").trim();
+      const kind = normalizeDoubtKind(body.kind);
       if (!title) {
         return Response.json(
-          { error: "What's the question? Add a title." },
+          {
+            error:
+              kind === "solved"
+                ? "What was the problem? Add a title."
+                : "What's the question? Add a title.",
+          },
           { status: 400 },
         );
       }
-      return feedResponse(
-        await askDoubt({
-          scope,
-          authorId: memberId,
-          authorName: memberName,
-          title,
-          body: body.text ?? "",
-          subject: body.subject,
-          work: body.work,
-        }),
-      );
+      // A fix without the fix helps nobody — catch it here so the message is
+      // specific rather than the generic 404 a null feed would produce.
+      if (kind === "solved" && !(body.work ?? "").trim()) {
+        return Response.json(
+          { error: "Add the steps you took — that's the part people need." },
+          { status: 400 },
+        );
+      }
+      const feed = await askDoubt({
+        scope,
+        authorId: memberId,
+        authorName: memberName,
+        title,
+        kind,
+        body: body.text ?? "",
+        subject: body.subject,
+        work: body.work,
+      });
+      // Eliora answers every new question like a resident helper — a few
+      // lines plus a short worked example. Fire-and-forget: this server
+      // is a single long-lived process (see lib/doubts.ts), and clients poll
+      // the feed, so her reply appears the same way anyone else's does.
+      if (feed && kind === "question") {
+        const posted = feed.doubts[feed.doubts.length - 1];
+        if (posted?.authorId === memberId) {
+          void answerDoubtAsEliora(feed.scope, posted);
+        }
+      }
+      return feedResponse(feed);
     }
 
     case "reply": {

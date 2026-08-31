@@ -1,30 +1,103 @@
 "use client";
 
-import { useCallback, useEffect, useRef, useState, type ReactNode } from "react";
+import {
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+  type ReactNode,
+} from "react";
 import { signIn, signOut, useSession } from "next-auth/react";
+import { DISPLAY_FONT, ElioraMark, ElioraWordmark } from "@/app/ui/brand";
+import AuthLanding from "@/app/ui/auth-landing";
 import {
   buildDoubtTree,
+  countDoubtFixes,
   countDoubtHelps,
+  courseModuleText,
   doubtAgo,
+  doubtKind,
   doubtScore,
   DOUBT_BODY_MAX,
   DOUBT_GLOBAL_SCOPE,
   DOUBT_REPLY_MAX,
   DOUBT_TITLE_MAX,
   DOUBT_WORK_MAX,
+  ELIORA_BOT_ID,
   ELIORA_DEFAULT_TUTOR,
   ELIORA_TUTORS,
+  filterDoubts,
+  findSimilarDoubts,
+  HELP_MODES,
+  isLanguageSubject,
+  LANGUAGE_CHOICES,
+  lessonSlides,
+  lessonSpeakable,
   MATERIAL_MAX,
   myVote,
+  PRIORITY_DEFAULT_MIN_PER_DAY,
+  PROFILE_FOCUS_HELP,
+  PROFILE_FOCUS_TIME,
+  PROFILE_SESSION_LENGTH,
+  scheduleClock,
+  scheduleMinutes,
   sortDoubts,
+  speechFriendly,
+  speechLangTag,
   studyTipPrompt,
   tutorById,
+  tutorVoiceDirection,
+  TUTOR_LEVELS,
+  TUTOR_MODES,
+  TUTOR_SESSION_DEFAULT_MINUTES,
+  TUTOR_SESSION_LENGTHS,
+  TUTOR_SUBJECTS,
+  WEEK_DAYS,
+  WEEK_DAY_LABEL,
+  type Course,
+  type CourseModule,
   type Doubt,
+  type ElioraBrowserVoice,
+  type DraftReview,
+  type DraftReviewRequest,
+  type DayIntakeAnswers,
+  type DayIntakeReply,
+  type DayIntakeTurn,
   type DoubtGroup,
+  type DoubtKind,
   type DoubtReplyNode,
   type DoubtSort,
+  type DoubtView,
   type ElioraTutor,
+  type Lesson,
+  type LessonSize,
+  type LessonSlide,
+  type LessonVisual,
+  type LessonVisualItem,
+  type PriorityInput,
+  type PriorityLevel,
+  type PriorityPlan,
+  type RubricVerdict,
+  // Aliased: the Study tab already has its own hour-grid ScheduleBlock, which
+  // is a different thing entirely (one day, one hour per row).
+  type ScheduleBlock as WeekBlock,
+  type ScheduleBlockKind as WeekBlockKind,
+  type ScheduleReply as WeekReply,
+  type ScheduleTurn as WeekTurn,
+  type SessionBeat,
+  type SessionRecap,
   type StudyMaterial,
+  type TutorCorrection,
+  type TutorLevel,
+  type TutorMode,
+  type TutorPhase,
+  type TutorPhrase,
+  type TutorReply,
+  type TutorTrack,
+  type TutorTurn,
+  type WeekDay,
+  type WeekSchedule,
 } from "@eliora/shared";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -111,6 +184,10 @@ type Message = {
   flashcards?: Flashcard[];
   quiz?: QuizQuestion[];
   attachments?: Attachment[];
+  // A diagram Eliora drew for this answer. It arrives from the tool call, which
+  // lands BEFORE the explanation streams — so the picture is on screen while
+  // she's still talking, not tacked on at the end.
+  visual?: LessonVisual;
 };
 type Chat = {
   id: string;
@@ -553,7 +630,17 @@ type IncomingMilestone = { title: string; detail?: string; checkpoint?: boolean 
 // slot that starts at that hour) to what the learner plans to do then. Stamped
 // with the date it's for so it starts fresh each new day.
 type ScheduleKind = "study" | "break" | "class" | "other";
-type ScheduleBlock = { text: string; kind: ScheduleKind };
+// `min` is how many minutes of real work this hour holds — the block is sized by
+// what its tasks need, so a 20-min block is a short sprint and a 60-min one is a
+// full hour. It also sets the length of the block's focus countdown.
+// `auto` marks a block the time budget laid down itself — re-budgeting clears
+// those and places fresh ones, so the learner's own blocks are never touched.
+type ScheduleBlock = {
+  text: string;
+  kind: ScheduleKind;
+  min?: number;
+  auto?: boolean;
+};
 type DaySchedule = { date: string; blocks: Record<number, ScheduleBlock> };
 // The hours the schedule covers: 9:00 (9am) through the 20:00 (8–9pm) block.
 const SCHEDULE_HOURS = [9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20];
@@ -613,6 +700,58 @@ function playTimerChime(): void {
     /* audio not available — silent */
   }
 }
+
+// ── Block reminders ────────────────────────────────────────────────────────
+// When a scheduled block comes around, Eliora says so: a banner in the app, and
+// a browser notification too if the learner allowed one (so it still lands when
+// the tab is in the background).
+
+// Ask once, when reminders are switched on. Never blocks — if the learner says
+// no, or the browser has no Notification API, the in-app banner carries on alone.
+async function requestNudgePermission(): Promise<void> {
+  try {
+    if (typeof Notification === "undefined") return;
+    if (Notification.permission === "default") await Notification.requestPermission();
+  } catch {
+    /* not available — the in-app banner is enough */
+  }
+}
+
+// Fire the OS-level notification for a block, if we're allowed to.
+function sendNudgeNotification(title: string, body: string): void {
+  try {
+    if (typeof Notification === "undefined") return;
+    if (Notification.permission !== "granted") return;
+    new Notification(title, { body, tag: "eliora-block", icon: "/icon.svg" });
+  } catch {
+    /* ignore */
+  }
+}
+
+// What Eliora says when a block starts. Varied by the hour so the same line
+// doesn't repeat all evening, and matched to what the block is for.
+const NUDGE_LINES: Record<ScheduleKind, string[]> = {
+  study: [
+    "This is your block — start it before the scroll starts you.",
+    "Just this one thing for now. I'll count the minutes for you.",
+    "Timer on, phone down. You only have to begin.",
+    "Future-you already thanked you for this one.",
+  ],
+  break: [
+    "Real break. Step away from the desk — it counts.",
+    "Rest is part of the plan. Take the whole thing.",
+    "Snack, stretch, stare at a wall. Back soon.",
+  ],
+  class: ["Class time — see you after.", "You're due somewhere. Go get it."],
+  other: [
+    "This one's on today's list too.",
+    "Quick one, then it's off your plate.",
+  ],
+};
+function nudgeLine(kind: ScheduleKind, hour: number): string {
+  const lines = NUDGE_LINES[kind] ?? NUDGE_LINES.other;
+  return lines[hour % lines.length];
+}
 type EventKind =
   | "exam"
   | "final"
@@ -627,13 +766,50 @@ type StudyEvent = {
   kind?: EventKind;
   tasks?: GoalTask[]; // prep checklist broken down from the event (working back from the date)
 };
+// How urgent a piece of work is. The learner sets this, or it's inferred from a
+// real deadline — never invented. Ordered most- to least-urgent so a plain
+// index comparison sorts a list.
+type AssignmentPriority = "urgent" | "high" | "medium" | "low";
+const PRIORITIES: {
+  key: AssignmentPriority;
+  dot: string;
+  label: string;
+  color: string;
+}[] = [
+  { key: "urgent", dot: "🔴", label: "Urgent", color: "#c8442e" },
+  { key: "high", dot: "🟠", label: "High", color: "#d98a2b" },
+  { key: "medium", dot: "🟡", label: "Medium", color: "#c9a227" },
+  { key: "low", dot: "🟢", label: "Low", color: "#2f6f4f" },
+];
+const PRIORITY_META = new Map(PRIORITIES.map((p) => [p.key, p]));
+const priorityRank = (p?: AssignmentPriority) =>
+  p ? PRIORITIES.findIndex((x) => x.key === p) : PRIORITIES.length;
+// What kind of work it is. Kept as a free-ish list because school names things
+// inconsistently; these are the buckets the calendar filters by.
+const ASSIGNMENT_TYPES = [
+  "homework",
+  "essay",
+  "project",
+  "test",
+  "quiz",
+  "reading",
+  "lab",
+  "presentation",
+  "other",
+] as const;
+type AssignmentType = (typeof ASSIGNMENT_TYPES)[number];
+
 type Assignment = {
   id: string;
   title: string;
   subject?: string;
   due?: string;
+  dueTime?: string; // HH:MM, 24h — optional time of day it's due
   estMin?: number; // estimated minutes (time management)
   planDate?: string; // day the learner plans to work on it (YYYY-MM-DD)
+  priority?: AssignmentPriority;
+  type?: AssignmentType;
+  notes?: string; // anything else the learner wants to remember about it
   concern?: string; // what the learner is worried about / stuck on
   done: boolean;
 };
@@ -720,7 +896,6 @@ type SmartGoal = {
   current?: number;
   statement?: string; // AI-composed one-sentence version of the answers
   tasks?: GoalTask[]; // checklist of steps to achieve the goal
-  rewardId?: string; // a custom reward unlocked free when this goal is achieved
   done: boolean;
 };
 
@@ -825,19 +1000,13 @@ const PLANNING_OPTIONS = [
   "I mentally plan it",
   "I don't plan at all",
 ];
-const SESSION_LENGTH_OPTIONS = [
-  "Less than 30 minutes",
-  "30–60 minutes",
-  "1–2 hours",
-  "More than 2 hours",
-];
-const FOCUS_HELP_OPTIONS = [
-  "Music or background noise",
-  "Taking frequent breaks",
-  "Quiet environment",
-  "Studying with others",
-  "Timers (Pomodoro, etc.)",
-];
+// Grade / year is a number, so it's a pick-one instead of free text.
+const GRADE_YEAR_OPTIONS = ["Grade 9", "Grade 10", "Grade 11", "Grade 12"];
+// Shared with the schedule intake, which writes these same answers onto the
+// profile — the two have to agree on the exact wording or a value saved by one
+// matches nothing in the other.
+const SESSION_LENGTH_OPTIONS = [...PROFILE_SESSION_LENGTH];
+const FOCUS_HELP_OPTIONS = [...PROFILE_FOCUS_HELP];
 const USED_APP_OPTIONS = [
   "Yes, and I liked it",
   "Yes, but I didn't like it",
@@ -848,7 +1017,6 @@ const WANTED_FEATURE_OPTIONS = [
   "Automatic study schedules",
   "Reminders and notifications",
   "Progress tracking",
-  "Gamification (points, rewards)",
   "Focus timers",
 ];
 const PLAN_BLOCKER_OPTIONS = [
@@ -875,39 +1043,7 @@ const HOBBY_OPTIONS = [
   "Social media / content creation",
   "Other",
 ];
-const FOCUS_TIME_OPTIONS = [
-  "Early morning",
-  "Afternoon",
-  "Evening",
-  "Late night",
-];
-
-// Schedule-setup survey answers → the hour the learner is free and today's
-// study-minute budget. Keys are the option labels shown in the survey.
-const HOME_TIME_OPTIONS = [
-  "Right after school (~3 PM)",
-  "Late afternoon (~4–5 PM)",
-  "Early evening (~6 PM)",
-  "Later (~7 PM or after)",
-];
-const HOME_TIME_HOUR: Record<string, number> = {
-  "Right after school (~3 PM)": 15,
-  "Late afternoon (~4–5 PM)": 16,
-  "Early evening (~6 PM)": 18,
-  "Later (~7 PM or after)": 19,
-};
-const STUDY_BUDGET_OPTIONS = [
-  "About 30 minutes",
-  "About 1 hour",
-  "About 2 hours",
-  "As much as fits",
-];
-const STUDY_BUDGET_MIN: Record<string, number | undefined> = {
-  "About 30 minutes": 30,
-  "About 1 hour": 60,
-  "About 2 hours": 120,
-  "As much as fits": undefined,
-};
+const FOCUS_TIME_OPTIONS = [...PROFILE_FOCUS_TIME];
 
 // Sent when the learner taps "Build/Rebuild plan from our chat".
 const PLAN_FROM_CHAT_PROMPT =
@@ -1318,6 +1454,8 @@ const TTS_VOICES: { id: string; label: string }[] = [
   { id: "onyx", label: "Onyx · deep" },
   { id: "coral", label: "Coral · friendly" },
   { id: "sage", label: "Sage · gentle" },
+  { id: "ash", label: "Ash · steady" },
+  { id: "ballad", label: "Ballad · soft" },
 ];
 
 // Roughly how long `text` takes to say, used to cap waits on voices that never
@@ -1327,14 +1465,228 @@ function speechBudgetMs(text: string): number {
   return Math.min(120_000, 4_000 + words * 450);
 }
 
-// Robotic browser voice — the fallback when OpenAI TTS is unavailable.
+// The built-in browser voice — the fallback when OpenAI TTS is unavailable
+// (and, if your project has no speech model, the voice you actually hear).
+// Browsers ship a spread of voices ranging from 1990s-robot to genuinely
+// human; the default pick is usually the worst of them, so choose deliberately.
+const NATURAL_VOICE_HINTS = [
+  // Apple's neural voices and Chrome's network voices, best first.
+  "premium",
+  "enhanced",
+  "neural",
+  "natural",
+  "siri",
+  "google",
+];
+// Known-good named voices, best first — used when nothing advertises itself as
+// premium. (Ava/Samantha on macOS, Aria/Jenny on Windows.)
+const NATURAL_VOICE_NAMES = [
+  "ava",
+  "samantha",
+  "allison",
+  "serena",
+  "jenny",
+  "aria",
+  "zoe",
+  "karen",
+  "moira",
+];
+// Apple's character voices, offered in every language alongside the real ones.
+const NOVELTY_VOICE_NAMES = [
+  "albert",
+  "bad news",
+  "bahh",
+  "bells",
+  "boing",
+  "bubbles",
+  "cellos",
+  "eddy",
+  "flo",
+  // Not a joke voice, but the original 1984 MacinTalk formant synth — the exact
+  // sound people mean by "robot". It's plainly named, so nothing else here
+  // catches it, and on a Mac with no premium voices downloaded it can win.
+  "fred",
+  "good news",
+  "grandma",
+  "grandpa",
+  "jester",
+  "junior",
+  "organ",
+  "reed",
+  "ralph",
+  "rocko",
+  "sandy",
+  "shelley",
+  "superstar",
+  "trinoids",
+  "whisper",
+  "wobble",
+  "zarvox",
+];
+
+// `prefer` is the tutor's own list of voice names, best first. It outranks
+// every other signal here on purpose: an "(Enhanced)" marker means the voice is
+// good, but the tutor's list is what makes Atlas and Iris different people, and
+// eight tutors sharing one excellent voice is the thing we're fixing.
+function voiceScore(
+  v: SpeechSynthesisVoice,
+  prefer: readonly string[] = [],
+): number {
+  const name = v.name.toLowerCase();
+  let score = 0;
+  const wanted = prefer.findIndex((n) => name.includes(n));
+  if (wanted >= 0) score += 400 - wanted * 20;
+  const hint = NATURAL_VOICE_HINTS.findIndex((h) => name.includes(h));
+  if (hint >= 0) score += 100 - hint * 10;
+  const named = NATURAL_VOICE_NAMES.findIndex((n) => name.includes(n));
+  if (named >= 0) score += 50 - named * 2;
+  // Network voices are the neural ones; local voices are the old formant
+  // synths that give the game away instantly.
+  if (!v.localService) score += 20;
+  // The compact/eloquence packs are the robotic ones — actively avoid them.
+  if (/compact|eloquence|espeak|festival/.test(name)) score -= 100;
+  // macOS ships a set of joke voices in every language ("Grandma (Spanish
+  // (Spain))", "Rocko", "Bubbles"). They're real speech, so nothing else here
+  // rules them out — but a tutor read by Grandpa isn't a tutor. In a language
+  // with no English-sounding name to prefer, these would otherwise win on
+  // alphabetical luck alone.
+  if (NOVELTY_VOICE_NAMES.some((n) => name.startsWith(n))) score -= 60;
+  // A voice whose name carries a locale in brackets — "Daniel (French
+  // (France))" — is an English-set voice doing French. The language's own
+  // voices are the plainly-named ones (Amélie, Thomas, Mónica), and they're the
+  // ones a native speaker would recognise. Small penalty on purpose: it must
+  // not outweigh a "(Premium)" or "(Natural)" marker, which is also brackets.
+  if (name.includes("(")) score -= 25;
+  return score;
+}
+
+// Best voice per language tag ("en", "fr-FR", …). The tutor teaches in more
+// than one language, and the best English voice installed is still the wrong
+// voice for a Spanish phrase.
+const cachedVoices = new Map<string, SpeechSynthesisVoice>();
+
+// Chrome fills getVoices() asynchronously, so ask early and re-pick when the
+// list lands — otherwise the very first line gets read by the default robot.
+if (typeof window !== "undefined" && window.speechSynthesis) {
+  window.speechSynthesis.getVoices();
+  window.speechSynthesis.addEventListener?.("voiceschanged", () => {
+    cachedVoices.clear();
+  });
+}
+
+// The nicest installed voice that actually speaks `lang`. Matching the language
+// matters more than any of the quality heuristics: a premium English voice
+// reading French is unmistakably a machine, where even a plain French voice
+// sounds like a person. Falls back to English when the learner has no voice for
+// that language installed — better an accent than silence.
+function pickNaturalVoice(
+  synth: SpeechSynthesis,
+  lang = "en",
+  prefer: readonly string[] = [],
+): SpeechSynthesisVoice | null {
+  const key = lang.toLowerCase();
+  // Two tutors asking for the same language want different voices, so the
+  // tutor's preference list is part of the cache identity — keying on language
+  // alone would serve Atlas's pick to Iris.
+  const cacheKey = prefer.length ? `${key}|${prefer.join(",")}` : key;
+  const cached = cachedVoices.get(cacheKey);
+  // getVoices() is empty until the browser loads them, so don't cache a miss.
+  const voices = synth.getVoices();
+  if (cached && voices.includes(cached)) return cached;
+
+  const base = key.split("-")[0];
+  // Prefer the exact region ("pt-BR"), settle for the language ("pt"), and only
+  // then give up and read it in English.
+  const pool = voices.filter(
+    (v) => v.lang.toLowerCase().replace("_", "-") === key,
+  );
+  const candidates = pool.length
+    ? pool
+    : voices.filter((v) => v.lang.toLowerCase().startsWith(base));
+  const usable = candidates.length
+    ? candidates
+    : base === "en"
+      ? []
+      : voices.filter((v) => v.lang.toLowerCase().startsWith("en"));
+  if (!usable.length) return null;
+
+  const best = usable.reduce((a, v) =>
+    voiceScore(v, prefer) > voiceScore(a, prefer) ? v : a,
+  );
+  cachedVoices.set(cacheKey, best);
+  return best;
+}
+
+// Everything a caller can say about HOW a line should sound. All optional: with
+// none of it you get the house voice reading English.
+type SpeechVoice = {
+  /** BCP-47 tag of the language of the text, when it isn't English. */
+  lang?: string;
+  /** OpenAI voice id, overriding whatever Settings picked. */
+  voice?: string;
+  /** Delivery direction for the steerable voice — usually a tutor's manner. */
+  instructions?: string;
+  /** Reading speed relative to the voice's natural pace (1 = as it comes). */
+  pace?: number;
+  /**
+   * Who to be on the built-in browser voice, which ignores `instructions`
+   * entirely. Without this the fallback reads every tutor in one default voice.
+   */
+  browser?: ElioraBrowserVoice;
+};
+
+// One long utterance comes out as an unbroken monotone slab. Feeding the
+// synth a sentence at a time gives it a real breath between them — the single
+// biggest thing that stops the browser voice sounding like a screen reader.
+function speechSentences(text: string): string[] {
+  return text
+    .split(/(?<=[.!?])\s+/)
+    .flatMap((s) => (s.length > 240 ? s.split(/(?<=,)\s+/) : [s]))
+    .map((s) => s.trim())
+    .filter(Boolean);
+}
+
+// How long to hold the silence after a sentence, by what ended it. Queueing
+// every sentence at once — which is what this used to do — runs them together
+// with no gap at all, and speech with no breath in it is the most robotic thing
+// a synthesizer does. These are roughly the beats a person leaves.
+function speechPauseMs(sentence: string): number {
+  const end = sentence.trimEnd();
+  if (/\?["')\]]?$/.test(end)) return 340; // a question waits for an answer
+  if (/!["')\]]?$/.test(end)) return 260;
+  if (/[.…]["')\]]?$/.test(end)) return 240;
+  if (/[,;:]$/.test(end)) return 130; // a clause break, not a full stop
+  return 180;
+}
+
+// A repeatable wobble in [-1, 1] derived from the sentence itself. Real speech
+// never holds an exact tempo; a synthesizer does, and that metronome is most of
+// what the ear hears as "machine". Deriving it from the text rather than
+// randomly means a re-read sounds like the same take, not a new one.
+function speechJitter(s: string): number {
+  let h = 0;
+  for (let i = 0; i < s.length; i++) h = (h * 31 + s.charCodeAt(i)) | 0;
+  return ((h >>> 0) % 2000) / 1000 - 1;
+}
+
+// Bumped whenever speech is stopped or restarted. synth.cancel() kills whatever
+// is mid-word, but the chain below schedules the *next* sentence on a timer —
+// and a read you cancelled that wakes up to deliver sentence four anyway is
+// worse than no cancel at all.
+let speechTurn = 0;
+
 // Resolves once it stops talking so callers can wait their turn.
-function speakFallback(text: string): Promise<void> {
+function speakFallback(text: string, opts?: SpeechVoice): Promise<void> {
   return new Promise((resolve) => {
     const synth =
       typeof window === "undefined" ? null : window.speechSynthesis ?? null;
     if (!synth) return resolve();
     synth.cancel();
+    const turn = ++speechTurn;
+
+    const sentences = speechSentences(text);
+    if (!sentences.length) return resolve();
+
     let settled = false;
     const finish = () => {
       if (settled) return;
@@ -1343,13 +1695,62 @@ function speakFallback(text: string): Promise<void> {
       resolve();
     };
     // Some browsers never fire onend (or have no voice installed at all), so
-    // don't let a caller wait on it forever.
-    const guard = window.setTimeout(finish, speechBudgetMs(text));
-    const u = new SpeechSynthesisUtterance(text);
-    u.rate = 0.95;
-    u.onend = finish;
-    u.onerror = finish;
-    synth.speak(u);
+    // don't let a caller wait on it forever. The pauses above are real added
+    // time, so budget for them rather than cutting the reading off mid-way.
+    const guard = window.setTimeout(
+      finish,
+      speechBudgetMs(text) + sentences.length * 400 + 4_000,
+    );
+
+    const lang = opts?.lang ?? "en";
+    const voice = pickNaturalVoice(synth, lang, opts?.browser?.names);
+    // Where this tutor's voice sits. Atlas is below the voice's natural pitch,
+    // Iris above it — the only handle the browser gives us for "a different
+    // person", since it ignores delivery direction entirely.
+    const basePitch = opts?.browser?.pitch ?? 1;
+    // Just under conversational speed by default, nudged by the tutor's own
+    // pace — Milo is slower than Iris out loud as well as on the page.
+    const rate = 0.94 * (opts?.pace ?? 1);
+
+    const sayFrom = (i: number) => {
+      if (settled) return;
+      if (turn !== speechTurn) return finish(); // someone else is talking now
+      if (i >= sentences.length) return finish();
+
+      const sentence = sentences[i];
+      const last = i === sentences.length - 1;
+      const question = /\?["')\]]?$/.test(sentence.trimEnd());
+      const u = new SpeechSynthesisUtterance(sentence);
+      if (voice) u.voice = voice;
+      // Tell the engine the language even when no matching voice is installed:
+      // some of them switch pronunciation rules on this alone.
+      u.lang = voice?.lang ?? lang;
+      // Tempo drifts a few percent sentence to sentence, and the opening line
+      // comes in a touch slower — people ease into a thought rather than
+      // starting at full speed. Questions ease off too, the way a person slows
+      // when they actually want an answer.
+      u.rate =
+        rate *
+        (1 + speechJitter(sentence) * 0.035) *
+        (i === 0 ? 0.96 : 1) *
+        (question ? 0.96 : 1);
+      // Lift slightly into a question and settle on the closing line, so the
+      // read has a shape instead of ending as flatly as it began.
+      u.pitch = basePitch + (question ? 0.06 : last ? -0.03 : 0);
+
+      const next = () => {
+        if (turn !== speechTurn) return finish();
+        window.setTimeout(() => sayFrom(i + 1), speechPauseMs(sentence));
+      };
+      u.onend = next;
+      // One sentence failing shouldn't strand the rest of the paragraph.
+      u.onerror = next;
+      synth.speak(u);
+    };
+
+    // Chrome drops the first utterance if it arrives while a cancel() is still
+    // settling, which costs you the opening sentence. A beat is enough.
+    window.setTimeout(() => sayFrom(0), 60);
   });
 }
 
@@ -1358,8 +1759,13 @@ function speakFallback(text: string): Promise<void> {
 let ttsAudio: HTMLAudioElement | null = null;
 
 function stopSpeaking() {
-  if (typeof window !== "undefined" && window.speechSynthesis)
+  if (typeof window !== "undefined" && window.speechSynthesis) {
+    // Invalidate the sentence chain BEFORE cancelling: cancel() only silences
+    // what's mid-word, and without this the pending timer would happily start
+    // the next sentence a moment later.
+    speechTurn++;
     window.speechSynthesis.cancel();
+  }
   if (ttsAudio) {
     ttsAudio.pause();
     if (ttsAudio.src.startsWith("blob:")) URL.revokeObjectURL(ttsAudio.src);
@@ -1367,11 +1773,54 @@ function stopSpeaking() {
   }
 }
 
+// Whether /api/tts is worth calling at all. The usual reason it isn't is that
+// the OpenAI project has no speech model (a 403 on every request), and asking
+// it again for every sentence just buys silence before the browser voice takes
+// over. One failed reply is enough to stop asking until the page reloads.
+let ttsUnavailable = false;
+
+// Synthesizes one clip and hands back a playable object URL. Split out so the
+// streaming voice below can synthesize the NEXT sentence while the current one
+// is still playing, and abandon it the moment you interrupt.
+async function ttsClipUrl(
+  text: string,
+  signal?: AbortSignal,
+  opts?: SpeechVoice,
+): Promise<string> {
+  if (ttsUnavailable) throw new Error("TTS unavailable");
+  const res = await fetch("/api/tts", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    signal,
+    body: JSON.stringify({
+      text,
+      voice: opts?.voice || window.localStorage.getItem(TTS_VOICE_KEY) || undefined,
+      instructions: opts?.instructions,
+      speed: opts?.pace,
+      lang: opts?.lang,
+    }),
+  });
+  if (!res.ok) {
+    // 403/404 mean this account can't use TTS at all — that won't change on a
+    // retry. Anything else (a 429, a flaky 500) is worth trying again on the
+    // next clip.
+    if (res.status === 403 || res.status === 404) ttsUnavailable = true;
+    throw new Error(`TTS ${res.status}`);
+  }
+  return URL.createObjectURL(await res.blob());
+}
+
 // Natural OpenAI voice via /api/tts, with the browser voice as a fallback.
 // Returns once playback has started (or the fallback fires). Clicking again
 // while the same text is playing toggles it off.
-async function speak(text: string, onState?: (s: "loading" | "playing" | "idle") => void) {
-  const clean = text.trim();
+async function speak(
+  text: string,
+  onState?: (s: "loading" | "playing" | "idle") => void,
+  opts?: SpeechVoice,
+) {
+  // Clean it here rather than at each call site: the browser fallback gets no
+  // server-side pass, so without this it reads asterisks and arrows out loud.
+  const clean = plainSpeech(text, opts?.lang);
   if (!clean || typeof window === "undefined") return;
 
   // Toggle off if this exact clip is already playing.
@@ -1384,17 +1833,7 @@ async function speak(text: string, onState?: (s: "loading" | "playing" | "idle")
   onState?.("loading");
 
   try {
-    const res = await fetch("/api/tts", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        text: clean,
-        voice: window.localStorage.getItem(TTS_VOICE_KEY) || undefined,
-      }),
-    });
-    if (!res.ok) throw new Error(`TTS ${res.status}`);
-    const blob = await res.blob();
-    const url = URL.createObjectURL(blob);
+    const url = await ttsClipUrl(clean, undefined, opts);
     const audio = new Audio(url);
     audio.dataset.text = clean;
     ttsAudio = audio;
@@ -1414,38 +1853,16 @@ async function speak(text: string, onState?: (s: "loading" | "playing" | "idle")
     // Network/API trouble → still read it aloud with the built-in voice.
     // "idle" only once that voice is done, so the caller isn't told the reading
     // finished while the browser is still talking.
-    await speakFallback(clean);
+    await speakFallback(clean, opts);
     onState?.("idle");
   }
 }
 
-// Like speak(), but resolves when the voice has finished talking (not merely
-// started) — the voice conversation below needs to know when it's safe to
-// listen again without hearing Eliora through the speakers.
-function speakUntilDone(text: string): Promise<void> {
-  return new Promise((resolve) => {
-    if (!text.trim()) return resolve();
-    let settled = false;
-    const finish = () => {
-      if (settled) return;
-      settled = true;
-      window.clearTimeout(guard);
-      resolve();
-    };
-    // Last-ditch guard: if playback never reports that it ended (a stalled
-    // audio element, a browser with no voices), the conversation still moves on
-    // instead of sitting on "speaking" forever.
-    const guard = window.setTimeout(finish, speechBudgetMs(text) + 15_000);
-    void speak(text, (state) => {
-      if (state === "idle") finish();
-    });
-  });
-}
 
 // Markdown reads badly out loud — strip the syntax (and the emoji Eliora likes
 // to sprinkle in) so the voice says the words and nothing else.
-function plainSpeech(md: string): string {
-  return md
+function plainSpeech(md: string, lang?: string): string {
+  const stripped = md
     .replace(/```[\s\S]*?```/g, " (code example on screen) ")
     .replace(/`([^`]+)`/g, "$1")
     .replace(/!\[[^\]]*\]\([^)]*\)/g, "")
@@ -1458,28 +1875,311 @@ function plainSpeech(md: string): string {
     .replace(/[\u{1F300}-\u{1FAFF}\u{2600}-\u{27BF}\u{FE0F}]/gu, "")
     .replace(/\n+/g, ". ")
     .replace(/\.\s*\.+/g, ".")
-    .replace(/[ \t]+/g, " ")
-    .trim();
+    .replace(/[ \t]+/g, " ");
+  // …then say it the way a person would — "e.g." out loud is a dead giveaway.
+  // (The TTS route does this too; doing it here covers the browser fallback
+  // voice and keeps the echo guard comparing the words actually spoken.)
+  return speechFriendly(stripped, lang);
+}
+
+// ---------------------------------------------------------------------------
+// Streaming speech
+//
+// Saying a whole reply as one clip costs the learner two full waits back to
+// back: the model finishes writing, and only THEN does the voice start
+// synthesizing all of it. In a conversation that's dead air on every turn.
+//
+// So the reply is spoken in pieces. Text arrives as deltas off the chat stream,
+// complete sentences are peeled off and synthesized one at a time, and the next
+// clip is fetched while the current one is still playing. Eliora starts talking
+// a sentence into the answer instead of a paragraph after it.
+// ---------------------------------------------------------------------------
+
+// How much text is worth one clip. Too short and the delivery turns choppy —
+// each clip is synthesized cold, so it can't carry intonation across the seam.
+// Too long and you're back to waiting. The FIRST clip is deliberately tiny:
+// it's the one the whole turn's responsiveness is measured by.
+const SPEECH_FIRST_CHUNK_MIN = 24;
+const SPEECH_CHUNK_MIN = 110;
+// A run this long with no sentence end (a list, a formula) gets broken anyway.
+const SPEECH_CHUNK_MAX = 400;
+
+// A period that ends an abbreviation or an initial isn't a sentence end, and
+// cutting there strands "for example," as its own clip.
+const SPEECH_ABBREV = /(?:\b(?:e\.g|i\.e|etc|vs|approx|mr|mrs|ms|dr|prof|st|fig|no|eq)|\s[a-z])\.$/i;
+
+// Where to cut `raw` for the next clip, or -1 to wait for more text.
+function nextSpeechCut(raw: string, min: number): number {
+  if (raw.length < min) return -1;
+  const ends = /([.!?…]["')\]]?|\n)\s/g;
+  for (let m = ends.exec(raw); m; m = ends.exec(raw)) {
+    const cut = m.index + m[0].length;
+    if (cut < min) continue;
+    if (SPEECH_ABBREV.test(raw.slice(0, m.index + 1))) continue;
+    return cut;
+  }
+  // No sentence end in sight — break at a word boundary rather than let the
+  // learner wait out a paragraph-long clip.
+  if (raw.length >= SPEECH_CHUNK_MAX) {
+    const space = raw.lastIndexOf(" ", SPEECH_CHUNK_MAX);
+    if (space >= min) return space + 1;
+  }
+  return -1;
+}
+
+type SpeechStream = {
+  /** Feed reply text as it streams in. */
+  push(delta: string): void;
+  /** No more text is coming — say what's left. */
+  end(): void;
+  /** Resolves once everything queued has finished playing. */
+  done(): Promise<void>;
+  /** Cut it off now: stop playback, abandon synthesis in flight. */
+  stop(): void;
+};
+
+function createSpeechStream(opts: {
+  /** Called with each clip's words as it becomes audible (feeds the echo guard). */
+  onSpoken?: (spoken: string) => void;
+  /** True once this turn has been superseded — stop without finishing. */
+  stale?: () => boolean;
+  /** Whose voice this is — the tutor currently teaching. */
+  voice?: SpeechVoice;
+}): SpeechStream {
+  let raw = ""; // reply text not yet cut into a clip
+  let ended = false;
+  let stopped = false;
+  const clips: string[] = [];
+  // Parks the pump until there's another clip (or the reply ends).
+  let wake: (() => void) | null = null;
+  const nudge = () => {
+    const w = wake;
+    wake = null;
+    w?.();
+  };
+
+  const aborters = new Set<AbortController>();
+  let audio: HTMLAudioElement | null = null;
+  let head = 0; // clip the pump is on right now
+
+  const dead = () => stopped || !!opts.stale?.();
+
+  // Synthesis runs one clip ahead of playback, so there are at most two
+  // requests in flight — enough to hide the round-trip, not enough to fan out
+  // a whole reply's worth of speech the learner may interrupt anyway.
+  const synth = new Map<number, Promise<string | null>>();
+  const startSynth = (i: number) => {
+    if (i >= clips.length || synth.has(i) || dead()) return;
+    const aborter = new AbortController();
+    aborters.add(aborter);
+    synth.set(
+      i,
+      ttsClipUrl(clips[i], aborter.signal, opts.voice)
+        .catch(() => null) // fall back to the browser voice at play time
+        .finally(() => aborters.delete(aborter)),
+    );
+  };
+
+  // Plays one clip to the end (or until it's cut off).
+  const play = (url: string) =>
+    new Promise<void>((resolve) => {
+      const el = new Audio(url);
+      audio = el;
+      // Register with the shared player so the existing stopSpeaking() — which
+      // barge-in and "Read aloud" elsewhere both call — silences this too.
+      ttsAudio = el;
+      let done = false;
+      let guard: number | undefined;
+      const finish = () => {
+        if (done) return;
+        done = true;
+        if (guard !== undefined) window.clearTimeout(guard);
+        URL.revokeObjectURL(url);
+        if (ttsAudio === el) ttsAudio = null;
+        if (audio === el) audio = null;
+        resolve();
+      };
+      const arm = (ms: number) => {
+        if (done) return;
+        if (guard !== undefined) window.clearTimeout(guard);
+        guard = window.setTimeout(finish, ms);
+      };
+      el.onended = finish;
+      el.onerror = finish;
+      // Paused means something cut us off (barge-in, Skip) — don't hang on it.
+      el.onpause = finish;
+      // A stalled element can fire none of the above — never let one clip park
+      // the pump forever. Once the duration is known, the cap tightens to the
+      // clip's own length plus slack.
+      arm(60_000);
+      el.onloadedmetadata = () => {
+        if (Number.isFinite(el.duration)) arm(el.duration * 1000 + 15_000);
+      };
+      el.play().catch(finish);
+    });
+
+  const pump = (async () => {
+    for (let i = 0; !dead(); i++) {
+      head = i;
+      while (i >= clips.length && !ended && !dead()) {
+        await new Promise<void>((res) => {
+          wake = res;
+        });
+      }
+      if (i >= clips.length || dead()) break;
+      startSynth(i);
+      startSynth(i + 1); // synthesize the next one while this one plays
+      const url = await synth.get(i)!;
+      if (dead()) {
+        if (url) URL.revokeObjectURL(url);
+        break;
+      }
+      opts.onSpoken?.(clips[i]);
+      if (url) await play(url);
+      else await speakFallback(clips[i], opts.voice); // TTS unreachable — browser voice
+    }
+  })();
+
+  const cut = () => {
+    for (;;) {
+      const at = nextSpeechCut(raw, clips.length ? SPEECH_CHUNK_MIN : SPEECH_FIRST_CHUNK_MIN);
+      if (at < 0) return;
+      const spoken = plainSpeech(raw.slice(0, at), opts.voice?.lang).trim();
+      raw = raw.slice(at);
+      if (spoken) {
+        clips.push(spoken);
+        // Keep the one-ahead window full even when text outruns playback; the
+        // pump starts the rest as it reaches them.
+        if (clips.length - 1 <= head + 1) startSynth(clips.length - 1);
+        // The pump may be parked waiting on exactly this.
+        nudge();
+      }
+    }
+  };
+
+  return {
+    push(delta) {
+      if (ended || dead()) return;
+      raw += delta;
+      cut();
+    },
+    end() {
+      if (ended) return;
+      const tail = plainSpeech(raw, opts.voice?.lang).trim();
+      raw = "";
+      if (tail) clips.push(tail);
+      ended = true;
+      nudge();
+    },
+    done: () => pump,
+    stop() {
+      if (stopped) return;
+      stopped = true;
+      ended = true;
+      for (const a of aborters) a.abort();
+      aborters.clear();
+      if (audio) {
+        audio.pause();
+        if (ttsAudio === audio) ttsAudio = null;
+        audio = null;
+      }
+      // Same as stopSpeaking(): bump the turn first so a queued sentence can't
+      // start talking over you a beat after you interrupted.
+      if (typeof window !== "undefined" && window.speechSynthesis) {
+        speechTurn++;
+        window.speechSynthesis.cancel();
+      }
+      nudge();
+    },
+  };
 }
 
 type VoicePhase = "listening" | "thinking" | "speaking";
 
 // How long a pause has to last before we treat it as "your turn is over".
-const VOICE_SILENCE_MS = 1300;
+// Waiting this out is pure latency on every turn, so once the recognizer has
+// committed a phrase as final — its own endpointer already heard you stop — a
+// much shorter pause is enough. The longer wait only applies while the words on
+// screen are still interim guesses, where cutting in early would truncate you.
+const VOICE_SILENCE_MS = 1100;
+const VOICE_SILENCE_FINAL_MS = 700;
+// How much you have to get out before Eliora stops talking and listens. Two
+// words is short enough that "wait, no —" cuts her off, long enough that a
+// cough or a stray syllable doesn't.
+const VOICE_BARGE_MIN_WORDS = 2;
+// If this share of the words the mic picked up are words Eliora is saying right
+// now, it's her own voice coming back through the speakers — not you.
+const VOICE_ECHO_RATIO = 0.7;
+
+function speechWords(s: string): string[] {
+  return s
+    .toLowerCase()
+    .replace(/[^a-z0-9\s']/g, " ")
+    .split(/\s+/)
+    .filter(Boolean);
+}
+
+// Interrupting only works if the mic stays open while Eliora talks — which
+// means it also hears HER. These two guards tell the learner's voice apart from
+// that echo. (Headphones make the problem disappear entirely.)
+function isLikelyEcho(heard: string, spoken: Set<string>): boolean {
+  const words = speechWords(heard);
+  if (!words.length) return true;
+  if (!spoken.size) return false;
+  const hits = words.filter((w) => spoken.has(w)).length;
+  return hits / words.length >= VOICE_ECHO_RATIO;
+}
+
+// Drop the leading run of words we can hear in Eliora's own line, so an
+// interruption that starts with a bit of echo doesn't drag it into your turn.
+function stripEchoPrefix(heard: string, spoken: Set<string>): string {
+  const words = heard.split(/\s+/).filter(Boolean);
+  let i = 0;
+  while (i < words.length && spoken.has(speechWords(words[i])[0] ?? "")) i++;
+  const rest = words.slice(i);
+  // If trimming leaves nothing to work with, the overlap was a coincidence —
+  // keep what you actually said.
+  return (speechWords(rest.join(" ")).length >= VOICE_BARGE_MIN_WORDS
+    ? rest
+    : words
+  ).join(" ");
+}
 
 // Hands-free conversation: you talk, Eliora answers out loud, then she listens
-// again. Recognition runs in the browser (audio never leaves the device — only
-// the transcript is sent); the reply comes from the normal chat endpoint and is
+// again — and you can cut her off mid-sentence, the way you would a person.
+// Recognition runs in the browser (audio never leaves the device — only the
+// transcript is sent); the reply comes from the normal chat endpoint and is
 // voiced by /api/tts, so it lands in the chat transcript underneath too.
 function VoiceChat({
   onSend,
+  onInterrupt,
   onClose,
+  visual,
+  voice,
 }: {
-  onSend: (text: string) => Promise<string>;
+  // Same chat send as the typed composer, but flagged as a spoken turn and fed
+  // back delta by delta so the voice can start on the first sentence.
+  onSend: (
+    text: string,
+    opts: { voice: true; onDelta: (chunk: string) => void },
+  ) => Promise<string>;
+  // Cancels a reply that's still streaming. Interrupting has to abort it or the
+  // chat stays busy and silently drops the message you interrupted WITH.
+  onInterrupt: () => void;
   onClose: () => void;
+  // The diagram from the answer Eliora is on. It comes down live from the chat
+  // stream, so it appears mid-sentence — she's explaining a picture you can
+  // already see, which is the whole point of drawing it.
+  visual?: LessonVisual;
+  // Which tutor is on the line — their voice, their manner, their pace.
+  voice?: SpeechVoice;
 }) {
   const [phase, setPhaseState] = useState<VoicePhase>("listening");
   const [heard, setHeard] = useState("");
+  // What you said on the turn Eliora is answering — kept apart from `heard` so
+  // the live mic buffer can be cleared (echo, interruptions) without blanking
+  // your last line off the screen.
+  const [saidText, setSaidText] = useState("");
   const [reply, setReply] = useState("");
   const [error, setError] = useState<string | null>(null);
 
@@ -1487,11 +2187,15 @@ function VoiceChat({
   // through refs instead of state that would be stale in a callback.
   const phaseRef = useRef<VoicePhase>("listening");
   const sendRef = useRef(onSend);
+  const interruptRef = useRef(onInterrupt);
   const skipRef = useRef<() => void>(() => {});
   const sendNowRef = useRef<() => void>(() => {});
   const cutSpeechRef = useRef<(() => void) | null>(null);
+  const voiceRef = useRef(voice);
   useEffect(() => {
     sendRef.current = onSend;
+    interruptRef.current = onInterrupt;
+    voiceRef.current = voice;
   });
 
   const setPhase = (p: VoicePhase) => {
@@ -1516,13 +2220,40 @@ function VoiceChat({
     let silence: number | undefined;
     let finalText = "";
     let heardText = "";
+    // The words Eliora is saying right now (or, while she's composing, the ones
+    // you just finished saying) — whatever the mic is most likely to hear that
+    // ISN'T you starting a new turn.
+    let echoWords = new Set<string>();
+    // Bumped every time a turn starts OR you interrupt one. A turn whose number
+    // is no longer current has been superseded — it must not speak, and it must
+    // not restart the listen loop, or it would stomp the turn that replaced it.
+    let turnSeq = 0;
 
     const clearSilence = () => {
       if (silence) window.clearTimeout(silence);
       silence = undefined;
     };
 
-    const stopListening = () => {
+    // A long enough pause means your turn is over.
+    const armSilence = (settled = false) => {
+      clearSilence();
+      silence = window.setTimeout(
+        () => {
+          if (heardText.trim()) void takeTurn(heardText.trim());
+        },
+        settled ? VOICE_SILENCE_FINAL_MS : VOICE_SILENCE_MS,
+      );
+    };
+
+    // Empty the buffer the next turn is being built in (optionally seeding it
+    // with the words you interrupted with).
+    const resetBuffer = (seed = "") => {
+      finalText = seed ? `${seed} ` : "";
+      heardText = seed;
+      setHeard(seed);
+    };
+
+    const stopRecognition = () => {
       clearSilence();
       if (!rec) return;
       const r = rec;
@@ -1537,14 +2268,10 @@ function VoiceChat({
       }
     };
 
-    const listen = () => {
-      if (closed) return;
-      stopListening();
-      finalText = "";
-      heardText = "";
-      setHeard("");
-      setReply("");
-      setPhase("listening");
+    // ONE long-lived recognizer runs through every phase. That's what makes
+    // interrupting possible — the mic never closes while Eliora is talking.
+    const startRecognition = () => {
+      if (closed || rec) return;
       const r = new SR();
       r.lang = "en-US";
       r.continuous = true;
@@ -1552,18 +2279,47 @@ function VoiceChat({
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       r.onresult = (e: any) => {
         let interim = "";
+        // A final result means the recognizer's own endpointer decided you
+        // finished a phrase — worth a shorter wait than an interim guess.
+        let settled = false;
         for (let i = e.resultIndex; i < e.results.length; i++) {
           const res = e.results[i];
-          if (res.isFinal) finalText += res[0].transcript + " ";
-          else interim += res[0].transcript;
+          if (res.isFinal) {
+            finalText += res[0].transcript + " ";
+            settled = true;
+          } else interim += res[0].transcript;
         }
         heardText = `${finalText} ${interim}`.replace(/\s+/g, " ").trim();
-        setHeard(heardText);
-        // Pause long enough and we take it as the end of your turn.
-        clearSilence();
-        silence = window.setTimeout(() => {
-          if (heardText.trim()) void takeTurn(heardText.trim());
-        }, VOICE_SILENCE_MS);
+        if (!heardText) return;
+
+        if (phaseRef.current === "listening") {
+          setHeard(heardText);
+          armSilence(settled && !interim);
+          return;
+        }
+
+        // She's composing or talking, and you started talking anyway.
+        if (speechWords(heardText).length < VOICE_BARGE_MIN_WORDS) return;
+        if (isLikelyEcho(heardText, echoWords)) {
+          // Her voice (or the tail of your own last sentence) — forget it so it
+          // can't leak into your next turn.
+          resetBuffer();
+          return;
+        }
+        resetBuffer(stripEchoPrefix(heardText, echoWords));
+        // Retire the turn you just talked over — if it's still waiting on the
+        // server, its answer must not come back and start talking at you.
+        turnSeq++;
+        // Cut it off at the source too. Because she starts talking before the
+        // reply has finished writing, the chat can still be streaming in EITHER
+        // phase — and until it's aborted the chat is busy, which would make your
+        // interruption vanish instead of being sent.
+        interruptRef.current();
+        setPhase("listening");
+        // Cut the audio and let takeTurn's await fall through.
+        stopSpeaking();
+        cutSpeechRef.current?.();
+        armSilence();
       };
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       r.onerror = (e: any) => {
@@ -1572,19 +2328,19 @@ function VoiceChat({
             "Microphone access is blocked. Allow it in your browser (the 🔒 icon in the address bar), then open voice mode again.",
           );
           closed = true;
-          stopListening();
+          stopRecognition();
         }
         // "no-speech" and "aborted" are normal — onend restarts us.
       };
       r.onend = () => {
-        // Chrome cuts recognition off after a lull; restart so the
-        // conversation stays hands-free.
-        if (!closed && rec === r && phaseRef.current === "listening") {
-          try {
-            r.start();
-          } catch {
-            /* already restarting */
-          }
+        // Chrome cuts recognition off after a lull. Restart in EVERY phase (not
+        // just while listening) or the mic would be shut during her answer and
+        // there'd be nothing to interrupt with.
+        if (closed || rec !== r) return;
+        try {
+          r.start();
+        } catch {
+          /* already restarting */
         }
       };
       rec = r;
@@ -1595,37 +2351,98 @@ function VoiceChat({
       }
     };
 
+    const listen = () => {
+      if (closed) return;
+      resetBuffer();
+      setReply("");
+      setPhase("listening");
+      startRecognition();
+    };
+
     const takeTurn = async (said: string) => {
-      stopListening();
-      setHeard(said);
+      const turn = ++turnSeq;
+      clearSilence();
+      resetBuffer();
+      setSaidText(said);
       setReply("");
       setPhase("thinking");
+      // While she thinks, the mic is still hot — and the trailing words of the
+      // sentence you just finished are still arriving. Treat those as echo.
+      echoWords = new Set(speechWords(said));
+      // You talked over her. The answer still lands in the chat to scroll back
+      // to, but nothing about this turn should speak or drive the loop again.
+      const stale = () => closed || turn !== turnSeq;
+
+      // She speaks off the live stream: the first sentence goes to the voice
+      // while the model is still writing the rest.
+      const speech = createSpeechStream({
+        stale,
+        voice: voiceRef.current,
+        onSpoken: (spoken) => {
+          // Whatever is audible right now is what the mic is most likely to
+          // hear that ISN'T you — widen the echo guard clip by clip.
+          for (const w of speechWords(spoken)) echoWords.add(w);
+          if (!stale() && phaseRef.current === "thinking") setPhase("speaking");
+        },
+      });
+      // Racing against a resolver lets an interruption (or "Skip", or hanging
+      // up) cut the voice off without leaving the await below hanging forever.
+      let cut = () => {};
+      const interrupted = new Promise<void>((res) => {
+        cut = () => {
+          speech.stop();
+          res();
+        };
+      });
+      cutSpeechRef.current = cut;
+
+      let streamed = "";
       let answer = "";
       try {
-        answer = await sendRef.current(said);
+        answer = await sendRef.current(said, {
+          voice: true,
+          onDelta: (chunk) => {
+            if (stale()) return;
+            streamed += chunk;
+            setReply(streamed);
+            speech.push(chunk);
+          },
+        });
       } catch {
         answer = "Sorry — I couldn't reach the server. Let's try that again.";
       }
-      if (closed) return;
-      setReply(answer);
-      const spoken = plainSpeech(answer);
-      if (spoken) {
-        setPhase("speaking");
-        // Racing against a resolver lets "Skip" (or hanging up) cut the voice
-        // off without leaving this await hanging forever.
-        const interrupted = new Promise<void>((res) => {
-          cutSpeechRef.current = res;
-        });
-        await Promise.race([speakUntilDone(spoken), interrupted]);
-        cutSpeechRef.current = null;
-        stopSpeaking();
+
+      if (!stale()) {
+        // A reply that never streamed as text (an error string, or a turn the
+        // server answered some other way) still gets said out loud.
+        if (!streamed.trim() && answer.trim()) {
+          setReply(answer);
+          speech.push(answer);
+        }
+        speech.end();
+        await Promise.race([speech.done(), interrupted]);
       }
-      if (!closed) listen();
+      speech.stop();
+      // Interrupted mid-sentence: the turn that replaced this one owns these
+      // now, and your words are already in its buffer — don't clobber either.
+      if (stale()) return;
+      cutSpeechRef.current = null;
+      echoWords = new Set();
+      listen();
     };
 
     skipRef.current = () => {
+      // Same as talking over her, but by button. Retire the turn first so its
+      // tail can't restart the loop underneath us, then call off the reply —
+      // she starts talking before it's finished writing, so there's almost
+      // always still a stream running behind the voice, and leaving it running
+      // keeps the chat busy and swallows your next message.
+      turnSeq++;
+      interruptRef.current();
       stopSpeaking();
       cutSpeechRef.current?.();
+      cutSpeechRef.current = null;
+      listen();
     };
     sendNowRef.current = () => {
       const said = heardText.trim();
@@ -1635,7 +2452,7 @@ function VoiceChat({
     listen();
     return () => {
       closed = true;
-      stopListening();
+      stopRecognition();
       stopSpeaking();
       cutSpeechRef.current?.();
     };
@@ -1646,12 +2463,21 @@ function VoiceChat({
     : phase === "listening"
       ? "Listening…"
       : phase === "thinking"
-        ? "Thinking…"
-        : "Eliora is talking";
+        ? "Thinking… (jump in any time)"
+        : "Eliora is talking — talk over her to cut in";
+
+  // Only while she's on this turn. Once she's listening again the diagram
+  // belongs to a finished answer — it stays in the chat thread, not the stage.
+  const stageVisual = !error && phase !== "listening" ? visual : undefined;
 
   return (
     <div style={styles.voiceOverlay}>
-      <div style={styles.voiceCard}>
+      <div
+        style={{
+          ...styles.voiceCard,
+          ...(stageVisual ? styles.voiceCardWide : null),
+        }}
+      >
         <div style={styles.voiceHead}>
           <span style={styles.voiceTitle}>🎙️ Voice mode</span>
           <button
@@ -1665,25 +2491,34 @@ function VoiceChat({
 
         <div
           className={`eliora-orb${error ? "" : ` ${phase}`}`}
-          style={styles.voiceOrb}
+          style={{
+            ...styles.voiceOrb,
+            ...(stageVisual ? styles.voiceOrbSmall : null),
+          }}
           aria-hidden
         >
-          🌱
+          💡
         </div>
 
         <div style={styles.voiceStatus} aria-live="polite">
           {status}
         </div>
 
+        {stageVisual && (
+          <div style={styles.voiceDiagram} className="fade-in">
+            <LessonDiagram visual={stageVisual} />
+          </div>
+        )}
+
         {error ? (
           <p style={styles.voiceError}>{error}</p>
         ) : (
           <>
             <p style={styles.voiceHeard}>
-              {heard ||
-                (phase === "listening"
-                  ? "Go ahead — say anything. Pause for a second when you're done and I'll answer."
-                  : "…")}
+              {phase === "listening"
+                ? heard ||
+                  "Go ahead — say anything. Pause for a second when you're done and I'll answer."
+                : saidText || "…"}
             </p>
             {reply && <p style={styles.voiceReply}>{reply}</p>}
           </>
@@ -1695,7 +2530,7 @@ function VoiceChat({
               ⏎ Send now
             </button>
           )}
-          {!error && phase === "speaking" && (
+          {!error && phase !== "listening" && (
             <button style={styles.recSecondary} onClick={() => skipRef.current()}>
               ⏭ Skip — my turn
             </button>
@@ -1707,8 +2542,9 @@ function VoiceChat({
 
         {!error && (
           <p style={styles.voiceHint}>
-            Everything you say lands in this chat, so you can scroll back and
-            read it later.
+            You can talk over Eliora — she&rsquo;ll stop and listen. Headphones
+            help her hear you over her own voice. Everything you say lands in
+            this chat, so you can scroll back and read it later.
           </p>
         )}
       </div>
@@ -1717,13 +2553,13 @@ function VoiceChat({
 }
 
 // "Read aloud" control with live loading / playing state.
-function SpeakButton({ text }: { text: string }) {
+function SpeakButton({ text, voice }: { text: string; voice?: SpeechVoice }) {
   const [state, setState] = useState<"loading" | "playing" | "idle">("idle");
   useEffect(() => () => stopSpeaking(), []);
   return (
     <button
       style={styles.speakBtn}
-      onClick={() => void speak(text, setState)}
+      onClick={() => void speak(text, setState, voice)}
       aria-label={
         state === "playing" ? "Stop reading aloud" : "Read this message aloud"
       }
@@ -1875,7 +2711,8 @@ function AccessibilityPanel({
             </span>
           </button>
         ))}
-        {value.readAloud && <VoicePicker />}
+        <VoicePicker />
+
         <ChangePasswordSection />
       </div>
     </div>
@@ -1883,7 +2720,9 @@ function AccessibilityPanel({
 }
 
 // Picks the OpenAI voice used for "Read aloud" and previews it. Stored on its
-// own in localStorage, so it survives without touching the A11y schema.
+// own in localStorage, so it survives without touching the A11y schema. Shown
+// whether or not auto-read-aloud is on, since every 🔊 button in the app uses
+// this voice too.
 function VoicePicker() {
   const [voice, setVoice] = useState("nova");
   const [previewing, setPreviewing] = useState(false);
@@ -1903,7 +2742,9 @@ function VoicePicker() {
     <div style={{ marginTop: 8, marginBottom: 4 }}>
       <div style={styles.toggleLabel}>Voice</div>
       <div style={styles.toggleDesc}>
-        {previewing ? "Playing a preview…" : "Tap a voice to hear it"}
+        {previewing
+          ? "Playing a preview…"
+          : "Tap a voice to hear it — used everywhere Eliora reads aloud"}
       </div>
       <div style={styles.themeGrid}>
         {TTS_VOICES.map((v) => (
@@ -2151,6 +2992,179 @@ function renderMarkdown(text: string, linkColor: string): React.ReactNode {
     }
   });
   return <div>{blocks}</div>;
+}
+
+// Same markdown subset as renderMarkdown, laid out as a page of notes rather
+// than a chat message: big accent section headings, roomier lines, and bullets
+// that visibly step in as they nest.
+function renderDocMarkdown(text: string, linkColor: string): React.ReactNode {
+  const blocks: React.ReactNode[] = [];
+  text.split("\n").forEach((raw, i) => {
+    const line = raw.replace(/\s+$/, "");
+    if (!line.trim()) {
+      blocks.push(<div key={i} style={{ height: 10 }} />);
+      return;
+    }
+    let m: RegExpMatchArray | null;
+    if ((m = line.match(/^(#{1,6})\s+(.*)$/))) {
+      blocks.push(
+        <div key={i} style={m[1].length <= 2 ? styles.docH2 : styles.docH3}>
+          {renderInline(m[2], linkColor)}
+        </div>,
+      );
+    } else if ((m = line.match(/^(\s*)[-*]\s+(.*)$/))) {
+      // Two spaces of source indent = one level in, as most models write it.
+      const depth = Math.min(Math.floor(m[1].length / 2), 3);
+      blocks.push(
+        <div key={i} style={{ ...styles.docBullet, marginLeft: depth * 22 }}>
+          <span
+            style={{ ...styles.docBulletMark, fontSize: depth > 0 ? 11 : 15 }}
+          >
+            •
+          </span>
+          <span>{renderInline(m[2], linkColor)}</span>
+        </div>,
+      );
+    } else if ((m = line.match(/^(\s*)(\d+)\.\s+(.*)$/))) {
+      const depth = Math.min(Math.floor(m[1].length / 2), 3);
+      blocks.push(
+        <div key={i} style={{ ...styles.docBullet, marginLeft: depth * 22 }}>
+          <span style={styles.docBulletMark}>{m[2]}.</span>
+          <span>{renderInline(m[3], linkColor)}</span>
+        </div>,
+      );
+    } else {
+      blocks.push(
+        <div key={i} style={styles.docP}>
+          {renderInline(line, linkColor)}
+        </div>,
+      );
+    }
+  });
+  return <div>{blocks}</div>;
+}
+
+// --- Save notes as a PDF ----------------------------------------------------
+// Opens a clean, print-styled copy of the notes in a hidden frame and hands it
+// to the browser's print dialog, where "Save as PDF" is always an option. No
+// PDF library needed, and the page keeps its headings/bullets/highlights.
+function escapeHtml(s: string): string {
+  return s
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;");
+}
+
+// Same markdown subset renderMarkdown handles, emitted as printable HTML.
+function markdownToPrintHtml(text: string): string {
+  const inline = (s: string) =>
+    escapeHtml(s)
+      .replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>")
+      .replace(/==([^=]+)==/g, "<mark>$1</mark>");
+  const out: string[] = [];
+  let list: "ul" | "ol" | null = null;
+  const closeList = () => {
+    if (list) out.push(`</${list}>`);
+    list = null;
+  };
+  for (const raw of (text || "").split("\n")) {
+    const line = raw.replace(/\s+$/, "");
+    let m: RegExpMatchArray | null;
+    if (!line.trim()) {
+      closeList();
+    } else if ((m = line.match(/^(#{1,6})\s+(.*)$/))) {
+      closeList();
+      const level = Math.min(m[1].length + 1, 4);
+      out.push(`<h${level}>${inline(m[2])}</h${level}>`);
+    } else if ((m = line.match(/^\s*[-*]\s+(.*)$/))) {
+      if (list !== "ul") {
+        closeList();
+        list = "ul";
+        out.push("<ul>");
+      }
+      out.push(`<li>${inline(m[1])}</li>`);
+    } else if ((m = line.match(/^\s*\d+\.\s+(.*)$/))) {
+      if (list !== "ol") {
+        closeList();
+        list = "ol";
+        out.push("<ol>");
+      }
+      out.push(`<li>${inline(m[1])}</li>`);
+    } else {
+      closeList();
+      out.push(`<p>${inline(line)}</p>`);
+    }
+  }
+  closeList();
+  return out.join("\n");
+}
+
+function printAsPdf(title: string, markdown: string) {
+  if (typeof document === "undefined" || !markdown.trim()) return;
+  const frame = document.createElement("iframe");
+  frame.setAttribute("aria-hidden", "true");
+  frame.style.cssText = "position:fixed;right:0;bottom:0;width:0;height:0;border:0;";
+  document.body.appendChild(frame);
+  const doc = frame.contentDocument;
+  if (!doc) {
+    frame.remove();
+    return;
+  }
+  doc.open();
+  doc.write(`<!doctype html><html><head><meta charset="utf-8">
+<title>${escapeHtml(title)}</title>
+<style>
+  @page { margin: 18mm 16mm; }
+  body { font: 12pt/1.55 Georgia, "Times New Roman", serif; color: #1a1a1a; margin: 0; }
+  h1 { font-size: 20pt; margin: 0 0 4pt; }
+  h2 { font-size: 14pt; margin: 16pt 0 4pt; page-break-after: avoid; }
+  h3, h4 { font-size: 12.5pt; margin: 12pt 0 3pt; page-break-after: avoid; }
+  p { margin: 0 0 6pt; }
+  ul, ol { margin: 0 0 8pt; padding-left: 20pt; }
+  li { margin: 0 0 3pt; }
+  mark { background: #fdf0a6; padding: 0 2px; }
+  .meta { font-size: 9.5pt; color: #666; margin: 0 0 14pt;
+          border-bottom: 1px solid #ddd; padding-bottom: 8pt; }
+</style></head><body>
+<h1>${escapeHtml(title)}</h1>
+<p class="meta">Eliora · ${escapeHtml(new Date().toLocaleDateString())}</p>
+${markdownToPrintHtml(markdown)}
+</body></html>`);
+  doc.close();
+  const go = () => {
+    frame.contentWindow?.focus();
+    frame.contentWindow?.print();
+    // Give the print dialog time to take over before tearing the frame down.
+    setTimeout(() => frame.remove(), 60000);
+  };
+  if (doc.readyState === "complete") go();
+  else frame.onload = go;
+}
+
+// Chat replies are mostly conversation, but a study guide asked for in chat is
+// something a learner wants on paper. Offer the PDF only when the reply is
+// actually guide-shaped — long, with headings or a real list — so the button
+// doesn't clutter every "sure, here's the answer".
+// noteTitle() takes the first line, which is right for a summary but wrong for
+// chat — Eliora opens with "Nice, good choice!" before she gets to the guide.
+// Prefer a real heading, then fall back to what the learner actually asked for.
+function chatDocTitle(reply: string, ask?: string): string {
+  const heading = (reply || "")
+    .split("\n")
+    .map((l) => l.match(/^#{1,6}\s+(.*)$/)?.[1]?.trim())
+    .find((h): h is string => !!h);
+  if (heading) return heading.length > 60 ? heading.slice(0, 60) + "…" : heading;
+  const asked = (ask || "").trim().replace(/\s+/g, " ");
+  if (asked) return asked.length > 60 ? asked.slice(0, 60) + "…" : asked;
+  return noteTitle(reply);
+}
+
+function looksPrintable(text: string): boolean {
+  const t = text || "";
+  if (t.length < 500) return false;
+  const headings = (t.match(/^#{1,6}\s+\S/gm) || []).length;
+  const bullets = (t.match(/^\s*(?:[-*]|\d+\.)\s+\S/gm) || []).length;
+  return headings >= 2 || (headings >= 1 && bullets >= 4) || bullets >= 6;
 }
 
 function VideoCards({ videos }: { videos: Video[] }) {
@@ -2795,14 +3809,13 @@ function TeachBackRecorder({
 
 type FeedVideo = Video & { topic: string };
 
-// A browsable feed of real study videos for the learner's classes. Videos play
-// inline (click a card → embedded player) so they can watch without leaving
-// the app. A search box lets them pull up a feed for any topic.
+// A browsable feed of real study videos for the learner's classes. Each card
+// shows the video's thumbnail; clicking it opens the video on YouTube. A
+// search box lets them pull up a feed for any topic.
 function VideoFeed({ topics }: { topics: string[] }) {
   const [items, setItems] = useState<FeedVideo[]>([]);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState(false);
-  const [playing, setPlaying] = useState<string | null>(null);
   const [filter, setFilter] = useState<string | null>(null);
   const [query, setQuery] = useState("");
   // What the feed is currently built from: the learner's classes, or a search.
@@ -2814,7 +3827,6 @@ function VideoFeed({ topics }: { topics: string[] }) {
     if (!forTopics.length) return;
     setLoading(true);
     setError(false);
-    setPlaying(null);
     try {
       const res = await fetch("/api/videos", {
         method: "POST",
@@ -2939,29 +3951,21 @@ function VideoFeed({ topics }: { topics: string[] }) {
         <div style={styles.feedGrid}>
           {shown.map((v) => (
             <div key={v.videoId} style={styles.feedCard}>
-              {playing === v.videoId ? (
-                <iframe
-                  style={styles.feedPlayer}
-                  src={`https://www.youtube.com/embed/${v.videoId}?autoplay=1`}
-                  title={v.title}
-                  allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture"
-                  allowFullScreen
+              <a
+                href={v.url}
+                target="_blank"
+                rel="noopener noreferrer"
+                style={styles.feedThumbBtn}
+                aria-label={`Watch ${v.title} on YouTube`}
+              >
+                {/* eslint-disable-next-line @next/next/no-img-element */}
+                <img
+                  src={`https://i.ytimg.com/vi/${v.videoId}/mqdefault.jpg`}
+                  alt=""
+                  style={styles.videoThumb}
                 />
-              ) : (
-                <button
-                  style={styles.feedThumbBtn}
-                  onClick={() => setPlaying(v.videoId)}
-                  aria-label={`Play ${v.title}`}
-                >
-                  {/* eslint-disable-next-line @next/next/no-img-element */}
-                  <img
-                    src={`https://i.ytimg.com/vi/${v.videoId}/mqdefault.jpg`}
-                    alt=""
-                    style={styles.videoThumb}
-                  />
-                  <span style={styles.feedPlayBadge}>▶</span>
-                </button>
-              )}
+                <span style={styles.feedPlayBadge}>▶</span>
+              </a>
               <div style={styles.videoMeta}>
                 <span style={styles.videoTitle}>{v.title}</span>
                 <span style={styles.videoChannel}>{v.channel}</span>
@@ -3363,6 +4367,703 @@ function AssignmentsPanel({
   );
 }
 
+const WEEK_SCHEDULE_KEY = "eliora-week-schedule";
+const WEEK_CHAT_KEY = "eliora-week-chat";
+
+// She speaks first, and the first question is the one nothing else in the app
+// asks: what does your week already have in it?
+const WEEK_OPENER =
+  "Tell me what you want your week to look like and I'll draw it — one message is enough. Anything you don't mention I'll guess and say so, and you can correct it from there.";
+const WEEK_OPENER_CHIPS = [
+  "Just build me a study week",
+  "Practice most evenings",
+  "Big test in two weeks",
+  "Fit study round school",
+];
+
+// How each kind of block reads in the grid. Study is the brand violet because
+// it's the part Eliora placed; the learner's own commitments stay quieter.
+const WEEK_KINDS: Record<
+  WeekBlockKind,
+  { label: string; bg: string; border: string; ink: string }
+> = {
+  study: {
+    label: "Study",
+    bg: "var(--accent-soft)",
+    border: "var(--accent)",
+    ink: "var(--accent)",
+  },
+  activity: {
+    label: "Activity",
+    bg: "var(--warning-soft)",
+    border: "var(--warning)",
+    ink: "var(--warning)",
+  },
+  class: {
+    label: "Class",
+    bg: "var(--elevated)",
+    border: "var(--border-strong)",
+    ink: "var(--muted)",
+  },
+  rest: {
+    label: "Rest",
+    bg: "var(--surface)",
+    border: "var(--success)",
+    ink: "var(--success)",
+  },
+  other: {
+    label: "Other",
+    bg: "var(--surface)",
+    border: "var(--border-strong)",
+    ink: "var(--muted)",
+  },
+};
+
+// The schedule studio. The learner says what their week holds in their own
+// words and Eliora draws the whole thing on that first turn — the five things a
+// week needs have defaults, so a gap is a stated assumption rather than another
+// question. Nobody sits through an interview to get a timetable.
+// Two ways to change it afterwards, because both are how people actually think:
+// say it ("move gym to mornings") or drag the block to another day.
+// The week itself is owned one level up, because it's not only the studio's:
+// the Calendar draws the same blocks onto real dates.
+function ScheduleStudio({
+  profile,
+  schedule,
+  onSchedule,
+}: {
+  profile: LearnerProfile | null;
+  schedule: WeekSchedule | null;
+  onSchedule: (next: WeekSchedule | null) => void;
+}) {
+  const [turns, setTurns] = useState<WeekTurn[]>([
+    { role: "eliora", text: WEEK_OPENER },
+  ]);
+  const [chips, setChips] = useState<string[]>(WEEK_OPENER_CHIPS);
+  const [input, setInput] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState("");
+  const [editing, setEditing] = useState<string | null>(null);
+  const [dragId, setDragId] = useState<string | null>(null);
+  const [overDay, setOverDay] = useState<WeekDay | null>(null);
+  const [loaded, setLoaded] = useState(false);
+  const logRef = useRef<HTMLDivElement | null>(null);
+
+  useEffect(() => {
+    try {
+      const chat = localStorage.getItem(WEEK_CHAT_KEY);
+      if (chat) {
+        const saved = JSON.parse(chat) as WeekTurn[];
+        if (Array.isArray(saved) && saved.length) {
+          setTurns(saved);
+          setChips([]);
+        }
+      }
+    } catch {
+      // A half-written week isn't worth a crash — start the conversation over.
+    }
+    setLoaded(true);
+  }, []);
+
+  useEffect(() => {
+    if (!loaded) return;
+    try {
+      localStorage.setItem(WEEK_CHAT_KEY, JSON.stringify(turns.slice(-40)));
+    } catch {
+      // Storage full or blocked — the week still works for this session.
+    }
+  }, [turns, loaded]);
+
+  // Keep the newest turn in view; she asks one question at a time, so the
+  // bottom of the log is the only part that matters.
+  useEffect(() => {
+    const el = logRef.current;
+    if (el) el.scrollTop = el.scrollHeight;
+  }, [turns, busy]);
+
+  async function send(text: string) {
+    const said = text.trim();
+    if (!said || busy) return;
+    const next: WeekTurn[] = [...turns, { role: "user", text: said }];
+    setTurns(next);
+    setInput("");
+    setChips([]);
+    setErr("");
+    setBusy(true);
+    try {
+      const res = await fetch("/api/scheduler", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          messages: next,
+          schedule,
+          profile: profile ?? undefined,
+        }),
+      });
+      const data = (await res.json()) as {
+        reply?: WeekReply;
+        error?: string;
+      };
+      if (data.reply) {
+        setTurns((prev) => [
+          ...prev,
+          { role: "eliora", text: data.reply!.reply },
+        ]);
+        setChips(data.reply.chips ?? []);
+        if (data.reply.schedule) onSchedule(data.reply.schedule);
+      } else {
+        setErr(data.error || "Something went wrong. Try that again?");
+      }
+    } catch {
+      setErr("Couldn't reach Eliora. Check your connection and try again.");
+    }
+    setBusy(false);
+  }
+
+  function editBlock(id: string, patch: Partial<WeekBlock>) {
+    if (!schedule) return;
+    onSchedule({
+      ...schedule,
+      blocks: schedule.blocks.map((b) => (b.id === id ? { ...b, ...patch } : b)),
+    });
+  }
+  function dropBlock(id: string) {
+    if (schedule)
+      onSchedule({
+        ...schedule,
+        blocks: schedule.blocks.filter((b) => b.id !== id),
+      });
+    setEditing(null);
+  }
+  function startOver() {
+    onSchedule(null);
+    setTurns([{ role: "eliora", text: WEEK_OPENER }]);
+    setChips(WEEK_OPENER_CHIPS);
+    setEditing(null);
+    setErr("");
+  }
+
+  const byDay = useMemo(() => {
+    const map = new Map<WeekDay, WeekBlock[]>(WEEK_DAYS.map((d) => [d, []]));
+    for (const b of schedule?.blocks ?? []) map.get(b.day)?.push(b);
+    for (const list of map.values())
+      list.sort((a, b) => scheduleMinutes(a.start) - scheduleMinutes(b.start));
+    return map;
+  }, [schedule]);
+
+  const studyMin = (schedule?.blocks ?? [])
+    .filter((b) => b.kind === "study")
+    .reduce((n, b) => n + b.min, 0);
+  const hrs = (m: number) => `${Math.round((m / 60) * 10) / 10} hr`;
+
+  return (
+    <div style={styles.weekWrap}>
+      <div style={styles.card}>
+        <div style={styles.cardHead}>
+          <span style={styles.cardClass}>🗓️ Your week</span>
+          <span style={styles.subjectsCount}>
+            {schedule ? `${hrs(studyMin)} of study` : "let's find out"}
+          </span>
+        </div>
+        <p style={styles.prioBlurb}>
+          Say what your week holds — practice, work, a test coming up — and I'll
+          draw the whole thing straight away, no questionnaire. Whatever you
+          leave out I'll fill in and tell you what I assumed. Then say what to
+          change, or just drag a block to another day.
+        </p>
+      </div>
+
+      <div style={styles.weekSplit}>
+        <div style={styles.weekChat}>
+          <div style={styles.weekLog} ref={logRef}>
+            {turns.map((t, i) => (
+              <div
+                key={i}
+                style={t.role === "user" ? styles.weekMine : styles.weekHers}
+              >
+                {t.text}
+              </div>
+            ))}
+            {busy && <div style={styles.weekHers}>…</div>}
+          </div>
+
+          {!!chips.length && !busy && (
+            <div style={styles.weekChips}>
+              {chips.map((c) => (
+                <button key={c} style={styles.weekChip} onClick={() => send(c)}>
+                  {c}
+                </button>
+              ))}
+            </div>
+          )}
+          {err && <p style={styles.prioErr}>{err}</p>}
+
+          <div style={styles.weekAsk}>
+            <input
+              style={styles.weekInput}
+              value={input}
+              placeholder={
+                schedule
+                  ? "Move gym to mornings…"
+                  : "Swim Tue/Thu 5–7, bio test Friday…"
+              }
+              onChange={(e) => setInput(e.target.value)}
+              onKeyDown={(e) => {
+                if (e.key === "Enter" && !e.shiftKey) {
+                  e.preventDefault();
+                  send(input);
+                }
+              }}
+            />
+            <button
+              style={{
+                ...styles.prioBtn,
+                ...(input.trim() && !busy ? {} : styles.prioBtnOff),
+              }}
+              onClick={() => send(input)}
+              disabled={!input.trim() || busy}
+            >
+              {busy ? "…" : "Send"}
+            </button>
+          </div>
+          {schedule && (
+            <button style={styles.weekReset} onClick={startOver}>
+              ↺ Start the week over
+            </button>
+          )}
+        </div>
+
+        <div style={styles.weekWeek}>
+          {!schedule && (
+            <p style={styles.assignEmpty}>
+              Tell me about your week on the left and it's drawn here.
+            </p>
+          )}
+
+          {schedule && (
+            <>
+              {!!schedule.summary && (
+                <p style={styles.weekSummary}>{schedule.summary}</p>
+              )}
+              {!!schedule.warning && (
+                <p style={styles.weekWarn}>⚠️ {schedule.warning}</p>
+              )}
+
+              <div style={styles.weekGrid}>
+                {WEEK_DAYS.map((day) => {
+                  const list = byDay.get(day) ?? [];
+                  const dayStudy = list
+                    .filter((b) => b.kind === "study")
+                    .reduce((n, b) => n + b.min, 0);
+                  return (
+                    <div
+                      key={day}
+                      style={{
+                        ...styles.weekDay,
+                        ...(overDay === day ? styles.weekDayOver : {}),
+                      }}
+                      onDragOver={(e) => {
+                        e.preventDefault();
+                        setOverDay(day);
+                      }}
+                      onDragLeave={() =>
+                        setOverDay((d) => (d === day ? null : d))
+                      }
+                      onDrop={(e) => {
+                        e.preventDefault();
+                        if (dragId) editBlock(dragId, { day });
+                        setDragId(null);
+                        setOverDay(null);
+                      }}
+                    >
+                      <div style={styles.weekDayHead}>
+                        <span>{WEEK_DAY_LABEL[day].slice(0, 3)}</span>
+                        <span style={styles.weekDayMin}>
+                          {dayStudy ? `${dayStudy}m` : "—"}
+                        </span>
+                      </div>
+
+                      {!list.length && <div style={styles.weekFree}>free</div>}
+
+                      {list.map((b) => {
+                        const look = WEEK_KINDS[b.kind];
+                        const open = editing === b.id;
+                        return (
+                          <div key={b.id}>
+                            <div
+                              draggable
+                              onDragStart={(e) => {
+                                setDragId(b.id);
+                                e.dataTransfer.effectAllowed = "move";
+                              }}
+                              onDragEnd={() => {
+                                setDragId(null);
+                                setOverDay(null);
+                              }}
+                              onClick={() => setEditing(open ? null : b.id)}
+                              style={{
+                                ...styles.weekBlock,
+                                background: look.bg,
+                                borderColor: look.border,
+                                opacity: dragId === b.id ? 0.45 : 1,
+                              }}
+                            >
+                              <div style={{ ...styles.weekBlockTime, color: look.ink }}>
+                                {scheduleClock(b.start)} ·{" "}
+                                {b.min >= 60 ? hrs(b.min) : `${b.min}m`}
+                                {b.fixed ? " · 📌" : ""}
+                              </div>
+                              <div style={styles.weekBlockTitle}>{b.title}</div>
+                              {!!b.detail && (
+                                <div style={styles.weekBlockDetail}>{b.detail}</div>
+                              )}
+                            </div>
+
+                            {open && (
+                              <div style={styles.weekEdit}>
+                                <input
+                                  style={styles.weekEditText}
+                                  value={b.title}
+                                  onChange={(e) =>
+                                    editBlock(b.id, { title: e.target.value })
+                                  }
+                                />
+                                <div style={styles.weekEditRow}>
+                                  <input
+                                    type="time"
+                                    style={styles.weekEditField}
+                                    value={b.start}
+                                    onChange={(e) =>
+                                      editBlock(b.id, {
+                                        start: e.target.value || b.start,
+                                      })
+                                    }
+                                  />
+                                  <input
+                                    type="number"
+                                    min={5}
+                                    step={5}
+                                    style={styles.weekEditField}
+                                    value={b.min}
+                                    onChange={(e) => {
+                                      const n = parseInt(e.target.value, 10);
+                                      if (Number.isFinite(n) && n > 0)
+                                        editBlock(b.id, { min: n });
+                                    }}
+                                  />
+                                </div>
+                                {/* Dragging needs a mouse, so the day is
+                                    changeable here too — this is the only way
+                                    to move a block on a phone. */}
+                                <select
+                                  style={styles.weekEditField}
+                                  value={b.day}
+                                  onChange={(e) =>
+                                    editBlock(b.id, {
+                                      day: e.target.value as WeekDay,
+                                    })
+                                  }
+                                >
+                                  {WEEK_DAYS.map((d) => (
+                                    <option key={d} value={d}>
+                                      {WEEK_DAY_LABEL[d]}
+                                    </option>
+                                  ))}
+                                </select>
+                                <button
+                                  style={styles.weekDrop}
+                                  onClick={() => dropBlock(b.id)}
+                                >
+                                  Remove
+                                </button>
+                              </div>
+                            )}
+                          </div>
+                        );
+                      })}
+                    </div>
+                  );
+                })}
+              </div>
+
+              {!!schedule.note && <p style={styles.weekNote}>{schedule.note}</p>}
+            </>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// The priority list. Everything already on the learner's plate — open
+// assignments plus upcoming exams — goes to Eliora, who ranks it, works out
+// what each item actually NEEDS, and lays the minutes out day by day. One tap
+// writes the estimates and work-days back onto the assignments, which is what
+// fills in the Calendar's day-by-day schedule.
+function PriorityPlanner({
+  assignments,
+  events,
+  profile,
+  onApply,
+}: {
+  assignments: Assignment[];
+  events: StudyEvent[];
+  profile: LearnerProfile | null;
+  onApply: (plan: PriorityPlan) => void;
+}) {
+  const [perDay, setPerDay] = useState(String(PRIORITY_DEFAULT_MIN_PER_DAY));
+  const [loading, setLoading] = useState(false);
+  const [plan, setPlan] = useState<PriorityPlan | null>(null);
+  const [err, setErr] = useState("");
+  const [applied, setApplied] = useState(false);
+  const [openNeeds, setOpenNeeds] = useState<Record<string, boolean>>({});
+
+  const todayISO = localISO(new Date());
+  const horizonISO = new Date(Date.now() + 14 * 86_400_000)
+    .toISOString()
+    .slice(0, 10);
+  const open = assignments.filter((a) => !a.done);
+  // Exams and quizzes in the window count as work too — they need study time
+  // even though nothing gets "handed in".
+  const exams = events.filter(
+    (e) => e.date >= todayISO && e.date <= horizonISO && e.kind !== "other",
+  );
+  const canPlan = open.length + exams.length > 0;
+
+  const parsedPerDay = parseInt(perDay, 10);
+  const budget =
+    Number.isFinite(parsedPerDay) && parsedPerDay > 0
+      ? parsedPerDay
+      : PRIORITY_DEFAULT_MIN_PER_DAY;
+  const fmtMin = (m: number) =>
+    m >= 60 ? `${Math.round((m / 60) * 10) / 10} hr` : `${m} min`;
+  const dayLabel = (dISO: string) =>
+    dISO === todayISO
+      ? "Today"
+      : new Date(`${dISO}T00:00:00`).toLocaleDateString("en-US", {
+          weekday: "short",
+          month: "short",
+          day: "numeric",
+        });
+  const LEVEL: Record<
+    PriorityLevel,
+    { label: string; style: React.CSSProperties }
+  > = {
+    high: { label: "High", style: styles.prioRankHigh },
+    med: { label: "Medium", style: styles.prioRankMed },
+    low: { label: "Low", style: styles.prioRankLow },
+  };
+
+  async function build() {
+    if (!canPlan || loading) return;
+    setLoading(true);
+    setErr("");
+    setApplied(false);
+    const items: PriorityInput[] = [
+      ...open.map((a) => ({
+        id: a.id,
+        title: a.title,
+        subject: a.subject,
+        due: a.due,
+        kind: "assignment" as const,
+        concern: a.concern,
+        estMin: a.estMin,
+      })),
+      ...exams.map((e) => ({
+        id: e.id,
+        title: e.title,
+        due: e.date,
+        kind: "exam" as const,
+      })),
+    ];
+    const mins = parseInt(perDay, 10);
+    try {
+      const res = await fetch("/api/priorities", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          items,
+          today: todayISO,
+          minutesPerDay:
+            Number.isFinite(mins) && mins > 0
+              ? mins
+              : PRIORITY_DEFAULT_MIN_PER_DAY,
+          profile: profile ?? undefined,
+        }),
+      });
+      const data = (await res.json()) as {
+        plan?: PriorityPlan;
+        error?: string;
+      };
+      if (data.plan) setPlan(data.plan);
+      else setErr(data.error || "Something went wrong. Try again?");
+    } catch {
+      setErr("Couldn't reach Eliora. Check your connection and try again.");
+    }
+    setLoading(false);
+  }
+
+  return (
+    <div style={styles.card}>
+      <div style={styles.cardHead}>
+        <span style={styles.cardClass}>🎯 Priority list</span>
+        <span style={styles.subjectsCount}>
+          {canPlan ? `${open.length + exams.length} on your plate` : "nothing yet"}
+        </span>
+      </div>
+      <p style={styles.prioBlurb}>
+        I'll rank everything you've got, work out what each one actually takes,
+        and spread it across your days.
+      </p>
+      <div style={styles.prioControls}>
+        <span style={styles.timeLabel}>I can work about</span>
+        <input
+          type="number"
+          min={15}
+          step={15}
+          style={styles.timeInput}
+          value={perDay}
+          onChange={(e) => setPerDay(e.target.value)}
+        />
+        <span style={styles.timeLabel}>min a day</span>
+        <button
+          style={{
+            ...styles.prioBtn,
+            ...(canPlan && !loading ? {} : styles.prioBtnOff),
+          }}
+          onClick={build}
+          disabled={!canPlan || loading}
+        >
+          {loading
+            ? "Sorting…"
+            : plan
+              ? "↻ Re-sort"
+              : "🎯 Sort my priorities"}
+        </button>
+      </div>
+
+      {!canPlan && (
+        <p style={styles.assignEmpty}>
+          Add an assignment or a test date above and I'll sort it out for you.
+        </p>
+      )}
+      {err && <p style={styles.prioErr}>{err}</p>}
+
+      {plan && (
+        <div style={{ marginTop: 4 }}>
+          {plan.summary && <p style={styles.prioSummary}>{plan.summary}</p>}
+          {plan.warning && <p style={styles.prioWarning}>⚠️ {plan.warning}</p>}
+
+          {plan.items.map((it) => {
+            const lvl = LEVEL[it.priority];
+            const showing = !!openNeeds[it.id];
+            return (
+              <div key={it.id} style={styles.prioItem}>
+                <div style={styles.prioItemHead}>
+                  <span style={{ ...styles.prioRank, ...lvl.style }}>
+                    {lvl.label}
+                  </span>
+                  <span style={styles.prioItemTitle}>{it.title}</span>
+                  <span style={styles.prioItemMin}>{fmtMin(it.estMin)}</span>
+                </div>
+                {it.why && <div style={styles.prioWhy}>{it.why}</div>}
+                <div style={styles.prioWhen}>
+                  {it.planDate ? `Work on it ${dayLabel(it.planDate)}` : ""}
+                  {it.startBy && it.startBy !== it.planDate
+                    ? `${it.planDate ? " · " : ""}start by ${dayLabel(it.startBy)}`
+                    : ""}
+                </div>
+                {it.needs.length > 0 && (
+                  <>
+                    <button
+                      style={styles.linkBtn}
+                      onClick={() =>
+                        setOpenNeeds((p) => ({ ...p, [it.id]: !p[it.id] }))
+                      }
+                    >
+                      {showing
+                        ? "Hide what it needs"
+                        : `What it needs (${it.needs.length})`}
+                    </button>
+                    {showing && (
+                      <ol style={styles.prioNeeds}>
+                        {it.needs.map((n, i) => (
+                          <li key={i} style={styles.prioNeed}>
+                            {n}
+                          </li>
+                        ))}
+                      </ol>
+                    )}
+                  </>
+                )}
+              </div>
+            );
+          })}
+
+          {plan.schedule.length > 0 && (
+            <div style={styles.prioSchedule}>
+              <div style={styles.prioScheduleHead}>⏳ Your schedule</div>
+              {plan.schedule.map((b) => {
+                // Eliora aims for the learner's daily limit but sometimes runs
+                // over. Say so rather than quietly handing them a heavier day.
+                const over = b.totalMin > budget;
+                return (
+                <div key={b.date} style={styles.prioDay}>
+                  <div style={styles.prioDayHead}>
+                    <span style={styles.prioDayName}>{dayLabel(b.date)}</span>
+                    <span
+                      style={{
+                        ...styles.prioDayMin,
+                        ...(over ? styles.prioDayOver : {}),
+                      }}
+                    >
+                      {fmtMin(b.totalMin)}
+                      {over ? ` · over your ${fmtMin(budget)}` : ""}
+                    </span>
+                  </div>
+                  {b.slots.map((s, i) => (
+                    <div key={`${s.id}-${i}`} style={styles.prioSlot}>
+                      <span style={styles.prioSlotMin}>{s.min}m</span>
+                      <span style={{ flex: 1 }}>
+                        {s.title}
+                        {s.focus && (
+                          <span style={styles.prioSlotFocus}> — {s.focus}</span>
+                        )}
+                      </span>
+                    </div>
+                  ))}
+                </div>
+                );
+              })}
+            </div>
+          )}
+
+          {plan.note && <p style={styles.prioNote}>{plan.note}</p>}
+
+          <button
+            style={{
+              ...styles.prioApply,
+              ...(applied ? styles.prioApplyDone : {}),
+            }}
+            onClick={() => {
+              onApply(plan);
+              setApplied(true);
+            }}
+          >
+            {applied
+              ? "✓ Added to your schedule"
+              : "＋ Put this on my schedule"}
+          </button>
+          <div style={styles.prioApplyHint}>
+            Fills in the time and work-day on each assignment, so it shows up in
+            your calendar.
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
 // A guided SMART-goal builder (Specific, Measurable, Achievable, Relevant,
 // Time-bound). Only the goal itself is required; the rest gently prompt the
 // learner through the framework. Returns the new goal to the parent on save.
@@ -3579,8 +5280,6 @@ function GoalsPanel({
   onToggleTask,
   onHelpTask,
   breakingGoalId,
-  rewards,
-  onLinkReward,
 }: {
   goals: SmartGoal[];
   subjects: string[];
@@ -3595,8 +5294,6 @@ function GoalsPanel({
   onToggleTask: (goalId: string, index: number) => void;
   onHelpTask: (goal: SmartGoal, taskTitle: string) => void;
   breakingGoalId: string | null;
-  rewards: CustomReward[];
-  onLinkReward: (goalId: string, rewardId: string | undefined) => void;
 }) {
   const [building, setBuilding] = useState(false);
   const [showDone, setShowDone] = useState(false);
@@ -3637,18 +5334,6 @@ function GoalsPanel({
     setSuggestions((prev) => (prev ? prev.filter((_, x) => x !== i) : prev));
   const activeGoals = goals.filter((g) => !g.done);
   const achieved = goals.filter((g) => g.done);
-  // Goal achievements: the badges you unlock by achieving goals, shown right
-  // here so progress toward them is visible where goals live. They only depend
-  // on goal counts, so build a minimal stats object (XP fields unused here).
-  const goalBadges = BADGE_DEFS.filter((b) => b.id.startsWith("goal-"));
-  const goalStats: BadgeStats = {
-    total: 0,
-    activeDays: 0,
-    streak: 0,
-    goalsAchieved: achieved.length,
-    goalHorizons: new Set(achieved.map((g) => g.horizon).filter(Boolean)).size,
-  };
-  const earnedGoalBadges = goalBadges.filter((b) => b.met(goalStats)).length;
   // Within a group, soonest deadline first (undated goals last).
   const byDeadline = (a: SmartGoal, b: SmartGoal) => {
     if (a.timeBound && b.timeBound) return a.timeBound.localeCompare(b.timeBound);
@@ -3796,46 +5481,6 @@ function GoalsPanel({
             ))}
           </div>
         )}
-        {(() => {
-          const prize = g.rewardId
-            ? rewards.find((r) => r.id === g.rewardId)
-            : undefined;
-          // Achieved goals show the treat they won; active goals let you pick or
-          // change the reward you're working toward.
-          if (g.done) {
-            return prize ? (
-              <div style={styles.goalPrizeEarned}>
-                🎁 Reward earned: {prize.emoji} {prize.title}
-              </div>
-            ) : null;
-          }
-          return (
-            <div style={styles.goalPrizeRow}>
-              <span style={styles.goalPrizeLabel}>🎁 Prize</span>
-              {rewards.length === 0 ? (
-                <span style={styles.goalPrizeHint}>
-                  Add a reward in “My rewards” to work toward one
-                </span>
-              ) : (
-                <select
-                  style={styles.goalPrizeSelect}
-                  value={g.rewardId ?? ""}
-                  onChange={(e) =>
-                    onLinkReward(g.id, e.target.value || undefined)
-                  }
-                  aria-label="Reward for achieving this goal"
-                >
-                  <option value="">No reward</option>
-                  {rewards.map((r) => (
-                    <option key={r.id} value={r.id}>
-                      {r.emoji} {r.title}
-                    </option>
-                  ))}
-                </select>
-              )}
-            </div>
-          );
-        })()}
         {!g.done && (
           <button
             style={styles.goalBreakBtn}
@@ -3868,46 +5513,6 @@ function GoalsPanel({
           Set a goal to aim for — Eliora will tie your plan to it. Make it SMART:
           Specific, Measurable, Achievable, Relevant, Time-bound.
         </p>
-      )}
-      {goals.length > 0 && (
-        <div style={styles.goalAchStrip}>
-          <div style={styles.goalAchHead}>
-            <span style={styles.goalAchTitle}>🏆 Achievements</span>
-            <span style={styles.subjectsCount}>
-              {earnedGoalBadges}/{goalBadges.length} unlocked
-            </span>
-          </div>
-          <div style={styles.goalAchRow}>
-            {goalBadges.map((bd) => {
-              const earned = bd.met(goalStats);
-              return (
-                <div
-                  key={bd.id}
-                  style={styles.goalAchItem}
-                  title={earned ? `${bd.label} — ${bd.blurb}` : `🔒 ${bd.hint}`}
-                >
-                  <span
-                    style={{
-                      ...styles.goalAchMedal,
-                      background: bd.bg,
-                      ...(earned ? {} : styles.badgeMedalLocked),
-                    }}
-                  >
-                    {bd.emoji}
-                  </span>
-                  <span
-                    style={{
-                      ...styles.goalAchLabel,
-                      ...(earned ? {} : { color: "var(--muted)" }),
-                    }}
-                  >
-                    {bd.label}
-                  </span>
-                </div>
-              );
-            })}
-          </div>
-        </div>
       )}
       {goalGroups.map((grp) => {
         const inGroup = activeGoals
@@ -4070,12 +5675,20 @@ type DailyTask = {
   priority?: Priority; // importance ranking (defaults to "med" when unset)
   estMin?: number; // estimated minutes — the time budget for this task
   done: boolean;
+  mine?: boolean; // the learner added this one themselves — regeneration keeps it
 };
 type DailyTasksState = { date: string; tasks: DailyTask[] };
 
-// Weight each priority carries when splitting a fixed time block across tasks:
-// a "high" task gets 3× the minutes of a "low" one.
-const PRIORITY_WEIGHT: Record<Priority, number> = { high: 3, med: 2, low: 1 };
+// When a task carries no estimate of its own, this is how much work we assume it
+// needs — a "high" task is treated as the meatier one.
+const PRIORITY_DEFAULT_MIN: Record<Priority, number> = {
+  high: 30,
+  med: 20,
+  low: 15,
+};
+// If the day is too short for everything, minutes are trimmed proportionally —
+// but a "high" task keeps a little more of what it needs than a "low" one.
+const PRIORITY_TILT: Record<Priority, number> = { high: 1.3, med: 1, low: 0.8 };
 const PRIORITY_RANK: Record<Priority, number> = { high: 0, med: 1, low: 2 };
 const PRIORITY_LABEL: Record<Priority, string> = {
   high: "High",
@@ -4085,30 +5698,54 @@ const PRIORITY_LABEL: Record<Priority, string> = {
 const PRIORITY_ORDER: Priority[] = ["high", "med", "low"];
 const taskPriority = (t: DailyTask): Priority => t.priority ?? "med";
 
-// Split a fixed block of minutes across tasks weighted by priority. Only unfinished
-// tasks get time; each slice is rounded to 5 min (min 5), then rounding drift is
-// absorbed by the highest-priority task so the slices sum back to the block.
-function budgetByPriority(
+// How much work a task needs: its own estimate when it has one, otherwise a
+// sensible default for its priority. Always a multiple of 5, never under 5.
+const taskNeedMin = (t: DailyTask): number =>
+  Math.max(
+    5,
+    Math.round((t.estMin || PRIORITY_DEFAULT_MIN[taskPriority(t)]) / 5) * 5,
+  );
+
+// Divide a block of minutes across today's open tasks BY WHAT EACH ONE NEEDS.
+// If the block covers everything, each task simply gets its own estimate and the
+// spare time stays spare — nothing is padded out to fill the hour. If the day is
+// short, every task is trimmed in proportion to what it needed (with high-priority
+// work trimmed the least), never below 5 min, and rounding drift lands on the
+// highest-priority task so the slices sum back to the block.
+function budgetByNeed(
   tasks: DailyTask[],
   blockMin: number,
 ): (number | undefined)[] {
   const idx = tasks
-    .map((t, i) => ({ t, i }))
+    .map((t, i) => ({ t, i, need: taskNeedMin(t) }))
     .filter(({ t }) => !t.done && t.title.trim());
   const out: (number | undefined)[] = tasks.map(() => undefined);
   if (!idx.length || blockMin < 5) return out;
+
+  const totalNeed = idx.reduce((n, x) => n + x.need, 0);
+  // Enough time for the whole list — everyone gets exactly what they need.
+  if (blockMin >= totalNeed) {
+    for (const { i, need } of idx) out[i] = need;
+    return out;
+  }
+
+  // Short on time: scale every task down by the same proportion of its need,
+  // tilted so the high-priority work gives up the fewest minutes.
   const totalWeight = idx.reduce(
-    (n, { t }) => n + PRIORITY_WEIGHT[taskPriority(t)],
+    (n, x) => n + x.need * PRIORITY_TILT[taskPriority(x.t)],
     0,
   );
   let assigned = 0;
-  for (const { t, i } of idx) {
-    const share = (blockMin * PRIORITY_WEIGHT[taskPriority(t)]) / totalWeight;
-    const rounded = Math.max(5, Math.round(share / 5) * 5);
+  for (const { t, i, need } of idx) {
+    const share =
+      (blockMin * (need * PRIORITY_TILT[taskPriority(t)])) / totalWeight;
+    // Never more than the task needs, never less than a 5-minute start.
+    const rounded = Math.min(need, Math.max(5, Math.round(share / 5) * 5));
     out[i] = rounded;
     assigned += rounded;
   }
-  // Absorb rounding drift on the highest-priority open task (never below 5 min).
+  // Absorb rounding drift on the highest-priority open task (never below 5 min,
+  // and never past what that task actually needs).
   let drift = blockMin - assigned;
   if (drift !== 0) {
     const top = idx
@@ -4119,7 +5756,11 @@ function budgetByPriority(
       )[0];
     if (top) {
       const step = drift > 0 ? 5 : -5;
-      while (drift !== 0 && (out[top.i] ?? 0) + step >= 5) {
+      while (
+        drift !== 0 &&
+        (out[top.i] ?? 0) + step >= 5 &&
+        (out[top.i] ?? 0) + step <= top.need
+      ) {
         out[top.i] = (out[top.i] ?? 0) + step;
         drift -= step;
       }
@@ -4360,7 +6001,7 @@ function TutorPicker({
   return (
     <div style={styles.card}>
       <div style={styles.cardHead}>
-        <span style={styles.cardClass}>🧑‍🏫 AI tutors</span>
+        <span style={styles.cardClass}>🧑‍🏫 Pick your tutor</span>
         <span style={{ color: "var(--muted)", fontSize: 13 }}>
           {active.emoji} {active.name}
         </span>
@@ -4368,7 +6009,7 @@ function TutorPicker({
       <p style={{ color: "var(--muted)", margin: "2px 0 12px", fontSize: 13 }}>
         Pick who teaches you. Each tutor explains their subject differently and
         has their own voice — everything else (your plan, goals, and tools)
-        stays the same.
+        stays the same. Whoever you pick takes your AI Tutor sessions too.
       </p>
       <div style={styles.tutorGrid}>
         {ELIORA_TUTORS.map((t) => {
@@ -4409,6 +6050,14 @@ function TutorPicker({
               `Hi, I'm ${active.name}. I help with ${active.subject.toLowerCase()}. ` +
                 `Tell me what you're working on and we'll take it one step at a time.`,
               (s) => setPreviewing(s !== "idle"),
+              // The preview is a promise about the sessions — so it uses the
+              // same voice, manner, and pace those sessions will.
+              {
+                voice: active.voice,
+                pace: active.pace,
+                browser: active.browserVoice,
+                instructions: tutorVoiceDirection(active.id),
+              },
             )
           }
         >
@@ -5112,7 +6761,7 @@ function taskCheer(done: number, total: number, seed: number): string {
   if (done === 0)
     return pick([
       "🚀 One small task to start — momentum beats motivation. Pick the top one.",
-      "🌱 Every plan begins with a single check. You've got this.",
+      "💡 Every plan begins with a single check. You've got this.",
       "🎯 Just start with one. Future-you is already grateful.",
     ]);
   if (done === total)
@@ -5147,6 +6796,11 @@ function DailyTasksCard({
   onSetMin,
   onSetPriority,
   onBudget,
+  onAdd,
+  onDelete,
+  onMove,
+  onRename,
+  onSortByPriority,
 }: {
   state: DailyTasksState | null;
   loading: boolean;
@@ -5156,22 +6810,78 @@ function DailyTasksCard({
   onSetMin: (i: number, min: number) => void;
   onSetPriority: (i: number, p: Priority) => void;
   onBudget: (blockMin: number) => void;
+  onAdd: (title: string, priority: Priority) => void;
+  onDelete: (i: number) => void;
+  onMove: (i: number, dir: -1 | 1) => void;
+  onRename: (i: number, title: string) => void;
+  onSortByPriority: () => void;
 }) {
   const today = localISO();
   const fresh = state?.date === today;
   const tasks = fresh ? state!.tasks : [];
   const doneCount = tasks.filter((t) => t.done).length;
-  // How many minutes to split across tasks by priority. Seeds from today's
-  // scheduled study time; the learner can override it before splitting.
+  // How many minutes to divide across tasks by what each needs. Seeds from
+  // today's scheduled study time; the learner can override it before splitting.
   const [blockMin, setBlockMin] = useState<number>(budgetMin || 60);
   useEffect(() => {
     if (budgetMin > 0) setBlockMin(budgetMin);
   }, [budgetMin]);
-  // Show tasks highest-priority first (stable within a priority, so generation
-  // order is preserved for ties). Keep each task's real index for the handlers.
-  const ordered = tasks
-    .map((t, i) => ({ t, i }))
-    .sort((a, b) => PRIORITY_RANK[taskPriority(a.t)] - PRIORITY_RANK[taskPriority(b.t)]);
+  // The list is shown in the learner's own order — the array itself is the
+  // ranking, so ↑/↓ move a task and it stays put. Freshly generated tasks
+  // arrive priority-sorted, and "⇅ By priority" re-applies that sort on demand.
+  const ordered = tasks.map((t, i) => ({ t, i }));
+  // The "add your own task" row, and which task (if any) is being renamed.
+  const [draft, setDraft] = useState("");
+  const [draftPrio, setDraftPrio] = useState<Priority>("med");
+  const [editing, setEditing] = useState<number | null>(null);
+  const [editText, setEditText] = useState("");
+  const submitDraft = () => {
+    const title = draft.trim();
+    if (!title) return;
+    onAdd(title, draftPrio);
+    setDraft("");
+    setDraftPrio("med");
+  };
+  const commitRename = () => {
+    if (editing == null) return;
+    const title = editText.trim();
+    if (title) onRename(editing, title);
+    setEditing(null);
+  };
+  // The add-your-own row: shown both when the list is empty and under a list.
+  const addRow = (
+    <div style={styles.taskAddRow}>
+      <button
+        style={{ ...styles.prioBadge, ...styles[`prio_${draftPrio}`] }}
+        onClick={() =>
+          setDraftPrio(
+            PRIORITY_ORDER[(PRIORITY_ORDER.indexOf(draftPrio) + 1) % 3],
+          )
+        }
+        title={`Priority: ${PRIORITY_LABEL[draftPrio]} — tap to change`}
+        aria-label={`New task priority ${PRIORITY_LABEL[draftPrio]}, tap to change`}
+      >
+        {PRIORITY_LABEL[draftPrio]}
+      </button>
+      <input
+        style={styles.taskAddInput}
+        value={draft}
+        placeholder="Add your own task…"
+        aria-label="New task"
+        onChange={(e) => setDraft(e.target.value)}
+        onKeyDown={(e) => {
+          if (e.key === "Enter") submitDraft();
+        }}
+      />
+      <button
+        style={styles.budgetSplitBtn}
+        disabled={!draft.trim()}
+        onClick={submitDraft}
+      >
+        ＋ Add
+      </button>
+    </div>
+  );
   const fmtMin = (m: number) =>
     m >= 60 ? `${Math.round((m / 60) * 10) / 10} hr` : `${m} min`;
   // Time budget: total estimated minutes and how much is still left to do.
@@ -5205,7 +6915,7 @@ function DailyTasksCard({
           <>
             <p style={styles.assignEmpty}>
               A fresh set of small tasks for today, built from your plan and
-              what&apos;s coming up.
+              what&apos;s coming up — or write your own list below.
             </p>
             <button
               style={styles.goalSuggestBtn}
@@ -5214,6 +6924,7 @@ function DailyTasksCard({
             >
               ✨ Generate today&apos;s tasks
             </button>
+            {addRow}
           </>
         )
       ) : (
@@ -5239,7 +6950,7 @@ function DailyTasksCard({
             </div>
           )}
 
-          {/* Split a fixed block of time across today's tasks by priority. */}
+          {/* Divide a fixed block of time across today's tasks by what each needs. */}
           <div style={styles.budgetSplit}>
             <span style={styles.budgetSplitLabel}>Split</span>
             <input
@@ -5254,16 +6965,24 @@ function DailyTasksCard({
               }
             />
             <span style={styles.budgetSplitLabel}>
-              min by priority
+              min by what each needs
               {budgetMin > 0 ? " (from your schedule)" : ""}
             </span>
             <button
               style={styles.budgetSplitBtn}
               disabled={blockMin < 5}
               onClick={() => onBudget(blockMin)}
-              title="Give each task minutes based on its priority"
+              title="Give each task the minutes it needs — trimmed evenly (High least) if the time runs short — then block them out on today's schedule, High-priority work first"
             >
               ⚖️ Budget it
+            </button>
+            <button
+              style={styles.budgetSplitBtn}
+              disabled={tasks.length < 2}
+              onClick={onSortByPriority}
+              title="Re-sort the list High → Low (you can still move tasks after)"
+            >
+              ⇅ By priority
             </button>
           </div>
 
@@ -5293,10 +7012,65 @@ function DailyTasksCard({
                     >
                       {PRIORITY_LABEL[p]}
                     </button>
-                    <span
-                      style={t.done ? styles.assignTitleDone : styles.assignTitle}
-                    >
-                      {t.title}
+                    {editing === i ? (
+                      <input
+                        autoFocus
+                        style={styles.taskEditInput}
+                        value={editText}
+                        aria-label="Task name"
+                        onChange={(e) => setEditText(e.target.value)}
+                        onBlur={commitRename}
+                        onKeyDown={(e) => {
+                          if (e.key === "Enter") commitRename();
+                          if (e.key === "Escape") setEditing(null);
+                        }}
+                      />
+                    ) : (
+                      <span
+                        style={{
+                          ...(t.done
+                            ? styles.assignTitleDone
+                            : styles.assignTitle),
+                          cursor: "text",
+                        }}
+                        title="Click to rename"
+                        onClick={() => {
+                          setEditing(i);
+                          setEditText(t.title);
+                        }}
+                      >
+                        {t.title}
+                      </span>
+                    )}
+                    {/* Rank this task against the others, and drop it if it's
+                        not yours to do. Order here is the learner's own. */}
+                    <span style={styles.taskRankBtns}>
+                      <button
+                        style={styles.taskRankBtn}
+                        disabled={i === 0}
+                        onClick={() => onMove(i, -1)}
+                        title="Move up"
+                        aria-label={`Move ${t.title} up`}
+                      >
+                        ↑
+                      </button>
+                      <button
+                        style={styles.taskRankBtn}
+                        disabled={i === tasks.length - 1}
+                        onClick={() => onMove(i, 1)}
+                        title="Move down"
+                        aria-label={`Move ${t.title} down`}
+                      >
+                        ↓
+                      </button>
+                      <button
+                        style={styles.taskRankBtn}
+                        onClick={() => onDelete(i)}
+                        title="Remove this task"
+                        aria-label={`Remove ${t.title}`}
+                      >
+                        ✕
+                      </button>
                     </span>
                   </div>
                   {(t.subject || t.why) && (
@@ -5325,6 +7099,7 @@ function DailyTasksCard({
               </div>
             );
           })}
+          {addRow}
           <div
             style={{
               display: "flex",
@@ -5337,7 +7112,7 @@ function DailyTasksCard({
             <span style={{ fontSize: 13, color: "var(--muted)" }}>
               {allDone
                 ? "🎉 All done for today — nice work!"
-                : "New tasks arrive each day."}
+                : "New tasks arrive each day — yours are kept."}
             </span>
             <button style={styles.linkBtn} disabled={loading} onClick={onGenerate}>
               {loading ? "…" : "↻ New tasks"}
@@ -5351,584 +7126,61 @@ function DailyTasksCard({
 
 // Compact 4-year-plan summary for the Home dashboard: the destination + how many
 // courses are done, tappable to open the full roadmap.
-// Local YYYY-MM-DD (not UTC) so streaks line up with the learner's own day.
+// Local YYYY-MM-DD (not UTC) so days line up with the learner's own day.
 function localISO(dt = new Date()): string {
   const p = (n: number) => String(n).padStart(2, "0");
   return `${dt.getFullYear()}-${p(dt.getMonth() + 1)}-${p(dt.getDate())}`;
 }
-const DAILY_XP_GOAL = 100;
-// Reward system: study-room backgrounds unlocked with total XP, then equipped.
-type StudyRoom = { id: string; name: string; emoji: string; cost: number; bg: string };
-const STUDY_ROOMS: StudyRoom[] = [
-  { id: "meadow", name: "Meadow", emoji: "🌿", cost: 0, bg: "linear-gradient(135deg,#c6ecc8,#8fd0a5)" },
-  { id: "library", name: "Cozy Library", emoji: "📚", cost: 50, bg: "linear-gradient(135deg,#ecd8b6,#c9a878)" },
-  { id: "night", name: "Night Sky", emoji: "🌌", cost: 150, bg: "linear-gradient(135deg,#2b2f6b,#6a5aa0)" },
-  { id: "cafe", name: "Café", emoji: "☕", cost: 300, bg: "linear-gradient(135deg,#dcb890,#a8794f)" },
-  { id: "beach", name: "Beach", emoji: "🏖️", cost: 500, bg: "linear-gradient(135deg,#bfeaf3,#f5e6b8)" },
-  { id: "forest", name: "Forest", emoji: "🌲", cost: 800, bg: "linear-gradient(135deg,#2f5e36,#5da152)" },
-  { id: "space", name: "Space", emoji: "🚀", cost: 1200, bg: "linear-gradient(135deg,#0f1030,#3a2a6a)" },
-  { id: "sakura", name: "Sakura", emoji: "🌸", cost: 1800, bg: "linear-gradient(135deg,#ffd6e8,#ff9dc4)" },
-  { id: "rain", name: "Rainy Window", emoji: "🌧️", cost: 2500, bg: "linear-gradient(135deg,#6b7a8f,#aebccd)" },
-  { id: "aurora", name: "Aurora", emoji: "🌠", cost: 3200, bg: "linear-gradient(135deg,#0b2a3a,#3ad6a0)" },
-  { id: "autumn", name: "Autumn", emoji: "🍂", cost: 4000, bg: "linear-gradient(135deg,#e0a15a,#c25b2c)" },
-  { id: "reef", name: "Coral Reef", emoji: "🐠", cost: 5000, bg: "linear-gradient(135deg,#1b6ca8,#3fc1c9)" },
-  { id: "volcano", name: "Volcano", emoji: "🌋", cost: 6500, bg: "linear-gradient(135deg,#4a1717,#c0392b)" },
-  { id: "candlelit", name: "Candlelit", emoji: "🕯️", cost: 8000, bg: "linear-gradient(135deg,#241c12,#a3701f)" },
-  { id: "rainbow", name: "Rainbow", emoji: "🌈", cost: 10000, bg: "linear-gradient(135deg,#ff9a9e,#a18cd1)" },
-];
-const roomById = (id?: string) =>
-  STUDY_ROOMS.find((r) => r.id === id) ?? STUDY_ROOMS[0];
-
-// The rewards shop: unlock study rooms with total XP, equip your favorite.
-function RewardsCard({
-  totalXp,
-  equipped,
-  onEquip,
-}: {
-  totalXp: number;
-  equipped: string;
-  onEquip: (id: string) => void;
-}) {
-  const next = STUDY_ROOMS.find((r) => r.cost > totalXp);
-  return (
-    <div style={styles.card}>
-      <div style={styles.cardHead}>
-        <span style={styles.cardClass}>🎁 Study rooms</span>
-        <span style={styles.subjectsCount}>⭐ {totalXp} XP</span>
-      </div>
-      <p style={{ color: "var(--muted)", margin: "2px 0 8px", fontSize: 13 }}>
-        Unlock backgrounds with XP, then equip your favorite.
-        {next ? ` Next: ${next.emoji} ${next.name} at ${next.cost} XP.` : ""}
-      </p>
-      <div style={styles.roomGrid}>
-        {STUDY_ROOMS.map((r) => {
-          const unlocked = totalXp >= r.cost;
-          const isEq = equipped === r.id;
-          return (
-            <button
-              key={r.id}
-              disabled={!unlocked}
-              onClick={() => unlocked && onEquip(r.id)}
-              style={{
-                ...styles.roomChip,
-                background: r.bg,
-                ...(isEq ? styles.roomChipEq : {}),
-                ...(unlocked ? {} : { filter: "grayscale(0.7)", opacity: 0.55 }),
-              }}
-              title={
-                unlocked
-                  ? isEq
-                    ? "Equipped"
-                    : "Tap to equip"
-                  : `Reach ${r.cost} XP to unlock`
-              }
-            >
-              <span style={styles.roomEmoji}>{r.emoji}</span>
-              <span style={styles.roomName}>{r.name}</span>
-              <span style={styles.roomStatus}>
-                {isEq
-                  ? "✓ Equipped"
-                  : unlocked
-                    ? "Tap to equip"
-                    : `🔒 ${r.cost} XP`}
-              </span>
-            </button>
-          );
-        })}
-      </div>
-    </div>
-  );
-}
-
-// Learner-created rewards: personal treats the student defines and "buys" with
-// the XP they earn. Redeeming spends from an AVAILABLE balance (earned − spent)
-// so cumulative XP for badges, streaks, and study rooms is never reduced.
-type CustomReward = {
-  id: string;
-  emoji: string;
-  title: string;
-  cost: number;
-  redeemed: number; // how many times it's been claimed
-  log?: string[]; // what the student typed each time they redeemed ("their output")
-};
-
-const REWARD_EMOJIS = [
-  "🎁", "🍦", "🎮", "📺", "🍕", "☕", "🛍️", "😴", "🎧", "🍫", "⚽", "🎬",
-];
-
-function MyRewardsCard({
-  availableXp,
-  rewards,
-  goals,
-  onAdd,
-  onRedeem,
-  onRemove,
-}: {
-  availableXp: number;
-  rewards: CustomReward[];
-  goals: SmartGoal[];
-  onAdd: (emoji: string, title: string, cost: number) => void;
-  onRedeem: (id: string, note?: string) => void;
-  onRemove: (id: string) => void;
-}) {
-  const [emoji, setEmoji] = useState(REWARD_EMOJIS[0]);
-  const [title, setTitle] = useState("");
-  const [cost, setCost] = useState("");
-  // Which reward is mid-redeem (its compose box is open) and what the student
-  // is typing as "their output" — a note about what they did to earn it.
-  const [redeemingId, setRedeemingId] = useState<string | null>(null);
-  const [note, setNote] = useState("");
-  const claim = (id: string) => {
-    onRedeem(id, note.trim() || undefined);
-    setRedeemingId(null);
-    setNote("");
+// The study-progress card: real time on task. Shows total hours and active
+// days, which days of this week had study time, minutes per day over the last
+// two weeks, cumulative hours over the last month, and hours per week.
+// `study` maps YYYY-MM-DD → minutes studied that day.
+function ProgressCard({ study = {} }: { study?: Record<string, number> }) {
+  // "3h 20m" / "45m" / "0m" — friendly hours+minutes from a minute count.
+  const fmtDuration = (mins: number) => {
+    const m = Math.round(mins);
+    const h = Math.floor(m / 60);
+    const r = m % 60;
+    return h > 0 ? (r ? `${h}h ${r}m` : `${h}h`) : `${r}m`;
   };
-  const costNum = parseInt(cost, 10);
-  const canAdd = !!title.trim() && Number.isFinite(costNum) && costNum > 0;
-  const add = () => {
-    if (!canAdd) return;
-    onAdd(emoji, title.trim(), costNum);
-    setTitle("");
-    setCost("");
-    setEmoji(REWARD_EMOJIS[0]);
-  };
-  return (
-    <div style={styles.card}>
-      <div style={styles.cardHead}>
-        <span style={styles.cardClass}>🎁 My rewards</span>
-        <span style={styles.subjectsCount}>⭐ {availableXp} to spend</span>
-      </div>
-      <p style={{ color: "var(--muted)", margin: "2px 0 10px", fontSize: 13 }}>
-        Set your own rewards and treat yourself with the XP you earn. Redeeming
-        spends XP but keeps your badges, streak, and study rooms.
-      </p>
-      {rewards.length === 0 ? (
-        <p style={styles.assignEmpty}>
-          No rewards yet — add one below (e.g. &ldquo;30 min of gaming&rdquo; for
-          100 XP).
-        </p>
-      ) : (
-        rewards.map((r) => {
-          const afford = availableXp >= r.cost;
-          const pct = Math.min(
-            100,
-            Math.round((availableXp / Math.max(1, r.cost)) * 100),
-          );
-          // A reward can be the prize for an active goal — surface that tie so
-          // the learner sees which goal unlocks this treat for free.
-          const prizeGoal = goals.find((g) => g.rewardId === r.id && !g.done);
-          const composing = redeemingId === r.id;
-          const log = r.log ?? [];
-          return (
-            <div key={r.id} style={styles.rewardWrap}>
-              <div style={styles.rewardItem}>
-                <span style={styles.rewardEmoji}>{r.emoji}</span>
-                <div style={{ flex: 1, minWidth: 0 }}>
-                  <div style={styles.rewardTitle}>
-                    {r.title}
-                    {r.redeemed > 0 && (
-                      <span style={styles.rewardRedeemed}>
-                        {" "}
-                        · claimed ×{r.redeemed}
-                      </span>
-                    )}
-                  </div>
-                  {prizeGoal && (
-                    <div style={styles.rewardGoalTag} title="Achieve this goal to unlock this reward free">
-                      🎯 Prize for: {prizeGoal.statement?.trim() || prizeGoal.specific}
-                    </div>
-                  )}
-                  <div style={styles.rewardTrack}>
-                    <div style={{ ...styles.rewardFill, width: `${pct}%` }} />
-                  </div>
-                </div>
-                <span style={styles.rewardCost}>{r.cost} XP</span>
-                <button
-                  style={{
-                    ...styles.rewardRedeemBtn,
-                    ...(afford ? {} : styles.rewardRedeemOff),
-                  }}
-                  disabled={!afford}
-                  onClick={() =>
-                    composing
-                      ? setRedeemingId(null)
-                      : (setRedeemingId(r.id), setNote(""))
-                  }
-                  title={
-                    afford
-                      ? "Redeem this reward"
-                      : `Earn ${r.cost - availableXp} more XP`
-                  }
-                >
-                  {afford ? (composing ? "Cancel" : "Redeem") : "🔒"}
-                </button>
-                <button
-                  style={styles.assignRemove}
-                  onClick={() => onRemove(r.id)}
-                  aria-label="Remove reward"
-                >
-                  ×
-                </button>
-              </div>
-              {composing && (
-                <div style={styles.rewardComposeBox}>
-                  <textarea
-                    style={styles.rewardComposeInput}
-                    value={note}
-                    autoFocus
-                    placeholder="Type what you did to earn this (optional) — e.g. finished 3 practice sets and hit my study streak…"
-                    onChange={(e) => setNote(e.target.value)}
-                    onKeyDown={(e) => {
-                      if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) claim(r.id);
-                    }}
-                  />
-                  <button style={styles.rewardClaimBtn} onClick={() => claim(r.id)}>
-                    🎉 Claim · −{r.cost} XP
-                  </button>
-                </div>
-              )}
-              {log.length > 0 && (
-                <div style={styles.rewardLog}>
-                  {log
-                    .slice()
-                    .reverse()
-                    .map((entry, i) => (
-                      <div key={i} style={styles.rewardLogItem}>
-                        <span style={styles.rewardLogDot}>·</span> {entry}
-                      </div>
-                    ))}
-                </div>
-              )}
-            </div>
-          );
-        })
-      )}
-      <div style={styles.rewardAddBox}>
-        <div style={styles.rewardEmojiRow}>
-          {REWARD_EMOJIS.map((e) => (
-            <button
-              key={e}
-              onClick={() => setEmoji(e)}
-              style={{
-                ...styles.rewardEmojiPick,
-                ...(emoji === e ? styles.rewardEmojiPickOn : {}),
-              }}
-              aria-label={`Use ${e}`}
-            >
-              {e}
-            </button>
-          ))}
-        </div>
-        <div style={styles.rewardAddRow}>
-          <input
-            style={styles.assignInput}
-            value={title}
-            placeholder="Reward (e.g. 30 min of gaming)"
-            onChange={(e) => setTitle(e.target.value)}
-            onKeyDown={(e) => e.key === "Enter" && add()}
-          />
-          <input
-            type="number"
-            min={1}
-            step={10}
-            style={styles.rewardCostInput}
-            value={cost}
-            placeholder="XP"
-            onChange={(e) => setCost(e.target.value)}
-            onKeyDown={(e) => e.key === "Enter" && add()}
-          />
-          <button style={styles.rewardAddBtn} onClick={add} disabled={!canAdd}>
-            ＋ Add
-          </button>
-        </div>
-      </div>
-    </div>
-  );
-}
-// Profile badges. Each has its own designed medallion (a gradient + emoji), a
-// bit of flavor text, and the criteria to earn it. `met` is checked against the
-// learner's live stats so we can show earned ones in color and the rest dimmed.
-type BadgeStats = {
-  total: number;
-  activeDays: number;
-  streak: number;
-  goalsAchieved: number; // how many goals the learner has marked achieved
-  goalHorizons: number; // distinct horizons (short/mid/long) among achieved goals
-};
-type BadgeDef = {
-  id: string;
-  emoji: string;
-  label: string;
-  blurb: string; // what the badge celebrates
-  hint: string; // how to earn it
-  bg: string; // medallion gradient
-  reward: number; // bonus XP granted the first time it's earned
-  met: (s: BadgeStats) => boolean;
-};
-
-// Ordered easiest → hardest within each family (streak, active days, XP).
-const BADGE_DEFS: BadgeDef[] = [
-  {
-    id: "on-a-roll",
-    emoji: "🔥",
-    label: "On a Roll",
-    blurb: "You showed up three days running — momentum is building.",
-    hint: "Study 3 days in a row.",
-    bg: "linear-gradient(135deg,#ffb347,#ff7a3c)",
-    reward: 25,
-    met: (s) => s.streak >= 3,
-  },
-  {
-    id: "week-warrior",
-    emoji: "📅",
-    label: "Week Warrior",
-    blurb: "A full week without missing a day. That's a real habit forming.",
-    hint: "Keep a 7-day streak.",
-    bg: "linear-gradient(135deg,#ff8a5c,#ff5e62)",
-    reward: 50,
-    met: (s) => s.streak >= 7,
-  },
-  {
-    id: "fortnight-focus",
-    emoji: "🌟",
-    label: "Fortnight Focus",
-    blurb: "Two straight weeks of showing up. Your future self says thanks.",
-    hint: "Keep a 14-day streak.",
-    bg: "linear-gradient(135deg,#f7971e,#ffd200)",
-    reward: 100,
-    met: (s) => s.streak >= 14,
-  },
-  {
-    id: "month-master",
-    emoji: "💎",
-    label: "Month Master",
-    blurb: "Thirty days in a row — this is elite consistency.",
-    hint: "Keep a 30-day streak.",
-    bg: "linear-gradient(135deg,#43cea2,#185a9d)",
-    reward: 200,
-    met: (s) => s.streak >= 30,
-  },
-  {
-    id: "focus-master",
-    emoji: "🧠",
-    label: "Focus Master",
-    blurb: "Five days of real focus in the bank.",
-    hint: "Study on 5 different days.",
-    bg: "linear-gradient(135deg,#56ab2f,#a8e063)",
-    reward: 30,
-    met: (s) => s.activeDays >= 5,
-  },
-  {
-    id: "study-habit",
-    emoji: "📚",
-    label: "Study Habit",
-    blurb: "Fifteen active days — studying is becoming second nature.",
-    hint: "Study on 15 different days.",
-    bg: "linear-gradient(135deg,#11998e,#38ef7d)",
-    reward: 75,
-    met: (s) => s.activeDays >= 15,
-  },
-  {
-    id: "dedicated-scholar",
-    emoji: "🦉",
-    label: "Dedicated Scholar",
-    blurb: "Thirty days of effort. You've made learning part of who you are.",
-    hint: "Study on 30 different days.",
-    bg: "linear-gradient(135deg,#136a8a,#267871)",
-    reward: 150,
-    met: (s) => s.activeDays >= 30,
-  },
-  {
-    id: "xp-500",
-    emoji: "⭐",
-    label: "500 XP Club",
-    blurb: "Your first 500 XP — the effort is adding up.",
-    hint: "Earn 500 total XP.",
-    bg: "linear-gradient(135deg,#f6d365,#fda085)",
-    reward: 40,
-    met: (s) => s.total >= 500,
-  },
-  {
-    id: "xp-1000",
-    emoji: "🏆",
-    label: "1000 XP Legend",
-    blurb: "A thousand XP of hard work. Legendary.",
-    hint: "Earn 1,000 total XP.",
-    bg: "linear-gradient(135deg,#f7971e,#ffd200)",
-    reward: 80,
-    met: (s) => s.total >= 1000,
-  },
-  {
-    id: "xp-2500",
-    emoji: "🚀",
-    label: "2500 XP Star",
-    blurb: "2,500 XP and climbing — you're on a serious trajectory.",
-    hint: "Earn 2,500 total XP.",
-    bg: "linear-gradient(135deg,#8e2de2,#4a00e0)",
-    reward: 160,
-    met: (s) => s.total >= 2500,
-  },
-  {
-    id: "xp-5000",
-    emoji: "👑",
-    label: "5000 XP Royalty",
-    blurb: "Five thousand XP. You wear the crown.",
-    hint: "Earn 5,000 total XP.",
-    bg: "linear-gradient(135deg,#734b6d,#42275a)",
-    reward: 300,
-    met: (s) => s.total >= 5000,
-  },
-  // Goal achievements — earned by marking SMART goals as achieved.
-  {
-    id: "goal-getter",
-    emoji: "🎯",
-    label: "Goal Getter",
-    blurb: "You set a goal and saw it through. That's how big things start.",
-    hint: "Achieve your first goal.",
-    bg: "linear-gradient(135deg,#f6d365,#f9a03f)",
-    reward: 30,
-    met: (s) => s.goalsAchieved >= 1,
-  },
-  {
-    id: "goal-triple",
-    emoji: "🥉",
-    label: "Triple Threat",
-    blurb: "Three goals achieved — you're building real momentum.",
-    hint: "Achieve 3 goals.",
-    bg: "linear-gradient(135deg,#f7971e,#ffd200)",
-    reward: 60,
-    met: (s) => s.goalsAchieved >= 3,
-  },
-  {
-    id: "goal-crusher",
-    emoji: "🏅",
-    label: "Goal Crusher",
-    blurb: "Five goals done. Following through is becoming your habit.",
-    hint: "Achieve 5 goals.",
-    bg: "linear-gradient(135deg,#43cea2,#185a9d)",
-    reward: 90,
-    met: (s) => s.goalsAchieved >= 5,
-  },
-  {
-    id: "goal-champion",
-    emoji: "🏆",
-    label: "Goal Champion",
-    blurb: "Ten goals achieved. You finish what you start — that's rare.",
-    hint: "Achieve 10 goals.",
-    bg: "linear-gradient(135deg,#8e2de2,#4a00e0)",
-    reward: 180,
-    met: (s) => s.goalsAchieved >= 10,
-  },
-  {
-    id: "goal-horizons",
-    emoji: "🧭",
-    label: "Big-Picture Thinker",
-    blurb: "A short, a mid, and a long-term goal — all achieved. Balance!",
-    hint: "Achieve a short-, mid-, and long-term goal.",
-    bg: "linear-gradient(135deg,#11998e,#38ef7d)",
-    reward: 120,
-    met: (s) => s.goalHorizons >= 3,
-  },
-];
-
-function badgeStats(
-  log: Record<string, number>,
-  streak: number,
-  goals: SmartGoal[] = [],
-): BadgeStats {
-  const achieved = goals.filter((g) => g.done);
-  const horizons = new Set(achieved.map((g) => g.horizon).filter(Boolean));
-  return {
-    total: Object.values(log).reduce((a, b) => a + b, 0),
-    activeDays: Object.values(log).filter((v) => v > 0).length,
-    streak,
-    goalsAchieved: achieved.length,
-    goalHorizons: horizons.size,
-  };
-}
-
-// Consecutive active days ending today (or yesterday if today's blank yet).
-function computeStreak(log: Record<string, number>): number {
-  let streak = 0;
-  const d = new Date();
-  if (!(log[localISO(d)] > 0)) d.setDate(d.getDate() - 1);
-  while (log[localISO(d)] > 0) {
-    streak++;
-    d.setDate(d.getDate() - 1);
-  }
-  return streak;
-}
-
-// The set of badge ids currently earned for a given progress log.
-function earnedBadgeIds(
-  log: Record<string, number>,
-  goals: SmartGoal[] = [],
-): string[] {
-  const s = badgeStats(log, computeStreak(log), goals);
-  return BADGE_DEFS.filter((b) => b.met(s)).map((b) => b.id);
-}
-// A Duolingo-style progress card: daily streak 🔥, total XP ⭐, this week's
-// activity, and a daily-goal ring. `log` maps YYYY-MM-DD → XP earned that day.
-function ProgressCard({
-  log,
-  study = {},
-  goals = [],
-}: {
-  log: Record<string, number>;
-  study?: Record<string, number>; // minutes studied per YYYY-MM-DD
-  goals?: SmartGoal[];
-}) {
-  // Which badge's detail card is open (null = closed).
-  const [openBadge, setOpenBadge] = useState<BadgeDef | null>(null);
-  const total = Object.values(log).reduce((a, b) => a + b, 0);
-  const todayXp = log[localISO()] || 0;
-  // Streak = consecutive active days ending today (or yesterday if today's blank).
-  let streak = 0;
-  const d = new Date();
-  if (!(log[localISO(d)] > 0)) d.setDate(d.getDate() - 1);
-  while (log[localISO(d)] > 0) {
-    streak++;
-    d.setDate(d.getDate() - 1);
-  }
+  const totalStudyMin = Object.values(study).reduce((a, b) => a + b, 0);
+  const activeDays = Object.values(study).filter((v) => v > 0).length;
   const now = new Date();
+  const todayISO = localISO(now);
   const sunday = new Date(now);
   sunday.setDate(now.getDate() - now.getDay());
-  const todayISO = localISO(now);
   const week = Array.from({ length: 7 }, (_, i) => {
     const dt = new Date(sunday);
     dt.setDate(sunday.getDate() + i);
     const iso = localISO(dt);
     return {
       label: ["S", "M", "T", "W", "T", "F", "S"][i],
-      active: (log[iso] || 0) > 0,
+      active: (study[iso] || 0) > 0,
       isToday: iso === todayISO,
       future: iso > todayISO,
     };
   });
-  const pct = Math.min(100, Math.round((todayXp / DAILY_XP_GOAL) * 100));
-  const stats = badgeStats(log, streak, goals);
-  const earnedCount = BADGE_DEFS.filter((b) => b.met(stats)).length;
-  // Everyday progress: XP earned each of the last 14 days, as a bar chart.
+  // Minutes studied each of the last 14 days, as a bar chart.
   const days14 = Array.from({ length: 14 }, (_, i) => {
     const dt = new Date(now);
     dt.setDate(now.getDate() - (13 - i));
     const iso = localISO(dt);
-    return { xp: log[iso] || 0, isToday: iso === todayISO };
+    return { mins: study[iso] || 0, isToday: iso === todayISO };
   });
-  const maxXp = Math.max(DAILY_XP_GOAL, ...days14.map((d) => d.xp));
-  // Cumulative XP over the last 30 days → a growth graph.
+  const maxMins = Math.max(30, ...days14.map((d) => d.mins));
+  // Cumulative hours over the last 30 days → a growth graph.
   const N = 30;
   const startDt = new Date(now);
   startDt.setDate(now.getDate() - (N - 1));
   const startISO = localISO(startDt);
   let base = 0;
-  for (const [d, v] of Object.entries(log)) if (d < startISO) base += v;
+  for (const [d, v] of Object.entries(study)) if (d < startISO) base += v;
   let cum = base;
   const series: number[] = [];
   for (let i = 0; i < N; i++) {
     const dt = new Date(now);
     dt.setDate(now.getDate() - (N - 1 - i));
-    cum += log[localISO(dt)] || 0;
+    cum += study[localISO(dt)] || 0;
     series.push(cum);
   }
   const GW = 300;
@@ -5946,11 +7198,12 @@ function ProgressCard({
     .map(([x, y]) => `L${x.toFixed(1)},${y.toFixed(1)}`)
     .join(" ")} L${GW},${GH} Z`;
   const gained30 = cum - base;
-  // Y-axis ticks (cumulative XP) + X-axis start label + today's point, for the
-  // growth graph's axes, scale, and end-marker.
-  const gTop = Math.round(hi);
-  const gMid = Math.round((hi + lo) / 2);
-  const gBot = Math.round(lo);
+  // Y-axis ticks (cumulative hours) + X-axis start label + today's point, for
+  // the growth graph's axes, scale, and end-marker.
+  const asHours = (mins: number) => Math.round((mins / 60) * 10) / 10;
+  const gTop = asHours(hi);
+  const gMid = asHours((hi + lo) / 2);
+  const gBot = asHours(lo);
   const gStartLabel = startDt.toLocaleDateString(undefined, {
     month: "short",
     day: "numeric",
@@ -5983,116 +7236,18 @@ function ProgressCard({
   });
   const maxWeekHours = Math.max(1, ...weeks.map((w) => w.hours));
   const thisWeekHours = weeks[WEEKS - 1].hours;
-  const totalStudyMin = Object.values(study).reduce((a, b) => a + b, 0);
-  // "3h 20m" / "45m" / "0m" — friendly hours+minutes from a minute count.
-  const fmtDuration = (mins: number) => {
-    const m = Math.round(mins);
-    const h = Math.floor(m / 60);
-    const r = m % 60;
-    return h > 0 ? (r ? `${h}h ${r}m` : `${h}h`) : `${r}m`;
-  };
   return (
     <div style={styles.progCard}>
       <div style={styles.progTop}>
         <div style={styles.progStat}>
-          <span style={styles.progBig}>🔥 {streak}</span>
-          <span style={styles.progLbl}>day streak</span>
+          <span style={styles.progBig}>⏱️ {fmtDuration(totalStudyMin)}</span>
+          <span style={styles.progLbl}>total studied</span>
         </div>
         <div style={styles.progStat}>
-          <span style={styles.progBig}>⭐ {total}</span>
-          <span style={styles.progLbl}>total XP</span>
+          <span style={styles.progBig}>📆 {activeDays}</span>
+          <span style={styles.progLbl}>active days</span>
         </div>
       </div>
-      <div style={styles.badgeSection}>
-        <div style={styles.badgeSectionHead}>
-          <span style={styles.badgeSectionTitle}>🎖️ Badges</span>
-          <span style={styles.badgeSectionCount}>
-            {earnedCount}/{BADGE_DEFS.length} earned
-          </span>
-        </div>
-        <div style={styles.badgeGrid}>
-          {BADGE_DEFS.map((bd) => {
-            const earned = bd.met(stats);
-            return (
-              <button
-                key={bd.id}
-                style={styles.badgeItem}
-                onClick={() => setOpenBadge(bd)}
-                title={earned ? bd.label : `Locked — ${bd.hint}`}
-                aria-label={`${bd.label}${earned ? " (earned)" : " (locked)"}`}
-              >
-                <span
-                  style={{
-                    ...styles.badgeMedal,
-                    background: bd.bg,
-                    ...(earned ? {} : styles.badgeMedalLocked),
-                  }}
-                >
-                  {bd.emoji}
-                  {!earned && <span style={styles.badgeLockPip}>🔒</span>}
-                </span>
-                <span
-                  style={{
-                    ...styles.badgeItemLabel,
-                    ...(earned ? {} : { color: "var(--muted)" }),
-                  }}
-                >
-                  {bd.label}
-                </span>
-              </button>
-            );
-          })}
-        </div>
-      </div>
-
-      {openBadge &&
-        (() => {
-          const earned = openBadge.met(stats);
-          return (
-            <div style={styles.overlay} onClick={() => setOpenBadge(null)}>
-              <div
-                style={styles.badgeModal}
-                onClick={(e) => e.stopPropagation()}
-              >
-                <button
-                  style={styles.badgeModalClose}
-                  onClick={() => setOpenBadge(null)}
-                  aria-label="Close"
-                >
-                  ×
-                </button>
-                <div
-                  style={{
-                    ...styles.badgeModalMedal,
-                    background: openBadge.bg,
-                    ...(earned ? {} : styles.badgeMedalLocked),
-                  }}
-                >
-                  {openBadge.emoji}
-                </div>
-                <div style={styles.badgeModalTitle}>{openBadge.label}</div>
-                <div
-                  style={{
-                    ...styles.badgeModalStatus,
-                    ...(earned
-                      ? { background: "var(--accent-soft)", color: "var(--accent)" }
-                      : { background: "var(--surface)", color: "var(--muted)" }),
-                  }}
-                >
-                  {earned ? "✓ Earned" : "🔒 Locked"}
-                </div>
-                <p style={styles.badgeModalBlurb}>{openBadge.blurb}</p>
-                <div style={styles.badgeModalHint}>
-                  <span style={styles.badgeModalHintLabel}>How to earn it</span>
-                  <span>{openBadge.hint}</span>
-                </div>
-                <div style={styles.badgeModalReward}>
-                  🎁 {earned ? "Earned reward:" : "Reward:"} +{openBadge.reward} XP
-                </div>
-              </div>
-            </div>
-          );
-        })()}
       <div style={styles.progWeek}>
         {week.map((w, i) => (
           <div key={i} style={styles.progDay}>
@@ -6105,32 +7260,22 @@ function ProgressCard({
                 ...(w.future ? { opacity: 0.35 } : {}),
               }}
             >
-              {w.active ? "🔥" : ""}
+              {w.active ? "📖" : ""}
             </span>
           </div>
         ))}
       </div>
-      <div style={styles.progGoalRow}>
-        <div style={styles.progTrack}>
-          <div style={{ ...styles.progFill, width: `${pct}%` }} />
-        </div>
-        <span style={styles.progGoalLbl}>
-          {todayXp >= DAILY_XP_GOAL
-            ? "🎉 Daily goal done!"
-            : `${todayXp}/${DAILY_XP_GOAL} XP today`}
-        </span>
-      </div>
       <div style={styles.progBarsHead}>📊 Every day · last 2 weeks</div>
       <div style={styles.progBars}>
         {days14.map((d, i) => (
-          <div key={i} style={styles.progBarCol} title={`${d.xp} XP`}>
+          <div key={i} style={styles.progBarCol} title={fmtDuration(d.mins)}>
             <div style={styles.progBarTrack}>
               <div
                 style={{
                   ...styles.progBarFill,
-                  height: `${Math.max(d.xp > 0 ? 10 : 3, Math.round((d.xp / maxXp) * 100))}%`,
+                  height: `${Math.max(d.mins > 0 ? 10 : 3, Math.round((d.mins / maxMins) * 100))}%`,
                   ...(d.isToday ? styles.progBarToday : {}),
-                  ...(d.xp === 0 ? { background: "var(--border)" } : {}),
+                  ...(d.mins === 0 ? { background: "var(--border)" } : {}),
                 }}
               />
             </div>
@@ -6140,14 +7285,15 @@ function ProgressCard({
       <div style={styles.progBarsHead}>
         📈 Progress over time
         <span style={styles.growthGain}>
-          {gained30 > 0 ? `+${gained30} XP` : "no XP yet"} · 30 days
+          {gained30 > 0 ? `+${fmtDuration(gained30)}` : "nothing logged yet"} · 30
+          days
         </span>
       </div>
       <div style={styles.growthWrap}>
         <div style={styles.growthYAxis}>
-          <span>{gTop}</span>
-          <span>{gMid}</span>
-          <span>{gBot}</span>
+          <span>{gTop}h</span>
+          <span>{gMid}h</span>
+          <span>{gBot}h</span>
         </div>
         <div style={styles.growthPlot}>
           <svg
@@ -6181,11 +7327,13 @@ function ProgressCard({
             />
           </svg>
           {gEmpty ? (
-            <span style={styles.growthEmpty}>Earn XP to grow this line 🌱</span>
+            <span style={styles.growthEmpty}>
+              Run a focus timer to grow this line 🌱
+            </span>
           ) : (
             <span
               style={{ ...styles.growthDot, top: `${gLastYPct}%` }}
-              title={`${gTop} XP so far`}
+              title={`${gTop}h so far`}
             />
           )}
         </div>
@@ -6244,35 +7392,20 @@ function ProgressCard({
   );
 }
 
-// Consecutive active days ending today (or yesterday if today is still blank).
-function currentStreak(log: Record<string, number>): number {
-  let streak = 0;
-  const d = new Date();
-  if (!(log[localISO(d)] > 0)) d.setDate(d.getDate() - 1);
-  while (log[localISO(d)] > 0) {
-    streak++;
-    d.setDate(d.getDate() - 1);
-  }
-  return streak;
-}
-
-// "☀️ Today" recap: a plain-language headline, today's XP toward the daily goal,
-// the current streak, and anything due (or overdue) today. Built only from data
-// that's actually time-stamped — the XP log and item due dates — so it never
-// overstates what happened.
+// "☀️ Today" recap: a plain-language headline, how long they've studied today,
+// and anything due (or overdue). Built only from data that's actually
+// time-stamped — the study log and item due dates — so it never overstates.
 function DailyRecap({
-  log,
+  study,
   assignments,
   events,
 }: {
-  log: Record<string, number>;
+  study: Record<string, number>;
   assignments: Assignment[];
   events: StudyEvent[];
 }) {
   const todayISO = localISO();
-  const todayXp = log[todayISO] || 0;
-  const streak = currentStreak(log);
-  const goalPct = Math.min(100, Math.round((todayXp / DAILY_XP_GOAL) * 100));
+  const todayMin = study[todayISO] || 0;
   const dueToday = [
     ...assignments
       .filter((a) => !a.done && a.due === todayISO)
@@ -6283,13 +7416,11 @@ function DailyRecap({
     (a) => !a.done && a.due && a.due < todayISO,
   );
   const headline =
-    todayXp >= DAILY_XP_GOAL
-      ? "🎉 Daily goal smashed — great work today!"
-      : todayXp > 0
-        ? `Good start — ${todayXp}/${DAILY_XP_GOAL} XP so far today.`
-        : streak > 0
-          ? "Nothing logged yet — a few minutes keeps your streak alive. 🔥"
-          : "Ready when you are — check off one thing to get rolling.";
+    todayMin >= 60
+      ? "🎉 Over an hour in today — great work!"
+      : todayMin > 0
+        ? `Good start — ${todayMin} min of study so far today.`
+        : "Ready when you are — start a focus timer to get rolling.";
   const dateLabel = new Date(`${todayISO}T00:00:00`).toLocaleDateString(
     "en-US",
     { weekday: "short", month: "short", day: "numeric" },
@@ -6301,12 +7432,6 @@ function DailyRecap({
         <span style={styles.subjectsCount}>{dateLabel}</span>
       </div>
       <p style={styles.recapHeadline}>{headline}</p>
-      <div style={styles.planProgTrack}>
-        <div style={{ ...styles.planProgFill, width: `${goalPct}%` }} />
-      </div>
-      <div style={styles.planProgMeta}>
-        ⭐ {todayXp} XP today · 🔥 {streak}-day streak
-      </div>
       {(dueToday.length > 0 || overdue.length > 0) && (
         <div style={styles.recapList}>
           {dueToday.map((t, i) => (
@@ -6331,17 +7456,17 @@ function DailyRecap({
   );
 }
 
-// "📅 This week" recap: XP this week with a trend vs last week, active days,
-// the best day, and a snapshot of open + overdue work. Weeks start Sunday to
-// match the ProgressCard week strip.
+// "📅 This week" recap: hours studied this week with a trend vs last week,
+// active days, the best day, and a snapshot of open + overdue work. Weeks start
+// Sunday to match the ProgressCard week strip.
 function WeeklyRecap({
-  log,
+  study,
   plan,
   goals,
   assignments,
   fourYearPlan,
 }: {
-  log: Record<string, number>;
+  study: Record<string, number>;
   plan: Milestone[];
   goals: SmartGoal[];
   assignments: Assignment[];
@@ -6362,18 +7487,25 @@ function WeeklyRecap({
     return localISO(dt);
   });
   const sum = (isos: string[]) =>
-    isos.reduce((n, iso) => n + (log[iso] || 0), 0);
-  const thisWeekXp = sum(weekISOs);
-  const lastWeekXp = sum(lastWeekISOs);
-  const activeDays = weekISOs.filter((iso) => (log[iso] || 0) > 0).length;
-  const delta = thisWeekXp - lastWeekXp;
+    isos.reduce((n, iso) => n + (study[iso] || 0), 0);
+  const thisWeekMin = sum(weekISOs);
+  const lastWeekMin = sum(lastWeekISOs);
+  const activeDays = weekISOs.filter((iso) => (study[iso] || 0) > 0).length;
+  const delta = thisWeekMin - lastWeekMin;
   let bestIso = weekISOs[0];
   for (const iso of weekISOs)
-    if ((log[iso] || 0) > (log[bestIso] || 0)) bestIso = iso;
-  const bestXp = log[bestIso] || 0;
+    if ((study[iso] || 0) > (study[bestIso] || 0)) bestIso = iso;
+  const bestMin = study[bestIso] || 0;
   const bestLabel = new Date(`${bestIso}T00:00:00`).toLocaleDateString("en-US", {
     weekday: "long",
   });
+  // "3h 20m" / "45m" / "0m" — friendly hours+minutes from a minute count.
+  const fmtDuration = (mins: number) => {
+    const m = Math.round(mins);
+    const h = Math.floor(m / 60);
+    const r = m % 60;
+    return h > 0 ? (r ? `${h}h ${r}m` : `${h}h`) : `${r}m`;
+  };
   const fyCourses = fourYearPlan
     ? fourYearPlan.years.flatMap((y) => y.courses)
     : [];
@@ -6386,14 +7518,14 @@ function WeeklyRecap({
     (a) => !a.done && a.due && a.due < todayISO,
   ).length;
   const trend =
-    lastWeekXp === 0
-      ? thisWeekXp > 0
+    lastWeekMin === 0
+      ? thisWeekMin > 0
         ? "off to a fresh start 🌱"
         : "a quiet week so far"
       : delta > 0
-        ? `up ${Math.round((delta / lastWeekXp) * 100)}% vs last week ↑`
+        ? `up ${Math.round((delta / lastWeekMin) * 100)}% vs last week ↑`
         : delta < 0
-          ? `down ${Math.round((-delta / lastWeekXp) * 100)}% vs last week ↓`
+          ? `down ${Math.round((-delta / lastWeekMin) * 100)}% vs last week ↓`
           : "level with last week";
   return (
     <div style={styles.card}>
@@ -6403,17 +7535,21 @@ function WeeklyRecap({
       </div>
       <div style={styles.recapStatRow}>
         <div style={styles.recapStat}>
-          <span style={styles.recapStatBig}>⭐ {thisWeekXp}</span>
-          <span style={styles.recapStatLbl}>XP this week</span>
+          <span style={styles.recapStatBig}>
+            ⏱️ {fmtDuration(thisWeekMin)}
+          </span>
+          <span style={styles.recapStatLbl}>studied this week</span>
         </div>
         <div style={styles.recapStat}>
           <span style={styles.recapStatBig}>{activeDays}</span>
           <span style={styles.recapStatLbl}>active days</span>
         </div>
         <div style={styles.recapStat}>
-          <span style={styles.recapStatBig}>{bestXp > 0 ? bestXp : "—"}</span>
+          <span style={styles.recapStatBig}>
+            {bestMin > 0 ? fmtDuration(bestMin) : "—"}
+          </span>
           <span style={styles.recapStatLbl}>
-            {bestXp > 0 ? `best · ${bestLabel}` : "best day"}
+            {bestMin > 0 ? `best · ${bestLabel}` : "best day"}
           </span>
         </div>
       </div>
@@ -6439,12 +7575,11 @@ function WeeklyRecap({
 }
 
 // "📈 Monthly report": one calendar month at a time. The top half is a factual
-// recap built only from time-stamped data (the XP log, study-minutes log, mistake
+// recap built only from time-stamped data (the study-minutes log, mistake
 // timestamps, and item due dates) plus current standings (goals, GPA) — so it never
 // overstates. The bottom half is Eliora's warm AI recap, generated on demand and
 // cached per month. Navigate months with the arrows; you can't go past this month.
 function MonthlyReport({
-  log,
   study,
   goals,
   assignments,
@@ -6454,7 +7589,6 @@ function MonthlyReport({
   busyKey,
   onGenerate,
 }: {
-  log: Record<string, number>;
   study: Record<string, number>;
   goals: SmartGoal[];
   assignments: Assignment[];
@@ -6482,22 +7616,17 @@ function MonthlyReport({
     localISO(new Date(year, month, i + 1)),
   );
 
-  const xp = monthISOs.reduce((n, iso) => n + (log[iso] || 0), 0);
   const minutes = monthISOs.reduce((n, iso) => n + (study[iso] || 0), 0);
   const hours = Math.round((minutes / 60) * 10) / 10;
-  const activeDays = monthISOs.filter(
-    (iso) => (log[iso] || 0) > 0 || (study[iso] || 0) > 0,
-  ).length;
+  const activeDays = monthISOs.filter((iso) => (study[iso] || 0) > 0).length;
   let bestIso = monthISOs[0];
   for (const iso of monthISOs)
-    if ((log[iso] || 0) > (log[bestIso] || 0)) bestIso = iso;
-  const bestDayXp = log[bestIso] || 0;
+    if ((study[iso] || 0) > (study[bestIso] || 0)) bestIso = iso;
+  const bestDayMin = study[bestIso] || 0;
   const bestLabel = new Date(`${bestIso}T00:00:00`).toLocaleDateString("en-US", {
     month: "short",
     day: "numeric",
   });
-  // Streak only means something as of *now* — don't show it for past months.
-  const streak = isCurrentMonth ? currentStreak(log) : undefined;
 
   const activeGoals = goals.filter((g) => !g.done);
   const goalsDone = goals.filter((g) => g.done).length;
@@ -6533,19 +7662,16 @@ function MonthlyReport({
     ? fypProjection(fourYearPlan).projectedWeightedGpa
     : undefined;
 
-  const quiet = xp === 0 && minutes === 0;
+  const quiet = minutes === 0;
   const report = reports[monthKey];
   const busy = busyKey === monthKey;
 
   const payload: Record<string, unknown> = {
     monthLabel,
     career: fourYearPlan?.destination,
-    xp,
     studyHours: hours,
     activeDays,
     daysInMonth,
-    bestDayXp,
-    streak,
     gpa,
     projectedGpa,
     goalsActive: activeGoals.length,
@@ -6589,11 +7715,7 @@ function MonthlyReport({
 
       <div style={styles.recapStatRow}>
         <div style={styles.recapStat}>
-          <span style={styles.recapStatBig}>⭐ {xp}</span>
-          <span style={styles.recapStatLbl}>XP this month</span>
-        </div>
-        <div style={styles.recapStat}>
-          <span style={styles.recapStatBig}>{hours > 0 ? hours : "—"}</span>
+          <span style={styles.recapStatBig}>⏱️ {hours > 0 ? hours : "—"}</span>
           <span style={styles.recapStatLbl}>hours studied</span>
         </div>
         <div style={styles.recapStat}>
@@ -6608,18 +7730,11 @@ function MonthlyReport({
       </div>
 
       <div style={styles.recapList}>
-        {bestDayXp > 0 && (
+        {bestDayMin > 0 && (
           <div style={styles.recapItem}>
             <span>🏆</span>
             <span style={{ flex: 1 }}>Best day · {bestLabel}</span>
-            <span style={styles.recapTag}>{bestDayXp} XP</span>
-          </div>
-        )}
-        {typeof streak === "number" && streak > 0 && (
-          <div style={styles.recapItem}>
-            <span>🔥</span>
-            <span style={{ flex: 1 }}>Current streak</span>
-            <span style={styles.recapTag}>{streak} days</span>
+            <span style={styles.recapTag}>{bestDayMin} min</span>
           </div>
         )}
         {(goalsDone > 0 || activeGoals.length > 0) && (
@@ -6700,12 +7815,11 @@ function MonthlyReport({
 }
 
 // "What you learned this week" recap: a Monday–Sunday window of the learner's
-// tracked activity (XP/effort, study hours, active days, streak, subjects &
-// concepts practiced, goal progress, what's due) plus Eliora's warm AI recap +
-// focuses for next week. Mirrors MonthlyReport, scoped to a 7-day week and cached
-// per week (keyed by the Monday's YYYY-MM-DD).
+// tracked activity (study hours, active days, subjects & concepts practiced,
+// goal progress, what's due) plus Eliora's warm AI recap + focuses for next
+// week. Mirrors MonthlyReport, scoped to a 7-day week and cached per week
+// (keyed by the Monday's YYYY-MM-DD).
 function WeeklyLearnedRecap({
-  log,
   study,
   goals,
   assignments,
@@ -6715,7 +7829,6 @@ function WeeklyLearnedRecap({
   busyKey,
   onGenerate,
 }: {
-  log: Record<string, number>;
   study: Record<string, number>;
   goals: SmartGoal[];
   assignments: Assignment[];
@@ -6756,21 +7869,16 @@ function WeeklyLearnedRecap({
     d.toLocaleDateString("en-US", { month: "short", day: "numeric" });
   const weekLabel = `${fmt(weekStart)} – ${fmt(weekEnd)}`;
 
-  const xp = weekISOs.reduce((n, iso) => n + (log[iso] || 0), 0);
   const minutes = weekISOs.reduce((n, iso) => n + (study[iso] || 0), 0);
   const hours = Math.round((minutes / 60) * 10) / 10;
-  const activeDays = weekISOs.filter(
-    (iso) => (log[iso] || 0) > 0 || (study[iso] || 0) > 0,
-  ).length;
+  const activeDays = weekISOs.filter((iso) => (study[iso] || 0) > 0).length;
   let bestIso = weekISOs[0];
   for (const iso of weekISOs)
-    if ((log[iso] || 0) > (log[bestIso] || 0)) bestIso = iso;
-  const bestDayXp = log[bestIso] || 0;
+    if ((study[iso] || 0) > (study[bestIso] || 0)) bestIso = iso;
+  const bestDayMin = study[bestIso] || 0;
   const bestLabel = new Date(`${bestIso}T00:00:00`).toLocaleDateString("en-US", {
     weekday: "short",
   });
-  // Streak only means something as of *now* — don't show it for past weeks.
-  const streak = isCurrentWeek ? currentStreak(log) : undefined;
 
   // Concepts they engaged this week (captured to work on), and the subjects/
   // topics those touch — the honest, timestamped signal for "what you practiced".
@@ -6810,19 +7918,15 @@ function WeeklyLearnedRecap({
     });
   const assignmentsDue = assignmentsDueList.length;
 
-  const quiet = xp === 0 && minutes === 0;
+  const quiet = minutes === 0;
   const report = reports[weekKey];
   const busy = busyKey === weekKey;
 
   const payload: Record<string, unknown> = {
     weekLabel,
     career: fourYearPlan?.destination,
-    xp,
     studyHours: hours,
     activeDays,
-    bestDayXp,
-    bestDayLabel: bestDayXp > 0 ? bestLabel : undefined,
-    streak,
     topics,
     mistakesLogged,
     mistakesOpen,
@@ -6874,11 +7978,7 @@ function WeeklyLearnedRecap({
 
       <div style={styles.recapStatRow}>
         <div style={styles.recapStat}>
-          <span style={styles.recapStatBig}>⭐ {xp}</span>
-          <span style={styles.recapStatLbl}>XP this week</span>
-        </div>
-        <div style={styles.recapStat}>
-          <span style={styles.recapStatBig}>{hours > 0 ? hours : "—"}</span>
+          <span style={styles.recapStatBig}>⏱️ {hours > 0 ? hours : "—"}</span>
           <span style={styles.recapStatLbl}>hours studied</span>
         </div>
         <div style={styles.recapStat}>
@@ -6898,18 +7998,11 @@ function WeeklyLearnedRecap({
             <span style={styles.recapTag}>{topics.slice(0, 3).join(", ")}</span>
           </div>
         )}
-        {bestDayXp > 0 && (
+        {bestDayMin > 0 && (
           <div style={styles.recapItem}>
             <span>🏆</span>
             <span style={{ flex: 1 }}>Best day · {bestLabel}</span>
-            <span style={styles.recapTag}>{bestDayXp} XP</span>
-          </div>
-        )}
-        {typeof streak === "number" && streak > 0 && (
-          <div style={styles.recapItem}>
-            <span>🔥</span>
-            <span style={{ flex: 1 }}>Current streak</span>
-            <span style={styles.recapTag}>{streak} days</span>
+            <span style={styles.recapTag}>{bestDayMin} min</span>
           </div>
         )}
         {mistakesLogged > 0 && (
@@ -8213,9 +9306,15 @@ function FourYearPlanPanel({
   // Post-survey (2nd round): which suggestions they liked + what to lean toward.
   const [csLiked, setCsLiked] = useState<string[]>([]);
   const [csRefine, setCsRefine] = useState<string[]>([]);
-  // Toggle a value in a multi-select answer array.
-  const toggleMc = (set: React.Dispatch<React.SetStateAction<string[]>>) => (v: string) =>
-    set((prev) => (prev.includes(v) ? prev.filter((x) => x !== v) : [...prev, v]));
+  // No option list covers every student, so each question carries an "Other…"
+  // chip that opens a text box. What they type is stored alongside the chips —
+  // an answer that isn't one of the offered options *is* their own words — so
+  // nothing downstream needs to know the difference. This record only tracks
+  // which boxes are open, since an open-but-empty box has nothing to derive it
+  // from; it is keyed by the question text.
+  const [otherOpen, setOtherOpen] = useState<Record<string, boolean>>({});
+  const otherOf = (opts: string[], selected: string[]) =>
+    selected.find((s) => !opts.includes(s)) ?? "";
   // Fetch career ideas. Pass refine=true for the post-survey second round.
   async function fetchCareers(refine = false) {
     if (loadingCareers) return;
@@ -8260,58 +9359,122 @@ function FourYearPlanPanel({
     }
   }
   // Render a multiple-choice question — multi-select (tap several) or single.
+  // `allowOther` is off for questions whose options are generated (the career
+  // titles we just suggested), where typing a new one means nothing.
   const mcMulti = (
     label: string,
     opts: string[],
     selected: string[],
-    onToggle: (v: string) => void,
-  ) => (
-    <div style={styles.mcGroup}>
-      <span style={styles.mcLabel}>{label}</span>
-      <div style={styles.mcChips}>
-        {opts.map((o) => {
-          const on = selected.includes(o);
-          return (
+    set: React.Dispatch<React.SetStateAction<string[]>>,
+    allowOther = true,
+  ) => {
+    const toggle = (v: string) =>
+      set((prev) => (prev.includes(v) ? prev.filter((x) => x !== v) : [...prev, v]));
+    const other = otherOf(opts, selected);
+    const open = allowOther && (otherOpen[label] || other !== "");
+    const setOther = (v: string) =>
+      set((prev) => {
+        const chips = prev.filter((x) => opts.includes(x));
+        return v.trim() ? [...chips, v] : chips;
+      });
+    return (
+      <div style={styles.mcGroup}>
+        <span style={styles.mcLabel}>{label}</span>
+        <div style={styles.mcChips}>
+          {opts.map((o) => {
+            const on = selected.includes(o);
+            return (
+              <button
+                key={o}
+                type="button"
+                aria-pressed={on}
+                style={{ ...styles.mcChip, ...(on ? styles.mcChipOn : {}) }}
+                onClick={() => toggle(o)}
+              >
+                {o}
+              </button>
+            );
+          })}
+          {allowOther && (
             <button
-              key={o}
               type="button"
-              aria-pressed={on}
-              style={{ ...styles.mcChip, ...(on ? styles.mcChipOn : {}) }}
-              onClick={() => onToggle(o)}
+              aria-pressed={open}
+              style={{ ...styles.mcChip, ...(open ? styles.mcChipOn : {}) }}
+              onClick={() => {
+                if (open) setOther(""); // closing drops what they typed
+                setOtherOpen((p) => ({ ...p, [label]: !open }));
+              }}
             >
-              {o}
+              Other…
             </button>
-          );
-        })}
+          )}
+        </div>
+        {open && (
+          <input
+            style={styles.mcOtherInput}
+            value={other}
+            autoFocus
+            placeholder="In your own words…"
+            onChange={(e) => setOther(e.target.value)}
+          />
+        )}
       </div>
-    </div>
-  );
+    );
+  };
   const mcSingle = (
     label: string,
     opts: string[],
     value: string,
     onSet: (v: string) => void,
-  ) => (
-    <div style={styles.mcGroup}>
-      <span style={styles.mcLabel}>{label}</span>
-      <div style={styles.mcChips}>
-        {opts.map((o) => {
-          const on = value === o;
-          return (
-            <button
-              key={o}
-              type="button"
-              aria-pressed={on}
-              style={{ ...styles.mcChip, ...(on ? styles.mcChipOn : {}) }}
-              onClick={() => onSet(on ? "" : o)}
-            >
-              {o}
-            </button>
-          );
-        })}
+  ) => {
+    // Single-select, so their own words simply *are* the answer.
+    const other = value && !opts.includes(value) ? value : "";
+    const open = otherOpen[label] || other !== "";
+    return (
+      <div style={styles.mcGroup}>
+        <span style={styles.mcLabel}>{label}</span>
+        <div style={styles.mcChips}>
+          {opts.map((o) => {
+            const on = value === o;
+            return (
+              <button
+                key={o}
+                type="button"
+                aria-pressed={on}
+                style={{ ...styles.mcChip, ...(on ? styles.mcChipOn : {}) }}
+                onClick={() => {
+                  onSet(on ? "" : o); // one answer only — this replaces theirs
+                  setOtherOpen((p) => ({ ...p, [label]: false }));
+                }}
+              >
+                {o}
+              </button>
+            );
+          })}
+          <button
+            type="button"
+            aria-pressed={open}
+            style={{ ...styles.mcChip, ...(open ? styles.mcChipOn : {}) }}
+            onClick={() => {
+              if (open) onSet("");
+              setOtherOpen((p) => ({ ...p, [label]: !open }));
+            }}
+          >
+            Other…
+          </button>
+        </div>
+        {open && (
+          <input
+            style={styles.mcOtherInput}
+            value={other}
+            autoFocus
+            placeholder="In your own words…"
+            onChange={(e) => onSet(e.target.value)}
+          />
+        )}
       </div>
-    </div>
-  );
+    );
+  };
 
   // Read uploaded school docs (PDF / image / text) into base64 for the API.
   async function onDocFiles(files: FileList | null) {
@@ -8608,16 +9771,16 @@ function FourYearPlanPanel({
                 No wrong answers — just tap whatever feels like you. Pick as many
                 as you want.
               </p>
-              {mcMulti("📚 Which class would you happily sit through?", CAREER_MC.subjects, csSubjects, toggleMc(setCsSubjects))}
-              {mcMulti("💪 In a group project, you're the one who…", CAREER_MC.strengths, csStrengths, toggleMc(setCsStrengths))}
-              {mcMulti("🎮 A free afternoon — you'd rather…", CAREER_MC.interests, csInterests, toggleMc(setCsInterests))}
-              {mcMulti("🧭 Your ideal way to work is…", CAREER_MC.workStyle, csWorkStyle, toggleMc(setCsWorkStyle))}
-              {mcMulti("✨ A job is worth it if it gives you…", CAREER_MC.values, csValues, toggleMc(setCsValues))}
-              {mcMulti("😩 What drains you the fastest?", CAREER_MC.dislikes, csDislikes, toggleMc(setCsDislikes))}
-              {mcMulti("🏙️ Where do you see yourself most days?", CAREER_MC.environment, csEnvironment, toggleMc(setCsEnvironment))}
-              {mcMulti("🤯 You could fall down a rabbit hole about…", CAREER_MC.curious, csCurious, toggleMc(setCsCurious))}
-              {mcMulti("🌍 The kind of difference you want to make…", CAREER_MC.impact, csImpact, toggleMc(setCsImpact))}
-              {mcMulti("🌟 Whose work makes you go 'that's so cool'?", CAREER_MC.admire, csAdmire, toggleMc(setCsAdmire))}
+              {mcMulti("📚 Which class would you happily sit through?", CAREER_MC.subjects, csSubjects, setCsSubjects)}
+              {mcMulti("💪 In a group project, you're the one who…", CAREER_MC.strengths, csStrengths, setCsStrengths)}
+              {mcMulti("🎮 A free afternoon — you'd rather…", CAREER_MC.interests, csInterests, setCsInterests)}
+              {mcMulti("🧭 Your ideal way to work is…", CAREER_MC.workStyle, csWorkStyle, setCsWorkStyle)}
+              {mcMulti("✨ A job is worth it if it gives you…", CAREER_MC.values, csValues, setCsValues)}
+              {mcMulti("😩 What drains you the fastest?", CAREER_MC.dislikes, csDislikes, setCsDislikes)}
+              {mcMulti("🏙️ Where do you see yourself most days?", CAREER_MC.environment, csEnvironment, setCsEnvironment)}
+              {mcMulti("🤯 You could fall down a rabbit hole about…", CAREER_MC.curious, csCurious, setCsCurious)}
+              {mcMulti("🌍 The kind of difference you want to make…", CAREER_MC.impact, csImpact, setCsImpact)}
+              {mcMulti("🌟 Whose work makes you go 'that's so cool'?", CAREER_MC.admire, csAdmire, setCsAdmire)}
               {mcSingle("🔁 Routine or variety?", CAREER_SINGLE.structure, csStructure, setCsStructure)}
               {mcSingle("💰 How much does a big paycheck matter?", CAREER_SINGLE.income, csIncome, setCsIncome)}
               {mcSingle("🎓 How much more school sounds right?", CAREER_SINGLE.education, csEducation, setCsEducation)}
@@ -8675,13 +9838,14 @@ function FourYearPlanPanel({
                       "Which of these felt most like you?",
                       careerIdeas.map((c) => c.title),
                       csLiked,
-                      toggleMc(setCsLiked),
+                      setCsLiked,
+                      false, // options are the suggestions themselves
                     )}
                     {mcMulti(
                       "Want the next round to lean…",
                       REFINE_OPTIONS,
                       csRefine,
-                      toggleMc(setCsRefine),
+                      setCsRefine,
                     )}
                     <button
                       style={{
@@ -9605,6 +10769,216 @@ function MistakeCenter({
   );
 }
 
+// The last row of a "select all that apply" list: an option for the answer we
+// didn't think of. Open it and what they type is stored like any other pick, so
+// only the questions whose answers are read back as free text offer it — the
+// ones that map an exact option onto a setting (what time you get home) don't.
+function OtherChoice({
+  open,
+  value,
+  onToggle,
+  onChange,
+}: {
+  open: boolean;
+  value: string;
+  onToggle: () => void;
+  onChange: (v: string) => void;
+}) {
+  return (
+    <>
+      <button
+        type="button"
+        onClick={onToggle}
+        style={{ ...styles.choiceBtn, ...(open ? styles.choiceBtnSelected : {}) }}
+      >
+        <span
+          style={{
+            ...styles.choiceCheckbox,
+            ...(open ? styles.choiceCheckboxSelected : {}),
+          }}
+        >
+          {open ? "✓" : ""}
+        </span>
+        Something else…
+      </button>
+      {open && (
+        <input
+          style={styles.otherInput}
+          value={value}
+          autoFocus
+          placeholder="In your own words…"
+          onChange={(e) => onChange(e.target.value)}
+          spellCheck
+        />
+      )}
+    </>
+  );
+}
+
+// The setup for today's schedule, as a conversation. This used to be five radio
+// questions in a panel, which is a form — and a form asked at the moment
+// someone wants a plan is a wall in front of the thing they came for. Asked out
+// loud it's shorter (she stops as soon as she can build, often two questions
+// in), it takes answers a radio button can't hold ("home at 6, bio test Friday,
+// wiped"), and the one field that actually matters — what today has to cover —
+// gets said rather than skipped.
+//
+// She only gathers. The schedule is still built by generateStudySchedule from
+// these answers plus the learner's real tasks.
+const DAY_SETUP_OPENER =
+  "Let's set today up. When are you free to start — and if you already know, how long you've got?";
+const DAY_SETUP_CHIPS = [
+  "Right after school",
+  "Home about 5",
+  "After practice, ~7",
+  "I'm free now",
+];
+
+function DaySetupChat({
+  profile,
+  generating,
+  onReady,
+}: {
+  profile: LearnerProfile | null;
+  generating: boolean;
+  // Everything she found out — the parent saves the study prefs and builds.
+  onReady: (a: DayIntakeAnswers) => void;
+}) {
+  const [turns, setTurns] = useState<DayIntakeTurn[]>([
+    { role: "eliora", text: DAY_SETUP_OPENER },
+  ]);
+  const [chips, setChips] = useState<string[]>(DAY_SETUP_CHIPS);
+  const [input, setInput] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState("");
+  const [done, setDone] = useState(false);
+  const logRef = useRef<HTMLDivElement | null>(null);
+
+  // She asks one question at a time, so the bottom of the log is the only part
+  // that matters.
+  useEffect(() => {
+    const el = logRef.current;
+    if (el) el.scrollTop = el.scrollHeight;
+  }, [turns, busy]);
+
+  async function send(text: string) {
+    const said = text.trim();
+    if (!said || busy || done) return;
+    const next: DayIntakeTurn[] = [...turns, { role: "user", text: said }];
+    setTurns(next);
+    setInput("");
+    setChips([]);
+    setErr("");
+    setBusy(true);
+    try {
+      const res = await fetch("/api/day-intake", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          messages: next,
+          profile: profile ?? undefined,
+          today: new Date().toLocaleDateString(undefined, {
+            weekday: "long",
+            month: "short",
+            day: "numeric",
+          }),
+        }),
+      });
+      const data = (await res.json()) as {
+        reply?: DayIntakeReply;
+        error?: string;
+      };
+      if (data.reply) {
+        setTurns((prev) => [
+          ...prev,
+          { role: "eliora", text: data.reply!.reply },
+        ]);
+        setChips(data.reply.chips ?? []);
+        if (data.reply.answers) {
+          setDone(true);
+          onReady(data.reply.answers);
+        }
+      } else {
+        setErr(data.error || "Something went wrong. Try that again?");
+      }
+    } catch {
+      setErr("Couldn't reach Eliora. Check your connection and try again.");
+    }
+    setBusy(false);
+  }
+
+  function startOver() {
+    setTurns([{ role: "eliora", text: DAY_SETUP_OPENER }]);
+    setChips(DAY_SETUP_CHIPS);
+    setInput("");
+    setErr("");
+    setDone(false);
+  }
+
+  return (
+    <div style={styles.schedSetupPanel}>
+      <div style={{ ...styles.weekLog, maxHeight: 220 }} ref={logRef}>
+        {turns.map((t, i) => (
+          <div
+            key={i}
+            style={t.role === "user" ? styles.weekMine : styles.weekHers}
+          >
+            {t.text}
+          </div>
+        ))}
+        {busy && <div style={styles.weekHers}>…</div>}
+        {/* The build happens in the grid below, which is off-screen while the
+            panel is open — so say it here, or the conversation just stops. */}
+        {done && generating && (
+          <div style={styles.weekHers}>Building today&apos;s schedule…</div>
+        )}
+      </div>
+
+      {!!chips.length && !busy && !done && (
+        <div style={styles.weekChips}>
+          {chips.map((c) => (
+            <button key={c} style={styles.weekChip} onClick={() => send(c)}>
+              {c}
+            </button>
+          ))}
+        </div>
+      )}
+      {err && <p style={styles.prioErr}>{err}</p>}
+
+      {done ? (
+        <button style={styles.weekReset} onClick={startOver}>
+          ↺ Set today up again
+        </button>
+      ) : (
+        <div style={styles.weekAsk}>
+          <input
+            style={styles.weekInput}
+            value={input}
+            placeholder="Tell me about today…"
+            onChange={(e) => setInput(e.target.value)}
+            onKeyDown={(e) => {
+              if (e.key === "Enter" && !e.shiftKey) {
+                e.preventDefault();
+                send(input);
+              }
+            }}
+          />
+          <button
+            style={{
+              ...styles.prioBtn,
+              ...(input.trim() && !busy ? {} : styles.prioBtnOff),
+            }}
+            onClick={() => send(input)}
+            disabled={!input.trim() || busy}
+          >
+            {busy ? "…" : "Send"}
+          </button>
+        </div>
+      )}
+    </div>
+  );
+}
+
 // A 9am–9pm day planner: one editable row per hour. Each block has a text field
 // and a tappable tag (study / break / class / other) that colors the block. The
 // row for the current hour is highlighted so "now" is easy to find.
@@ -9615,10 +10989,14 @@ function ScheduleGrid({
   homeHour,
   onSetHomeHour,
   onGenerate,
-  onSetupSubmit,
-  setupInitial,
+  onSetupReady,
+  profile,
   generating,
   onStudyMinutes,
+  remindOn,
+  onSetRemindOn,
+  timerRequest,
+  onTimerRequestConsumed,
 }: {
   schedule: DaySchedule | null;
   onSet: (hour: number, patch: Partial<ScheduleBlock>) => void;
@@ -9626,21 +11004,17 @@ function ScheduleGrid({
   homeHour: number;
   onSetHomeHour: (h: number) => void;
   onGenerate: () => void;
-  onSetupSubmit: (a: {
-    homeTime: string;
-    budget: string;
-    focusTime: string;
-    sessionLength: string;
-    focusHelp: string;
-    focusNote: string;
-  }) => void;
-  setupInitial?: {
-    focusTime?: string;
-    sessionLength?: string;
-    focusHelp?: string;
-  };
+  // What the setup conversation found out, once it has enough to build.
+  onSetupReady: (a: DayIntakeAnswers) => void;
+  profile: LearnerProfile | null;
   generating: boolean;
   onStudyMinutes: (mins: number) => void;
+  remindOn: boolean; // nudge me when each block starts
+  onSetRemindOn: (on: boolean) => void;
+  // Set by a reminder's "Start it" — starts that block's countdown here.
+  timerRequest: { hour: number } | null;
+  // Hand the request back once it's started, so a remount can't replay it.
+  onTimerRequestConsumed: () => void;
 }) {
   const today = localISO();
   const fresh = schedule && schedule.date === today ? schedule : null;
@@ -9660,97 +11034,9 @@ function ScheduleGrid({
     onSet(h, { kind: SCHEDULE_KINDS[(idx + 1) % SCHEDULE_KINDS.length].key });
   };
 
-  // Schedule-setup survey: a short intake shown when "Set up my schedule" is
-  // tapped. Answers feed the schedule builder (when free, how long, what to focus
-  // on) and are remembered on the learner's profile.
+  // "Set up my schedule" opens the setup conversation rather than a form —
+  // see DaySetupChat for why.
   const [setupOpen, setSetupOpen] = useState(false);
-  const [suHomeTime, setSuHomeTime] = useState("");
-  const [suBudget, setSuBudget] = useState("");
-  const [suFocusTime, setSuFocusTime] = useState(setupInitial?.focusTime ?? "");
-  const [suSessionLength, setSuSessionLength] = useState(
-    setupInitial?.sessionLength ?? "",
-  );
-  const [suFocusHelp, setSuFocusHelp] = useState(setupInitial?.focusHelp ?? "");
-  const [suFocusNote, setSuFocusNote] = useState("");
-  const setupChoice = (
-    question: string,
-    options: string[],
-    value: string,
-    setValue: (s: string) => void,
-  ) => (
-    <div style={styles.label}>
-      {question}
-      <div style={styles.choiceList}>
-        {options.map((opt) => {
-          const selected = value === opt;
-          return (
-            <button
-              key={opt}
-              type="button"
-              onClick={() => setValue(selected ? "" : opt)}
-              style={{
-                ...styles.choiceBtn,
-                ...(selected ? styles.choiceBtnSelected : {}),
-              }}
-            >
-              <span style={styles.choiceRadio}>{selected ? "●" : ""}</span>
-              {opt}
-            </button>
-          );
-        })}
-      </div>
-    </div>
-  );
-
-  // Like setupChoice but multi-select — value is a comma-joined list.
-  const setupMultiChoice = (
-    question: string,
-    options: string[],
-    value: string,
-    setValue: (s: string) => void,
-  ) => {
-    const chosen = new Set(
-      value ? value.split(",").map((s) => s.trim()).filter(Boolean) : [],
-    );
-    const toggle = (opt: string) => {
-      const next = new Set(chosen);
-      if (next.has(opt)) next.delete(opt);
-      else next.add(opt);
-      setValue([...next].join(", "));
-    };
-    return (
-      <div style={styles.label}>
-        {question}{" "}
-        <span style={styles.choiceHint}>(select all that apply)</span>
-        <div style={styles.choiceList}>
-          {options.map((opt) => {
-            const isSel = chosen.has(opt);
-            return (
-              <button
-                key={opt}
-                type="button"
-                onClick={() => toggle(opt)}
-                style={{
-                  ...styles.choiceBtn,
-                  ...(isSel ? styles.choiceBtnSelected : {}),
-                }}
-              >
-                <span
-                  style={{
-                    ...styles.choiceCheckbox,
-                    ...(isSel ? styles.choiceCheckboxSelected : {}),
-                  }}
-                >
-                  {isSel ? "✓" : ""}
-                </span>
-                {opt}
-              </button>
-            );
-          })}
-        </div>
-      </div>
-    );
-  };
 
   // Per-task countdown timer. One block runs at a time. `total`/`study` let us
   // credit the finished session's minutes toward "hours studied" (study blocks
@@ -9762,8 +11048,11 @@ function ScheduleGrid({
     total: number; // full session length, seconds
     study: boolean; // whether this block counts as study time
   } | null>(null);
+  // A block's countdown runs for exactly the work in it — the minutes the
+  // schedule budgeted — falling back to a plain Pomodoro when it has none.
+  const blockMinutes = (h: number) => blocks[h]?.min ?? TIMER_DEFAULT_MIN;
   // Build a fresh running-timer state for an hour block, tagging it study or not.
-  const mkTimer = (h: number, mins = TIMER_DEFAULT_MIN) => ({
+  const mkTimer = (h: number, mins = blockMinutes(h)) => ({
     hour: h,
     left: mins * 60,
     running: true,
@@ -9790,8 +11079,17 @@ function ScheduleGrid({
     }, 1000);
     return () => clearInterval(id);
   }, [timer?.running, timer?.hour]);
-  const startTimer = (h: number, mins = TIMER_DEFAULT_MIN) =>
+  const startTimer = (h: number, mins = blockMinutes(h)) =>
     setTimer(mkTimer(h, mins));
+  // A reminder's "Start it" button reaches in here: each new request (a fresh
+  // object) starts that block's countdown, so the learner goes from nudge to
+  // working in one tap.
+  useEffect(() => {
+    if (!timerRequest) return;
+    setTimer(mkTimer(timerRequest.hour));
+    onTimerRequestConsumed();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [timerRequest]);
   const toggleTimer = (h: number) =>
     setTimer((t) =>
       t && t.hour === h
@@ -9818,76 +11116,17 @@ function ScheduleGrid({
         style={styles.schedSetupBtn}
         onClick={() => setSetupOpen((v) => !v)}
       >
-        📝 {setupOpen ? "Hide setup" : "Set up my schedule"}
+        💬 {setupOpen ? "Hide setup" : "Set up my day with Eliora"}
       </button>
-      {setupOpen && (
-        <div style={styles.schedSetupPanel}>
-          <p style={{ color: "var(--muted)", margin: "0 0 6px", fontSize: 13 }}>
-            A few quick questions so I can build today&apos;s plan around you.
-          </p>
-          {setupChoice(
-            "When are you usually free to study?",
-            HOME_TIME_OPTIONS,
-            suHomeTime,
-            setSuHomeTime,
-          )}
-          {setupChoice(
-            "How much study time do you want today?",
-            STUDY_BUDGET_OPTIONS,
-            suBudget,
-            setSuBudget,
-          )}
-          {setupChoice(
-            "When do you focus best?",
-            FOCUS_TIME_OPTIONS,
-            suFocusTime,
-            setSuFocusTime,
-          )}
-          {setupChoice(
-            "How long can you focus in one sitting?",
-            SESSION_LENGTH_OPTIONS,
-            suSessionLength,
-            setSuSessionLength,
-          )}
-          {setupMultiChoice(
-            "What helps you focus?",
-            FOCUS_HELP_OPTIONS,
-            suFocusHelp,
-            setSuFocusHelp,
-          )}
-          <label style={styles.label}>
-            Anything today&apos;s schedule should prioritize? (optional)
-            <textarea
-              style={{ ...styles.input, minHeight: 56, resize: "vertical" }}
-              value={suFocusNote}
-              onChange={(e) => setSuFocusNote(e.target.value)}
-              placeholder="e.g. Bio exam Friday, catch up on algebra"
-            />
-          </label>
-          <button
-            type="button"
-            style={{
-              ...styles.schedBuildBtn,
-              opacity: !suHomeTime || generating ? 0.5 : 1,
-              width: "100%",
-            }}
-            disabled={!suHomeTime || generating}
-            onClick={() => {
-              onSetupSubmit({
-                homeTime: suHomeTime,
-                budget: suBudget,
-                focusTime: suFocusTime,
-                sessionLength: suSessionLength,
-                focusHelp: suFocusHelp,
-                focusNote: suFocusNote.trim(),
-              });
-              setSetupOpen(false);
-            }}
-          >
-            {generating ? "Building…" : "✨ Build my schedule"}
-          </button>
-        </div>
-      )}
+      {/* Kept mounted so hiding the panel doesn't throw away the
+          conversation mid-question. */}
+      <div style={setupOpen ? undefined : { display: "none" }}>
+        <DaySetupChat
+          profile={profile}
+          generating={generating}
+          onReady={onSetupReady}
+        />
+      </div>
       <div style={styles.schedBuildRow}>
         <label style={styles.schedBuildLabel}>
           I get home at
@@ -9909,6 +11148,28 @@ function ScheduleGrid({
           onClick={onGenerate}
         >
           {generating ? "Building…" : "✨ Build my study schedule"}
+        </button>
+        {/* Nudge me when each block starts. Asks for browser notifications the
+            first time it's switched on, so reminders land even in a background
+            tab — the in-app banner shows either way. */}
+        <button
+          style={{
+            ...styles.schedRemindBtn,
+            ...(remindOn ? styles.schedRemindBtnOn : {}),
+          }}
+          aria-pressed={remindOn}
+          onClick={() => {
+            const next = !remindOn;
+            if (next) void requestNudgePermission();
+            onSetRemindOn(next);
+          }}
+          title={
+            remindOn
+              ? "I'll remind you when each block starts — tap to turn off"
+              : "Get a nudge when each block starts"
+          }
+        >
+          {remindOn ? "🔔 Reminders on" : "🔕 Remind me"}
         </button>
       </div>
       <div style={styles.schedList}>
@@ -9949,6 +11210,34 @@ function ScheduleGrid({
                 placeholder={isNow ? "Now — what's the plan?" : "—"}
                 onChange={(e) => onSet(h, { text: e.target.value })}
               />
+              {/* How long this block actually runs — set by the work in it, not
+                  by the hour. Editable, and it's what the ⏱ counts down. */}
+              {hasText && (
+                <label
+                  style={styles.schedMin}
+                  title="How long this block runs — the minutes its work needs"
+                >
+                  <input
+                    style={styles.schedMinInput}
+                    type="number"
+                    min={5}
+                    max={60}
+                    step={5}
+                    value={b?.min ?? ""}
+                    placeholder={String(TIMER_DEFAULT_MIN)}
+                    aria-label={`Minutes for the ${hourLabel(h)} block`}
+                    onChange={(e) => {
+                      const n = parseInt(e.target.value, 10);
+                      onSet(h, {
+                        min: Number.isFinite(n)
+                          ? Math.min(60, Math.max(5, n))
+                          : undefined,
+                      });
+                    }}
+                  />
+                  min
+                </label>
+              )}
               {hasText &&
                 (timer?.hour === h ? (
                   <div style={styles.schedTimer}>
@@ -9993,8 +11282,8 @@ function ScheduleGrid({
                   <button
                     style={styles.schedTimerStart}
                     onClick={() => startTimer(h)}
-                    title={`Start a ${TIMER_DEFAULT_MIN}-min focus countdown`}
-                    aria-label={`Start a ${TIMER_DEFAULT_MIN}-minute focus timer for this block`}
+                    title={`Start this block's ${blockMinutes(h)}-min countdown`}
+                    aria-label={`Start a ${blockMinutes(h)}-minute focus timer for this block`}
                   >
                     ⏱
                   </button>
@@ -10478,15 +11767,21 @@ function PlanPanel({
 }
 
 // A visual month grid that marks days with events and lets you tap a day to add.
+// SMART goals show up on the calendar in their own colour, so a goal's target
+// date sits next to the exams and deadlines it has to fit around.
+const GOAL_COLOR = "#a8548c";
+
 function MonthGrid({
   events,
   assignments = [],
   dailyTasks = null,
+  goals = [],
   onPickDate,
 }: {
   events: StudyEvent[];
   assignments?: Assignment[];
   dailyTasks?: DailyTasksState | null;
+  goals?: SmartGoal[];
   onPickDate: (iso: string) => void;
 }) {
   const now = new Date();
@@ -10524,6 +11819,14 @@ function MonthGrid({
         label: `⏳ work on: ${a.title}${
           a.estMin ? ` (${a.estMin} min)` : ""
         }`,
+      });
+  // SMART goal target dates (magenta) — the deadline the learner set for
+  // themselves, shown alongside the deadlines school set for them.
+  for (const g of goals)
+    if (g.timeBound)
+      (dotsByDate[g.timeBound] ||= []).push({
+        color: GOAL_COLOR,
+        label: `🌟 goal: ${g.specific}${g.done ? " ✓" : ""}`,
       });
   // Daily to-do list (purple) — one dot per task on the day it's scheduled for.
   if (dailyTasks?.date)
@@ -10603,7 +11906,8 @@ function MonthGrid({
         })}
       </div>
       {(assignments.some((a) => a.planDate && !a.done) ||
-        (dailyTasks?.tasks.length ?? 0) > 0) && (
+        (dailyTasks?.tasks.length ?? 0) > 0 ||
+        goals.some((g) => g.timeBound)) && (
         <div style={styles.calLegend}>
           <span style={styles.calLegendItem}>
             <span style={{ ...styles.calDot, background: "#2f6f4f" }} /> due
@@ -10616,6 +11920,11 @@ function MonthGrid({
               <span style={{ ...styles.calDot, background: "#6b5bd6" }} /> tasks
             </span>
           )}
+          {goals.some((g) => g.timeBound) && (
+            <span style={styles.calLegendItem}>
+              <span style={{ ...styles.calDot, background: GOAL_COLOR }} /> goals
+            </span>
+          )}
         </div>
       )}
     </div>
@@ -10626,23 +11935,29 @@ function CalendarPanel({
   events,
   assignments = [],
   dailyTasks = null,
+  goals = [],
+  week = null,
   profile,
   career,
   onAdd,
   onRemove,
   onBreakDown,
   onToggleTask,
+  onOpenGoals,
   breakingEventId,
 }: {
   events: StudyEvent[];
   assignments?: Assignment[];
   dailyTasks?: DailyTasksState | null;
+  goals?: SmartGoal[];
+  week?: WeekSchedule | null;
   profile?: LearnerProfile | null;
   career?: string;
   onAdd: (e: StudyEvent) => void;
   onRemove: (id: string) => void;
   onBreakDown: (e: StudyEvent) => void;
   onToggleTask: (eventId: string, index: number) => void;
+  onOpenGoals?: () => void;
   breakingEventId: string | null;
 }) {
   const [adding, setAdding] = useState(false);
@@ -10651,19 +11966,56 @@ function CalendarPanel({
   const [kind, setKind] = useState<EventKind>("exam");
 
   const sorted = [...events].sort((a, b) => a.date.localeCompare(b.date));
+  // Goals with a target date, soonest first — achieved ones drop off, overdue
+  // ones stay so a missed target doesn't quietly disappear from the calendar.
+  const datedGoals = goals
+    .filter((g) => !g.done && g.timeBound)
+    .sort((a, b) => a.timeBound!.localeCompare(b.timeBound!));
 
   // Build a day-by-day SCHEDULE for the next 2 weeks: planned work sessions
   // (assignment planDates) + events, grouped by date, with per-day time totals.
-  const todayISO = new Date().toISOString().slice(0, 10);
-  const horizonISO = new Date(Date.now() + 14 * 86_400_000)
-    .toISOString()
-    .slice(0, 10);
+  // Local dates, not UTC: an evening west of Greenwich is already tomorrow in
+  // UTC, which would slide the whole window (and "Today") a day forward.
+  const todayISO = localISO();
+  const horizonISO = localISO(new Date(Date.now() + 14 * 86_400_000));
   const schedule: Record<
     string,
-    { work: Assignment[]; events: StudyEvent[]; tasks: DailyTask[]; min: number }
+    {
+      work: Assignment[];
+      events: StudyEvent[];
+      tasks: DailyTask[];
+      goals: SmartGoal[];
+      blocks: WeekBlock[];
+      min: number;
+    }
   > = {};
   const bucket = (iso: string) =>
-    (schedule[iso] ||= { work: [], events: [], tasks: [], min: 0 });
+    (schedule[iso] ||= {
+      work: [],
+      events: [],
+      tasks: [],
+      goals: [],
+      blocks: [],
+      min: 0,
+    });
+  // The week the learner built in the Schedule studio repeats, so it only
+  // becomes a calendar once it's laid onto real dates: every day in the window
+  // takes that weekday's blocks, at their own times.
+  if (week?.blocks.length) {
+    const byWeekday = new Map<WeekDay, WeekBlock[]>(
+      WEEK_DAYS.map((d) => [d, []]),
+    );
+    for (const b of week.blocks) byWeekday.get(b.day)?.push(b);
+    for (const list of byWeekday.values())
+      list.sort((a, b) => scheduleMinutes(a.start) - scheduleMinutes(b.start));
+    for (let i = 0; i <= 14; i++) {
+      const d = new Date(`${todayISO}T00:00:00`);
+      d.setDate(d.getDate() + i);
+      // WEEK_DAYS starts on Monday; JS getDay() starts on Sunday.
+      const blocks = byWeekday.get(WEEK_DAYS[(d.getDay() + 6) % 7]) ?? [];
+      if (blocks.length) bucket(localISO(d)).blocks.push(...blocks);
+    }
+  }
   for (const a of assignments)
     if (!a.done && a.planDate && a.planDate >= todayISO && a.planDate <= horizonISO) {
       const b = bucket(a.planDate);
@@ -10672,6 +12024,16 @@ function CalendarPanel({
     }
   for (const e of events)
     if (e.date >= todayISO && e.date <= horizonISO) bucket(e.date).events.push(e);
+  // A goal's target date is a deadline like any other, so it lands in the
+  // day-by-day schedule too (no minutes — the goal's own steps carry those).
+  for (const g of goals)
+    if (
+      !g.done &&
+      g.timeBound &&
+      g.timeBound >= todayISO &&
+      g.timeBound <= horizonISO
+    )
+      bucket(g.timeBound).goals.push(g);
   // Today's to-do list lands on its own day too, so the schedule shows the day's
   // tasks alongside deadlines and planned work — not just as dots on the grid.
   if (
@@ -10751,6 +12113,7 @@ function CalendarPanel({
         events={events}
         assignments={assignments}
         dailyTasks={dailyTasks}
+        goals={goals}
         onPickDate={(iso) => {
           setDate(iso);
           setAdding(true);
@@ -10773,6 +12136,21 @@ function CalendarPanel({
                     <span style={styles.schedTotal}>~{fmtMin(day.min)}</span>
                   )}
                 </div>
+                {day.blocks.map((b) => (
+                  <div key={`week-${b.id}`} style={styles.schedItem}>
+                    <span
+                      style={{
+                        ...styles.schedTick,
+                        background: WEEK_KINDS[b.kind].ink,
+                      }}
+                    />
+                    <span>
+                      <b>{b.start}</b> {b.title}
+                      {b.min ? ` · ${fmtMin(b.min)}` : ""}
+                      {b.kind !== "study" ? ` (${WEEK_KINDS[b.kind].label})` : ""}
+                    </span>
+                  </div>
+                ))}
                 {day.events.map((e) => (
                   <div key={e.id} style={styles.schedItem}>
                     <span
@@ -10795,6 +12173,21 @@ function CalendarPanel({
                       ⏳ {a.title}
                       {a.estMin ? ` · ${fmtMin(a.estMin)}` : ""}
                       {a.due ? ` (due ${formatDate(a.due)})` : ""}
+                    </span>
+                  </div>
+                ))}
+                {day.goals.map((g) => (
+                  <div key={g.id} style={styles.schedItem}>
+                    <span
+                      style={{ ...styles.schedTick, background: GOAL_COLOR }}
+                    />
+                    <span>
+                      🌟 <b>goal:</b> {g.specific}
+                      {g.target
+                        ? ` · ${g.current ?? 0}/${g.target}`
+                        : g.tasks?.length
+                          ? ` · ${g.tasks.filter((t) => t.done).length}/${g.tasks.length} steps`
+                          : ""}
                     </span>
                   </div>
                 ))}
@@ -10901,6 +12294,44 @@ function CalendarPanel({
               </button>
             </div>
           ))}
+        </div>
+      )}
+
+      {datedGoals.length > 0 && (
+        <div style={styles.schedBox}>
+          <div style={styles.planHead}>
+            <span style={{ ...styles.schedTitle, marginBottom: 0 }}>
+              🌟 Goal deadlines
+            </span>
+            {onOpenGoals && (
+              <button style={styles.linkBtn} onClick={onOpenGoals}>
+                Goals →
+              </button>
+            )}
+          </div>
+          {datedGoals.map((g) => {
+            const steps = g.tasks?.length ?? 0;
+            const stepsDone = g.tasks?.filter((t) => t.done).length ?? 0;
+            return (
+              <div key={g.id} style={styles.calRow}>
+                <span style={{ ...styles.calChip, background: GOAL_COLOR }}>
+                  {goalHorizonLabelLocal(g.horizon)}
+                </span>
+                <span style={styles.calDate}>{formatDate(g.timeBound!)}</span>
+                <span style={styles.calTitle}>
+                  {g.specific}
+                  {g.target
+                    ? ` · ${g.current ?? 0}/${g.target}`
+                    : steps
+                      ? ` · ${stepsDone}/${steps} steps`
+                      : ""}
+                </span>
+                <span style={styles.calCountdown}>
+                  {countdown(g.timeBound!)}
+                </span>
+              </div>
+            );
+          })}
         </div>
       )}
 
@@ -11783,7 +13214,7 @@ function SchoolConnect({
                 borderRadius: 10,
                 border: "none",
                 background: "var(--accent)",
-                color: "#fff",
+                color: "var(--primary-foreground)",
                 fontWeight: 700,
                 cursor: busy ? "default" : "pointer",
                 opacity: busy || !icsUrl.trim() ? 0.6 : 1,
@@ -11864,7 +13295,7 @@ function SchoolConnect({
               borderRadius: 10,
               border: "none",
               background: "var(--accent)",
-              color: "#fff",
+              color: "var(--primary-foreground)",
               fontWeight: 700,
               cursor: busy ? "default" : "pointer",
               opacity: busy || paste.trim().length < 4 ? 0.6 : 1,
@@ -11998,7 +13429,7 @@ function SchoolConnect({
               borderRadius: 10,
               border: "none",
               background: "var(--accent)",
-              color: "#fff",
+              color: "var(--primary-foreground)",
               fontWeight: 700,
               cursor: "pointer",
             }}
@@ -12280,6 +13711,26 @@ function FocusMusicPlayer({ storageKey }: { storageKey: string }) {
   );
 }
 
+// What the summarizer can make from a piece of material. Doubles as the chip
+// row and, once notes exist, the label on the document.
+const SUMMARIZER_OUTPUTS = {
+  summary: "📝 Summary",
+  studyguide: "📚 Study guide",
+  modules: "🧩 Modules",
+  videonotes: "🎬 Video notes",
+  flashcards: "🃏 Flashcards",
+  quiz: "📋 Quiz",
+} as const;
+
+// Openers for the notes chat, so the panel is useful before anyone thinks of a
+// question. Each is sent verbatim to /api/notes-qa.
+const NOTE_CHAT_PROMPTS = [
+  "Explain this more simply",
+  "What's most important here?",
+  "Give me an example",
+  "Quiz me on this",
+];
+
 function Summarizer({
   profile,
   onClose,
@@ -12297,7 +13748,7 @@ function Summarizer({
 }) {
   const [tab, setTab] = useState<"text" | "video" | "doc">("text");
   const [output, setOutput] = useState<
-    "summary" | "studyguide" | "flashcards" | "quiz"
+    "summary" | "studyguide" | "modules" | "videonotes" | "flashcards" | "quiz"
   >("summary");
   // Which flashcard format to generate (only used when output = "flashcards").
   const [flashStyle, setFlashStyle] = useState<FlashcardStyle>("basic");
@@ -12407,8 +13858,10 @@ function Summarizer({
     }
   }
 
-  async function ask() {
-    const q = question.trim();
+  // `preset` lets the suggestion chips ask a question without it having to be
+  // typed into the box first.
+  async function ask(preset?: string) {
+    const q = (preset ?? question).trim();
     if (!q || asking || !result) return;
     setAsking(true);
     setQuestion("");
@@ -12537,12 +13990,10 @@ function Summarizer({
         <div style={styles.outputLabel}>Make from this material:</div>
         <div style={styles.outputRow}>
           {(
-            [
-              ["summary", "📝 Summary"],
-              ["studyguide", "📚 Study guide"],
-              ["flashcards", "🃏 Flashcards"],
-              ["quiz", "📋 Quiz"],
-            ] as const
+            Object.entries(SUMMARIZER_OUTPUTS) as [
+              keyof typeof SUMMARIZER_OUTPUTS,
+              string,
+            ][]
           ).map(([k, label]) => (
             <button
               key={k}
@@ -12582,12 +14033,16 @@ function Summarizer({
               ? "Summarize"
               : output === "studyguide"
                 ? "Make study guide"
-                : output === "flashcards"
-                  ? "Make flashcards"
-                  : "Make quiz"}
+                : output === "modules"
+                  ? "Break into modules"
+                  : output === "videonotes"
+                    ? "Take video notes"
+                    : output === "flashcards"
+                      ? "Make flashcards"
+                      : "Make quiz"}
         </button>
 
-        {(result || cards || quiz) && (
+        {(cards || quiz) && (
           <div style={styles.result}>
             {cards ? (
               cards.length ? (
@@ -12595,46 +14050,12 @@ function Summarizer({
               ) : (
                 <div style={styles.resultText}>No flashcards — try more material.</div>
               )
-            ) : quiz ? (
-              quiz.length ? (
-                <QuizView quiz={quiz} onMissed={() => {}} onStudyGuide={onStudyGuide} />
-              ) : (
-                <div style={styles.resultText}>No quiz — try more material.</div>
-              )
+            ) : quiz?.length ? (
+              <QuizView quiz={quiz} onMissed={() => {}} onStudyGuide={onStudyGuide} />
             ) : (
-              <div style={styles.resultMd}>
-                {renderMarkdown(result, "var(--accent)")}
-              </div>
+              <div style={styles.resultText}>No quiz — try more material.</div>
             )}
             <div style={styles.formActions}>
-              {!cards && !quiz && (
-                <button
-                  style={styles.secondaryBtn}
-                  onClick={() => navigator.clipboard?.writeText(result)}
-                >
-                  Copy
-                </button>
-              )}
-              {!cards && !quiz && result && (
-                <ShareButton
-                  payload={{
-                    v: 1,
-                    kind: "note",
-                    title: noteTitle(result),
-                    text: result,
-                  }}
-                  label="Share with a friend"
-                />
-              )}
-              {!cards && !quiz && result && !busy && (
-                <button
-                  style={styles.secondaryBtn}
-                  onClick={makeQuestions}
-                  disabled={makingQuiz}
-                >
-                  {makingQuiz ? "Writing questions…" : "📋 Make questions"}
-                </button>
-              )}
               <button
                 style={styles.primaryBtn}
                 onClick={() => {
@@ -12648,37 +14069,105 @@ function Summarizer({
                       content: "Here's a quiz from your material:",
                       quiz,
                     });
-                  else onAddToChat({ content: result });
                   onClose?.();
                 }}
               >
                 Add to chat
               </button>
             </div>
+          </div>
+        )}
 
-            {/* Practice questions written from the notes above. */}
-            {!cards && !quiz && noteQuiz && (
-              <div style={styles.qaBox}>
-                <div style={styles.qaHead}>📋 Questions from these notes</div>
-                {noteQuiz.length ? (
-                  <QuizView
-                    quiz={noteQuiz}
-                    onMissed={() => {}}
-                    onStudyGuide={onStudyGuide}
+        {/* Written notes get a workspace rather than a block of text: the notes
+            themselves read as a document, with the chat about them alongside. */}
+        {!cards && !quiz && result && (
+          <div className="eliora-note-ws">
+            <section style={styles.noteDoc}>
+              <div style={styles.noteDocHead}>
+                {/* Labelled by what was made, not by the first line — that
+                    line is already the document's own opening heading. */}
+                <div style={styles.noteDocTitle}>{SUMMARIZER_OUTPUTS[output]}</div>
+                <div style={styles.noteDocActions}>
+                  <button
+                    style={styles.secondaryBtn}
+                    onClick={() => navigator.clipboard?.writeText(result)}
+                  >
+                    Copy
+                  </button>
+                  {!busy && (
+                    <button
+                      style={styles.secondaryBtn}
+                      onClick={() => printAsPdf(noteTitle(result), result)}
+                    >
+                      📄 Save as PDF
+                    </button>
+                  )}
+                  <ShareButton
+                    payload={{
+                      v: 1,
+                      kind: "note",
+                      title: noteTitle(result),
+                      text: result,
+                    }}
+                    label="Share"
                   />
-                ) : (
-                  <div style={styles.resultText}>
-                    I couldn&apos;t write questions from these notes — try a longer
-                    summary or study guide.
-                  </div>
-                )}
+                  {!busy && (
+                    <button
+                      style={styles.secondaryBtn}
+                      onClick={makeQuestions}
+                      disabled={makingQuiz}
+                    >
+                      {makingQuiz ? "Writing questions…" : "📋 Make questions"}
+                    </button>
+                  )}
+                  <button
+                    style={styles.primaryBtn}
+                    onClick={() => {
+                      onAddToChat({ content: result });
+                      onClose?.();
+                    }}
+                  >
+                    Add to chat
+                  </button>
+                </div>
               </div>
-            )}
+              <div style={styles.noteDocBody}>
+                {renderDocMarkdown(result, "var(--accent)")}
+              </div>
 
-            {/* Follow-up Q&A grounded in the generated notes. */}
-            {!cards && !quiz && result && !busy && (
-              <div style={styles.qaBox}>
-                <div style={styles.qaHead}>💬 Ask about these notes</div>
+              {/* Practice questions written from the notes above. */}
+              {noteQuiz && (
+                <div style={{ ...styles.qaBox, padding: "12px 22px 22px" }}>
+                  <div style={styles.qaHead}>📋 Questions from these notes</div>
+                  {noteQuiz.length ? (
+                    <QuizView
+                      quiz={noteQuiz}
+                      onMissed={() => {}}
+                      onStudyGuide={onStudyGuide}
+                    />
+                  ) : (
+                    <div style={styles.resultText}>
+                      I couldn&apos;t write questions from these notes — try a
+                      longer summary or study guide.
+                    </div>
+                  )}
+                </div>
+              )}
+            </section>
+
+            {/* Follow-up Q&A grounded in the notes on the left. */}
+            <aside className="eliora-note-chat" style={styles.noteChat}>
+              <div style={styles.noteChatHead}>
+                <span style={styles.noteChatAvatar} aria-hidden="true">
+                  💬
+                </span>
+                <div style={styles.noteChatTitle}>Chat with these notes</div>
+              </div>
+              <div style={styles.noteChatBody}>
+                <div style={styles.noteGreet}>
+                  Hi! Ask me anything about these notes — I answer from what&apos;s
+                  written here, not from somewhere else.
+                </div>
                 {qa.map((m, i) => (
                   <div
                     key={i}
@@ -12695,6 +14184,20 @@ function Summarizer({
                     )}
                   </div>
                 ))}
+              </div>
+              <div style={styles.noteChatFoot}>
+                <div style={styles.outputRow}>
+                  {NOTE_CHAT_PROMPTS.map((p) => (
+                    <button
+                      key={p}
+                      style={styles.outChip}
+                      disabled={busy || asking}
+                      onClick={() => ask(p)}
+                    >
+                      {p}
+                    </button>
+                  ))}
+                </div>
                 <div style={styles.qaInputRow}>
                   <input
                     style={styles.formInput}
@@ -12703,18 +14206,23 @@ function Summarizer({
                     onKeyDown={(e) => {
                       if (e.key === "Enter") ask();
                     }}
-                    placeholder="e.g. Can you explain the second point more simply?"
+                    disabled={busy}
+                    placeholder={
+                      busy
+                        ? "Still writing your notes…"
+                        : "Type your question here"
+                    }
                   />
                   <button
                     style={styles.primaryBtn}
-                    onClick={ask}
-                    disabled={asking || !question.trim()}
+                    onClick={() => ask()}
+                    disabled={busy || asking || !question.trim()}
                   >
                     {asking ? "…" : "Ask"}
                   </button>
                 </div>
               </div>
-            )}
+            </aside>
           </div>
         )}
     </div>
@@ -12753,6 +14261,1469 @@ function ShareButton({
             ? "Couldn’t share"
             : `🔗 ${label}`}
     </button>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Lesson diagrams.
+//
+// The lesson builder hands back a LessonVisual — a shape plus labels — and this
+// draws it as inline SVG. All the geometry lives here rather than in the model's
+// output, so a diagram is always laid out properly, and colours come from the
+// theme variables so they follow light/dark mode. Everything the model wrote is
+// rendered as SVG <text>, never as markup.
+// ---------------------------------------------------------------------------
+
+// Break a label across lines so it fits its box. Long labels are truncated
+// rather than allowed to overflow the shape.
+function wrapLabel(text: string, maxChars: number, maxLines: number): string[] {
+  const lines: string[] = [];
+  let cur = "";
+  for (const word of text.split(/\s+/)) {
+    const next = cur ? `${cur} ${word}` : word;
+    if (next.length > maxChars && cur) {
+      lines.push(cur);
+      cur = word;
+    } else cur = next;
+  }
+  if (cur) lines.push(cur);
+  if (lines.length <= maxLines) return lines;
+  const kept = lines.slice(0, maxLines);
+  kept[maxLines - 1] = `${kept[maxLines - 1].slice(0, maxChars - 1)}…`;
+  return kept;
+}
+
+// A label (and optional detail line) centred in a box, wrapped to fit.
+function DiagramLabel({
+  x,
+  y,
+  width,
+  item,
+  chars,
+}: {
+  x: number;
+  y: number;
+  width: number;
+  item: LessonVisualItem;
+  chars: number;
+}) {
+  const lines = wrapLabel(item.label, chars, 2);
+  const detail = item.detail ? wrapLabel(item.detail, chars + 4, 2) : [];
+  const total = lines.length + detail.length;
+  const top = y - ((total - 1) * 14) / 2;
+  return (
+    <>
+      {lines.map((line, i) => (
+        <text
+          key={`l${i}`}
+          x={x + width / 2}
+          y={top + i * 14}
+          textAnchor="middle"
+          fontSize={13}
+          fontWeight={700}
+          fill="var(--text)"
+        >
+          {line}
+        </text>
+      ))}
+      {detail.map((line, i) => (
+        <text
+          key={`d${i}`}
+          x={x + width / 2}
+          y={top + (lines.length + i) * 14 + 2}
+          textAnchor="middle"
+          fontSize={11}
+          fill="var(--muted)"
+        >
+          {line}
+        </text>
+      ))}
+    </>
+  );
+}
+
+// A right-pointing arrow between two boxes (used by "steps").
+function DiagramArrow({ x, y }: { x: number; y: number }) {
+  return (
+    <path
+      d={`M ${x} ${y} l 14 0 m -5 -5 l 5 5 l -5 5`}
+      stroke="var(--border-strong)"
+      strokeWidth={2}
+      fill="none"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+    />
+  );
+}
+
+const DIAGRAM_W = 640;
+
+// Height per shape — each layout has its own natural aspect.
+const DIAGRAM_H: Record<LessonVisual["kind"], number> = {
+  steps: 150,
+  compare: 210,
+  parts: 190,
+  cycle: 330,
+  timeline: 210,
+  hierarchy: 240,
+  formula: 230,
+};
+
+function LessonDiagram({ visual }: { visual: LessonVisual }) {
+  const { kind, items } = visual;
+  const n = items.length;
+  const height = DIAGRAM_H[kind];
+
+  let body: ReactNode = null;
+
+  if (kind === "steps") {
+    const gap = 30;
+    const boxW = (DIAGRAM_W - 16 - (n - 1) * gap) / n;
+    const boxH = 84;
+    const top = 34;
+    body = items.map((item, i) => {
+      const x = 8 + i * (boxW + gap);
+      return (
+        <g key={i}>
+          <rect
+            x={x}
+            y={top}
+            width={boxW}
+            height={boxH}
+            rx={12}
+            fill="var(--accent-soft)"
+            stroke="var(--accent)"
+            strokeWidth={1.5}
+          />
+          <DiagramLabel
+            x={x}
+            y={top + boxH / 2}
+            width={boxW}
+            item={item}
+            chars={Math.max(9, Math.floor(boxW / 7))}
+          />
+          {i < n - 1 && <DiagramArrow x={x + boxW + 8} y={top + boxH / 2} />}
+        </g>
+      );
+    });
+  } else if (kind === "compare") {
+    const gap = 18;
+    const boxW = (DIAGRAM_W - 16 - (n - 1) * gap) / n;
+    const boxH = 150;
+    const top = 34;
+    body = items.map((item, i) => {
+      const x = 8 + i * (boxW + gap);
+      const detail = item.detail ? wrapLabel(item.detail, Math.floor(boxW / 6), 5) : [];
+      return (
+        <g key={i}>
+          <rect
+            x={x}
+            y={top}
+            width={boxW}
+            height={boxH}
+            rx={14}
+            fill="var(--surface)"
+            stroke="var(--accent)"
+            strokeWidth={1.5}
+          />
+          <rect
+            x={x}
+            y={top}
+            width={boxW}
+            height={36}
+            rx={14}
+            fill="var(--accent-soft)"
+          />
+          {/* Square off the header's bottom corners so it reads as a banner. */}
+          <rect x={x} y={top + 22} width={boxW} height={14} fill="var(--accent-soft)" />
+          <line
+            x1={x}
+            y1={top + 36}
+            x2={x + boxW}
+            y2={top + 36}
+            stroke="var(--accent)"
+            strokeWidth={1.5}
+          />
+          {wrapLabel(item.label, Math.floor(boxW / 7), 1).map((line, li) => (
+            <text
+              key={li}
+              x={x + boxW / 2}
+              y={top + 23}
+              textAnchor="middle"
+              fontSize={13.5}
+              fontWeight={700}
+              fill="var(--text)"
+            >
+              {line}
+            </text>
+          ))}
+          {detail.map((line, li) => (
+            <text
+              key={`d${li}`}
+              x={x + boxW / 2}
+              y={top + 60 + li * 16}
+              textAnchor="middle"
+              fontSize={12}
+              fill="var(--muted)"
+            >
+              {line}
+            </text>
+          ))}
+        </g>
+      );
+    });
+  } else if (kind === "parts") {
+    // One stacked bar sized by each item's value, with a legend underneath —
+    // labels sit outside the bar so a thin slice never swallows its own text.
+    const values = items.map((it) => (it.value && it.value > 0 ? it.value : 1));
+    const sum = values.reduce((a, b) => a + b, 0);
+    const barW = DIAGRAM_W - 16;
+    const barY = 34;
+    const barH = 46;
+    let cursor = 8;
+    body = (
+      <>
+        {items.map((item, i) => {
+          const w = (values[i] / sum) * barW;
+          const x = cursor;
+          cursor += w;
+          return (
+            <g key={i}>
+              <rect
+                x={x}
+                y={barY}
+                width={w}
+                height={barH}
+                fill="var(--accent)"
+                opacity={0.85 - i * 0.14}
+              />
+              {w > 34 && (
+                <text
+                  x={x + w / 2}
+                  y={barY + barH / 2 + 5}
+                  textAnchor="middle"
+                  fontSize={13}
+                  fontWeight={700}
+                  fill="var(--surface)"
+                >
+                  {Math.round((values[i] / sum) * 100)}%
+                </text>
+              )}
+            </g>
+          );
+        })}
+        <rect
+          x={8}
+          y={barY}
+          width={barW}
+          height={barH}
+          rx={10}
+          fill="none"
+          stroke="var(--border-strong)"
+          strokeWidth={1.5}
+        />
+        {items.map((item, i) => (
+          <g key={`lg${i}`}>
+            <rect
+              x={12}
+              y={barY + barH + 20 + i * 22}
+              width={12}
+              height={12}
+              rx={3}
+              fill="var(--accent)"
+              opacity={0.85 - i * 0.14}
+            />
+            <text
+              x={32}
+              y={barY + barH + 30 + i * 22}
+              fontSize={12.5}
+              fontWeight={600}
+              fill="var(--text)"
+            >
+              {item.label}
+              {item.detail ? (
+                <tspan fontWeight={400} fill="var(--muted)">
+                  {" "}
+                  — {item.detail}
+                </tspan>
+              ) : null}
+            </text>
+          </g>
+        ))}
+      </>
+    );
+  } else if (kind === "cycle") {
+    // Items evenly spaced around a circle, each arc pointing at the next, so the
+    // loop visibly closes back on itself.
+    const cx = DIAGRAM_W / 2;
+    const cy = 172;
+    const r = 108;
+    const boxW = 150;
+    const boxH = 54;
+    const at = (i: number) => {
+      const angle = (i / n) * Math.PI * 2 - Math.PI / 2;
+      return { x: cx + r * Math.cos(angle), y: cy + r * Math.sin(angle) };
+    };
+    body = (
+      <>
+        {items.map((_, i) => {
+          const from = at(i);
+          const to = at((i + 1) % n);
+          return (
+            <path
+              key={`a${i}`}
+              d={`M ${from.x} ${from.y} A ${r} ${r} 0 0 1 ${to.x} ${to.y}`}
+              stroke="var(--accent)"
+              strokeWidth={2}
+              fill="none"
+              opacity={0.45}
+              markerEnd="url(#cycleArrow)"
+            />
+          );
+        })}
+        {items.map((item, i) => {
+          const p = at(i);
+          return (
+            <g key={i}>
+              <rect
+                x={p.x - boxW / 2}
+                y={p.y - boxH / 2}
+                width={boxW}
+                height={boxH}
+                rx={12}
+                fill="var(--accent-soft)"
+                stroke="var(--accent)"
+                strokeWidth={1.5}
+              />
+              <DiagramLabel
+                x={p.x - boxW / 2}
+                y={p.y}
+                width={boxW}
+                item={item}
+                chars={20}
+              />
+            </g>
+          );
+        })}
+      </>
+    );
+  } else if (kind === "timeline") {
+    // A spine with evenly spaced ticks; labels alternate above and below so
+    // neighbouring entries never collide.
+    const y = 108;
+    const startX = 40;
+    const endX = DIAGRAM_W - 40;
+    const step = n > 1 ? (endX - startX) / (n - 1) : 0;
+    body = (
+      <>
+        <line
+          x1={startX}
+          y1={y}
+          x2={endX}
+          y2={y}
+          stroke="var(--border-strong)"
+          strokeWidth={3}
+          strokeLinecap="round"
+        />
+        {items.map((item, i) => {
+          const x = startX + i * step;
+          const above = i % 2 === 0;
+          const labelY = above ? y - 30 : y + 34;
+          const chars = Math.max(10, Math.floor(step / 6.5));
+          const detail = item.detail ? wrapLabel(item.detail, chars, 2) : [];
+          return (
+            <g key={i}>
+              <line
+                x1={x}
+                y1={y}
+                x2={x}
+                y2={above ? y - 16 : y + 16}
+                stroke="var(--accent)"
+                strokeWidth={2}
+              />
+              <circle cx={x} cy={y} r={7} fill="var(--accent)" />
+              <text
+                x={x}
+                y={labelY}
+                textAnchor="middle"
+                fontSize={13}
+                fontWeight={700}
+                fill="var(--text)"
+              >
+                {item.label}
+              </text>
+              {detail.map((line, li) => (
+                <text
+                  key={li}
+                  x={x}
+                  y={labelY + (above ? -16 + li * 13 - (detail.length - 1) * 13 : 16 + li * 13)}
+                  textAnchor="middle"
+                  fontSize={11}
+                  fill="var(--muted)"
+                >
+                  {line}
+                </text>
+              ))}
+            </g>
+          );
+        })}
+      </>
+    );
+  } else if (kind === "hierarchy") {
+    // The visual's title is the parent; items hang off it as branches.
+    const rootW = 220;
+    const rootX = (DIAGRAM_W - rootW) / 2;
+    const rootY = 26;
+    const rootH = 52;
+    const gap = 14;
+    const childW = (DIAGRAM_W - 16 - (n - 1) * gap) / n;
+    const childY = 150;
+    const childH = 74;
+    body = (
+      <>
+        <rect
+          x={rootX}
+          y={rootY}
+          width={rootW}
+          height={rootH}
+          rx={12}
+          fill="var(--accent)"
+          stroke="var(--accent)"
+        />
+        {wrapLabel(visual.title || "", 26, 2).map((line, i, arr) => (
+          <text
+            key={i}
+            x={DIAGRAM_W / 2}
+            y={rootY + rootH / 2 + 5 - ((arr.length - 1) * 14) / 2 + i * 14}
+            textAnchor="middle"
+            fontSize={14}
+            fontWeight={700}
+            fill="var(--surface)"
+          >
+            {line}
+          </text>
+        ))}
+        {items.map((item, i) => {
+          const x = 8 + i * (childW + gap);
+          const midX = x + childW / 2;
+          return (
+            <g key={i}>
+              <path
+                d={`M ${DIAGRAM_W / 2} ${rootY + rootH} V ${childY - 26} H ${midX} V ${childY}`}
+                stroke="var(--border-strong)"
+                strokeWidth={2}
+                fill="none"
+              />
+              <rect
+                x={x}
+                y={childY}
+                width={childW}
+                height={childH}
+                rx={12}
+                fill="var(--accent-soft)"
+                stroke="var(--accent)"
+                strokeWidth={1.5}
+              />
+              <DiagramLabel
+                x={x}
+                y={childY + childH / 2}
+                width={childW}
+                item={item}
+                chars={Math.max(10, Math.floor(childW / 6.5))}
+              />
+            </g>
+          );
+        })}
+      </>
+    );
+  } else {
+    // "formula": the expression large and centred, its symbols explained below.
+    const rowY = 116;
+    body = (
+      <>
+        <rect
+          x={8}
+          y={26}
+          width={DIAGRAM_W - 16}
+          height={66}
+          rx={14}
+          fill="var(--accent-soft)"
+          stroke="var(--accent)"
+          strokeWidth={1.5}
+        />
+        <text
+          x={DIAGRAM_W / 2}
+          y={68}
+          textAnchor="middle"
+          fontSize={26}
+          fontWeight={700}
+          fill="var(--text)"
+          fontFamily="ui-monospace, SFMono-Regular, Menlo, monospace"
+        >
+          {(visual.title || "").slice(0, 46)}
+        </text>
+        {items.map((item, i) => (
+          <g key={i}>
+            <circle cx={30} cy={rowY + i * 28 - 4} r={11} fill="var(--accent)" />
+            <text
+              x={30}
+              y={rowY + i * 28}
+              textAnchor="middle"
+              fontSize={12}
+              fontWeight={700}
+              fill="var(--surface)"
+              fontFamily="ui-monospace, SFMono-Regular, Menlo, monospace"
+            >
+              {item.label.slice(0, 3)}
+            </text>
+            <text x={52} y={rowY + i * 28} fontSize={13.5} fill="var(--text)">
+              <tspan fontWeight={700}>{item.label}</tspan>
+              {item.detail ? (
+                <tspan fill="var(--muted)"> — {item.detail}</tspan>
+              ) : null}
+            </text>
+          </g>
+        ))}
+      </>
+    );
+  }
+
+  return (
+    <figure style={styles.diagramWrap}>
+      <svg
+        viewBox={`0 0 ${DIAGRAM_W} ${height}`}
+        style={styles.diagramSvg}
+        role="img"
+        aria-label={
+          visual.caption ||
+          visual.title ||
+          `Diagram: ${items.map((i) => i.label).join(", ")}`
+        }
+      >
+        <defs>
+          <marker
+            id="cycleArrow"
+            markerWidth={9}
+            markerHeight={9}
+            refX={7}
+            refY={3}
+            orient="auto"
+          >
+            <path d="M0,0 L7,3 L0,6 z" fill="var(--accent)" opacity={0.75} />
+          </marker>
+        </defs>
+        {kind !== "hierarchy" && visual.title && kind !== "formula" && (
+          <text
+            x={DIAGRAM_W / 2}
+            y={16}
+            textAnchor="middle"
+            fontSize={13}
+            fontWeight={700}
+            fill="var(--muted)"
+          >
+            {visual.title}
+          </text>
+        )}
+        {body}
+      </svg>
+      {visual.caption && (
+        <figcaption style={styles.diagramCaption}>{visual.caption}</figcaption>
+      )}
+    </figure>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Lessons from your own material — the web player.
+//
+// Two ways to work through the same lesson. "Read" is the self-paced view: the
+// whole step on screen, diagram included, advance when you're ready. "Slides"
+// turns it into something closer to a video — one idea per screen, narrated in
+// Eliora's voice, advancing on its own when the narration ends, and stopping at
+// each check question until it's answered.
+// ---------------------------------------------------------------------------
+
+// The check question, styled for whichever view it's shown in.
+function LessonCheck({
+  q,
+  onMissed,
+  onResolved,
+  slide,
+}: {
+  q: QuizQuestion;
+  onMissed: (topic: string) => void;
+  onResolved: (correct: boolean) => void;
+  slide?: boolean; // bigger type + roomier hit targets for the slide stage
+}) {
+  const [picked, setPicked] = useState<number | null>(null);
+  const correct = picked === q.answerIndex;
+
+  function choose(i: number) {
+    if (picked !== null) return;
+    setPicked(i);
+    if (i !== q.answerIndex) onMissed(q.topic || q.question);
+    onResolved(i === q.answerIndex);
+  }
+
+  return (
+    <div style={slide ? styles.slideCheckBox : styles.lessonCheckBox}>
+      <div style={slide ? styles.slideCheckQ : styles.lessonCheckQ}>{q.question}</div>
+      {q.options.map((opt, i) => {
+        const state =
+          picked === null
+            ? undefined
+            : i === q.answerIndex
+              ? styles.lessonOptCorrect
+              : i === picked
+                ? styles.lessonOptWrong
+                : undefined;
+        return (
+          <button
+            key={i}
+            onClick={() => choose(i)}
+            disabled={picked !== null}
+            style={{
+              ...(slide ? styles.slideOpt : styles.lessonOpt),
+              ...(state ?? {}),
+            }}
+          >
+            {opt}
+            {picked !== null && i === q.answerIndex ? " ✓" : ""}
+          </button>
+        );
+      })}
+      {picked !== null && (
+        <div style={slide ? styles.slideCheckFb : styles.lessonCheckFb}>
+          {correct ? "Correct — " : "Not quite. "}
+          {q.explanation || (correct ? "nice work." : "Have another look.")}
+        </div>
+      )}
+    </div>
+  );
+}
+
+// Slide mode: the narrated, auto-advancing view.
+function LessonSlideshow({
+  lesson,
+  onMissed,
+  onExit,
+  onFinished,
+}: {
+  lesson: Lesson;
+  onMissed: (topic: string) => void;
+  onExit: () => void;
+  onFinished?: () => void; // the deck played through to the end
+}) {
+  const slides = useMemo(() => lessonSlides(lesson), [lesson]);
+  const [i, setI] = useState(0);
+  const [playing, setPlaying] = useState(true);
+  const [voice, setVoice] = useState<"loading" | "playing" | "idle">("idle");
+  const [answered, setAnswered] = useState<Record<number, boolean>>({});
+  const slide = slides[i];
+  // Identifies the narration currently in flight, so a clip that finishes after
+  // the learner has already moved on can't advance the deck a second time.
+  const token = useRef(0);
+
+  const go = useCallback(
+    (delta: number) => {
+      token.current += 1;
+      stopSpeaking();
+      setVoice("idle");
+      setI((prev) => Math.min(slides.length - 1, Math.max(0, prev + delta)));
+    },
+    [slides.length],
+  );
+
+  // A check slide holds the deck until it's answered — that's the whole point
+  // of the check, so autoplay must not read past it.
+  const blocked = slide?.kind === "check" && !(i in answered);
+
+  useEffect(() => {
+    if (!playing || blocked) return;
+    if (slide.kind === "check") {
+      // Answered while still in play mode — give the feedback a beat to land,
+      // then pick the deck back up.
+      const t = window.setTimeout(() => {
+        if (i + 1 < slides.length) setI(i + 1);
+        else {
+          setPlaying(false);
+          onFinished?.();
+        }
+      }, 1200);
+      return () => window.clearTimeout(t);
+    }
+    const mine = ++token.current;
+    let cancelled = false;
+    const timer = window.setTimeout(() => {
+      if (cancelled || mine !== token.current) return;
+      void speak(slide.narration, (s) => {
+        if (mine !== token.current) return;
+        setVoice(s);
+        // The voice finishing is the cue to advance — the deck paces itself to
+        // the narration rather than to an arbitrary timer.
+        if (s === "idle") {
+          if (i + 1 < slides.length) setI(i + 1);
+          else {
+            setPlaying(false);
+            onFinished?.();
+          }
+        }
+      });
+    }, 350);
+    return () => {
+      cancelled = true;
+      window.clearTimeout(timer);
+    };
+  }, [i, playing, blocked, slide, slides.length]);
+
+  // Stop the voice when the deck closes, so it isn't still talking afterwards.
+  useEffect(() => () => stopSpeaking(), []);
+
+  useEffect(() => {
+    function onKey(e: KeyboardEvent) {
+      if (e.key === "ArrowRight") go(1);
+      else if (e.key === "ArrowLeft") go(-1);
+      else if (e.key === "Escape") onExit();
+      else if (e.key === " ") {
+        e.preventDefault();
+        setPlaying((p) => {
+          if (p) stopSpeaking();
+          return !p;
+        });
+      }
+    }
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [go, onExit]);
+
+  function togglePlay() {
+    setPlaying((p) => {
+      if (p) {
+        token.current += 1;
+        stopSpeaking();
+        setVoice("idle");
+      }
+      return !p;
+    });
+  }
+
+  return (
+    <div style={styles.slideStage}>
+      <div style={styles.slideBar}>
+        <span style={styles.slideCount}>
+          {i + 1} / {slides.length}
+        </span>
+        <div style={styles.slideProgressTrack}>
+          <div
+            style={{
+              ...styles.slideProgressFill,
+              width: `${((i + 1) / slides.length) * 100}%`,
+            }}
+          />
+        </div>
+        <button style={styles.slideExit} onClick={onExit}>
+          Exit
+        </button>
+      </div>
+
+      <div style={styles.slideCard} key={i}>
+        {slide.kind === "title" && (
+          <div style={styles.slideCenter}>
+            <div style={styles.slideKicker}>
+              {lesson.size === "mini" ? "⚡ Mini lesson" : "📖 Lesson"} · ~
+              {lesson.minutes} min
+            </div>
+            <h2 style={styles.slideBigTitle}>{slide.title}</h2>
+            <p style={styles.slideLead}>{slide.body}</p>
+          </div>
+        )}
+
+        {slide.kind === "teach" && (
+          <>
+            <h3 style={styles.slideTitle}>{slide.title}</h3>
+            {slide.visual ? (
+              <LessonDiagram visual={slide.visual} />
+            ) : (
+              <p style={styles.slideBody}>{lessonSpeakable(slide.body)}</p>
+            )}
+            {slide.visual && (
+              <p style={styles.slideBodySmall}>{lessonSpeakable(slide.body)}</p>
+            )}
+          </>
+        )}
+
+        {slide.kind === "check" && (
+          <>
+            <h3 style={styles.slideTitle}>Your turn</h3>
+            <LessonCheck
+              key={i}
+              q={slide.check}
+              slide
+              onMissed={onMissed}
+              onResolved={(ok) => setAnswered((a) => ({ ...a, [i]: ok }))}
+            />
+          </>
+        )}
+
+        {slide.kind === "terms" && (
+          <>
+            <h3 style={styles.slideTitle}>📚 Key terms</h3>
+            <div style={styles.slideTerms}>
+              {slide.terms.map((t, ti) => (
+                <div key={ti} style={styles.slideTerm}>
+                  <span style={styles.slideTermWord}>{t.term}</span>
+                  <span style={styles.slideTermDef}>{t.definition}</span>
+                </div>
+              ))}
+            </div>
+          </>
+        )}
+
+        {slide.kind === "recap" && (
+          <div style={styles.slideCenter}>
+            <h3 style={styles.slideTitle}>🎉 Recap</h3>
+            <p style={styles.slideLead}>{slide.body}</p>
+            {lesson.note && <p style={styles.slideNote}>{lesson.note}</p>}
+          </div>
+        )}
+      </div>
+
+      <div style={styles.slideControls}>
+        <button style={styles.slideNav} disabled={i === 0} onClick={() => go(-1)}>
+          ‹ Back
+        </button>
+        <button style={styles.slidePlay} onClick={togglePlay}>
+          {voice === "loading" ? "· · ·" : playing ? "⏸ Pause" : "▶ Play"}
+        </button>
+        <button
+          style={styles.slideNav}
+          disabled={i + 1 >= slides.length || blocked}
+          onClick={() => go(1)}
+          title={blocked ? "Answer the question to continue" : undefined}
+        >
+          Next ›
+        </button>
+      </div>
+      <div style={styles.slideHint}>
+        {blocked
+          ? "Answer to continue"
+          : "Space to play/pause · ← → to move · Esc to exit"}
+      </div>
+    </div>
+  );
+}
+
+// Read mode: the original self-paced step view, now with the step's diagram.
+function LessonReader({
+  lesson,
+  onMissed,
+  onRestart,
+  onFinished,
+  restartLabel,
+}: {
+  lesson: Lesson;
+  onMissed: (topic: string) => void;
+  onRestart: () => void;
+  onFinished?: (score: number, total: number) => void; // reached the end
+  restartLabel?: string; // done-screen button, e.g. "Back to the course map"
+}) {
+  const total = lesson.steps.length;
+  const [idx, setIdx] = useState(0);
+  const [done, setDone] = useState(false);
+  const [results, setResults] = useState<Record<number, boolean>>({});
+  const step = lesson.steps[idx];
+  const answered = step?.check ? idx in results : true;
+  const score = Object.values(results).filter(Boolean).length;
+  const withChecks = lesson.steps.filter((s) => s.check).length;
+
+  if (done) {
+    return (
+      <div style={styles.toolBox}>
+        <div style={styles.cardClass}>🎉 Lesson complete</div>
+        {withChecks > 0 && (
+          <div style={styles.lessonScore}>
+            You got {score} of {withChecks} checks right.
+          </div>
+        )}
+        {lesson.recap && <p style={styles.lessonBody}>{lesson.recap}</p>}
+        {lesson.keyTerms.length > 0 && (
+          <>
+            <div style={{ ...styles.cardClass, marginTop: 10 }}>📚 Key terms</div>
+            {lesson.keyTerms.map((t, i) => (
+              <div key={i} style={styles.lessonTerm}>
+                <b>{t.term}</b> — {t.definition}
+              </div>
+            ))}
+          </>
+        )}
+        {lesson.note && <p style={styles.lessonNote}>{lesson.note}</p>}
+        <button style={styles.studyToolBtn} onClick={onRestart}>
+          {restartLabel ?? "Make another lesson"}
+        </button>
+      </div>
+    );
+  }
+
+  return (
+    <div style={styles.toolBox}>
+      <div style={styles.cardClass}>
+        {lesson.size === "mini" ? "⚡" : "📖"} {lesson.title}
+      </div>
+      {idx === 0 && lesson.intro && <p style={styles.lessonBody}>{lesson.intro}</p>}
+      <div style={styles.lessonProgressTrack}>
+        <div
+          style={{
+            ...styles.lessonProgressFill,
+            width: `${((idx + 1) / total) * 100}%`,
+          }}
+        />
+      </div>
+      <div style={styles.lessonMeta}>
+        Step {idx + 1} of {total} · ~{lesson.minutes} min
+      </div>
+
+      <div style={{ ...styles.cardClass, marginTop: 10 }}>{step.heading}</div>
+      {step.visual && <LessonDiagram visual={step.visual} />}
+      <p style={styles.lessonBody}>{lessonSpeakable(step.body)}</p>
+
+      {step.check && (
+        <LessonCheck
+          key={idx}
+          q={step.check}
+          onMissed={onMissed}
+          onResolved={(ok) => setResults((r) => ({ ...r, [idx]: ok }))}
+        />
+      )}
+
+      <button
+        style={{
+          ...styles.studyToolBtn,
+          marginTop: 12,
+          ...(answered ? {} : { opacity: 0.5, cursor: "not-allowed" }),
+        }}
+        disabled={!answered}
+        onClick={() => {
+          if (idx + 1 >= total) {
+            setDone(true);
+            onFinished?.(score, withChecks);
+          } else setIdx(idx + 1);
+        }}
+      >
+        {idx + 1 >= total ? "Finish lesson" : "Next step →"}
+      </button>
+    </div>
+  );
+}
+
+// Builds a lesson from pasted text or an uploaded PDF / photo, then hands it to
+// whichever player the learner picked.
+function LessonStudio({
+  profile,
+  onMissed,
+}: {
+  profile: LearnerProfile | null;
+  onMissed: (topic: string) => void;
+}) {
+  const [size, setSize] = useState<LessonSize>("mini");
+  const [text, setText] = useState("");
+  const [file, setFile] = useState<File | null>(null);
+  const [loading, setLoading] = useState(false);
+  const [err, setErr] = useState("");
+  const [lesson, setLesson] = useState<Lesson | null>(null);
+  const [mode, setMode] = useState<"slides" | "read">("slides");
+
+  async function build() {
+    setLoading(true);
+    setErr("");
+    setLesson(null);
+    try {
+      const body: Record<string, unknown> = { size, profile: profile ?? undefined };
+      if (file) {
+        const buf = await file.arrayBuffer();
+        let binary = "";
+        const bytes = new Uint8Array(buf);
+        for (let i = 0; i < bytes.length; i += 1)
+          binary += String.fromCharCode(bytes[i]);
+        body.fileBase64 = window.btoa(binary);
+        body.fileMediaType = file.type || "text/plain";
+        body.fileName = file.name;
+      }
+      if (text.trim()) body.text = text.trim();
+
+      const res = await fetch("/api/lesson", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+      });
+      const data = await res.json();
+      if (data.lesson?.steps?.length) setLesson(data.lesson as Lesson);
+      else
+        setErr(
+          data.lesson?.note ||
+            data.error ||
+            "Couldn't build a lesson — try a bit more material.",
+        );
+    } catch {
+      setErr("Couldn't build a lesson right now — try again.");
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  if (lesson) {
+    return (
+      <div style={styles.card}>
+        <div style={styles.cardHead}>
+          <span style={styles.cardClass}>🎓 {lesson.title}</span>
+          <button style={styles.linkBtn} onClick={() => setLesson(null)}>
+            New lesson
+          </button>
+        </div>
+        <div style={styles.lessonModeRow}>
+          {(
+            [
+              ["slides", "🎬 Slides"],
+              ["read", "📄 Read"],
+            ] as const
+          ).map(([key, label]) => (
+            <button
+              key={key}
+              style={{
+                ...styles.lessonModeBtn,
+                ...(mode === key ? styles.lessonModeBtnActive : {}),
+              }}
+              onClick={() => setMode(key)}
+            >
+              {label}
+            </button>
+          ))}
+        </div>
+        {mode === "slides" ? (
+          <LessonSlideshow
+            lesson={lesson}
+            onMissed={onMissed}
+            onExit={() => setMode("read")}
+          />
+        ) : (
+          <LessonReader
+            lesson={lesson}
+            onMissed={onMissed}
+            onRestart={() => setLesson(null)}
+          />
+        )}
+      </div>
+    );
+  }
+
+  return (
+    <div style={styles.card}>
+      <div style={styles.cardHead}>
+        <span style={styles.cardClass}>🎓 Lesson from your material</span>
+      </div>
+      <div style={styles.lessonHint}>
+        Paste your notes or upload a handout — Eliora turns it into a narrated,
+        illustrated lesson you can watch as slides.
+      </div>
+      <div style={styles.lessonModeRow}>
+        {(
+          [
+            ["mini", "⚡ Mini · ~8 min"],
+            ["regular", "📖 Full · ~25 min"],
+          ] as const
+        ).map(([key, label]) => (
+          <button
+            key={key}
+            style={{
+              ...styles.lessonModeBtn,
+              ...(size === key ? styles.lessonModeBtnActive : {}),
+            }}
+            onClick={() => setSize(key)}
+          >
+            {label}
+          </button>
+        ))}
+      </div>
+      <textarea
+        style={styles.lessonInput}
+        placeholder="Paste your notes, a chapter, a lecture transcript…"
+        value={text}
+        onChange={(e) => setText(e.target.value)}
+        rows={5}
+      />
+      <input
+        type="file"
+        accept="application/pdf,image/*,text/plain"
+        style={styles.lessonFile}
+        onChange={(e) => setFile(e.target.files?.[0] ?? null)}
+      />
+      {err && <div style={styles.lessonErr}>{err}</div>}
+      <button
+        style={{
+          ...styles.studyToolBtn,
+          marginTop: 10,
+          ...(loading || (!text.trim() && !file)
+            ? { opacity: 0.5, cursor: "not-allowed" }
+            : {}),
+        }}
+        disabled={loading || (!text.trim() && !file)}
+        onClick={build}
+      >
+        {loading ? "Building your lesson…" : "🎬 Make the lesson"}
+      </button>
+    </div>
+  );
+}
+
+// Course from your textbook — the Khan-Academy-style unit page.
+//
+// Takes the textbook digests uploaded in "Teach from my textbook" (or a fresh
+// upload right here), plans each into a course of ordered modules
+// (/api/course), and shows it as a module map: numbered rings, a progress bar,
+// and a highlighted "next up". Opening a module builds a teach-then-check
+// lesson from JUST that module's sections (/api/lesson + courseModuleText) and
+// plays it in the same slides/read player lessons use. Finishing the lesson
+// ticks the module; courses and ticks persist per-user in localStorage.
+function CourseStudio({
+  materials,
+  profile,
+  ns,
+  busyName,
+  error,
+  onAddMaterial,
+  onMissed,
+}: {
+  materials: StudyMaterial[];
+  profile: LearnerProfile | null;
+  ns: string;
+  busyName: string | null; // material currently being read by /api/material
+  error: string;
+  onAddMaterial: (source: { file?: File }) => void;
+  onMissed: (topic: string) => void;
+}) {
+  const COURSE_KEY = `eliora-courses::${ns}`;
+  const TICK_KEY = `eliora-course-progress::${ns}`;
+  const [courses, setCourses] = useState<Record<string, Course>>({});
+  const [ticks, setTicks] = useState<
+    Record<string, { done: boolean; score?: number; total?: number }>
+  >({});
+  const [loaded, setLoaded] = useState(false);
+  const [planning, setPlanning] = useState<string | null>(null); // material id
+  const [planErr, setPlanErr] = useState("");
+  const [moduleBusy, setModuleBusy] = useState<string | null>(null); // module id
+  const [moduleErr, setModuleErr] = useState("");
+  const [active, setActive] = useState<{
+    course: Course;
+    module: CourseModule;
+    lesson: Lesson;
+  } | null>(null);
+  const [mode, setMode] = useState<"slides" | "read">("slides");
+  const fileRef = useRef<HTMLInputElement>(null);
+
+  // Same load-then-persist dance the dashboard does: read after mount (so the
+  // server render matches an empty client), save on every change after that.
+  useEffect(() => {
+    try {
+      const c = localStorage.getItem(COURSE_KEY);
+      if (c) setCourses(JSON.parse(c));
+      const t = localStorage.getItem(TICK_KEY);
+      if (t) setTicks(JSON.parse(t));
+    } catch {}
+    setLoaded(true);
+  }, [COURSE_KEY, TICK_KEY]);
+  useEffect(() => {
+    if (!loaded) return;
+    try {
+      localStorage.setItem(COURSE_KEY, JSON.stringify(courses));
+      localStorage.setItem(TICK_KEY, JSON.stringify(ticks));
+    } catch {}
+  }, [courses, ticks, loaded, COURSE_KEY, TICK_KEY]);
+
+  async function planCourse(material: StudyMaterial) {
+    if (planning) return;
+    setPlanErr("");
+    setPlanning(material.id);
+    try {
+      const res = await fetch("/api/course", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ material, profile: profile ?? undefined }),
+      });
+      const data = (await res.json()) as { course?: Course; error?: string };
+      if (data.course?.modules?.length) {
+        setCourses((prev) => ({ ...prev, [material.id]: data.course! }));
+      } else {
+        setPlanErr(data.error || "Couldn't plan a course from that — try again.");
+      }
+    } catch {
+      setPlanErr("Couldn't plan the course right now — try again.");
+    } finally {
+      setPlanning(null);
+    }
+  }
+
+  // Drop the plan and its ticks so "Re-plan" starts genuinely fresh.
+  function forgetCourse(materialId: string) {
+    const course = courses[materialId];
+    setCourses((prev) => {
+      const next = { ...prev };
+      delete next[materialId];
+      return next;
+    });
+    if (course) {
+      setTicks((prev) =>
+        Object.fromEntries(
+          Object.entries(prev).filter(([k]) => !k.startsWith(`${course.id}:`)),
+        ),
+      );
+    }
+  }
+
+  async function openModule(
+    material: StudyMaterial,
+    course: Course,
+    module: CourseModule,
+  ) {
+    if (moduleBusy) return;
+    setModuleErr("");
+    setModuleBusy(module.id);
+    try {
+      const res = await fetch("/api/lesson", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          size: module.minutes <= 12 ? "mini" : "regular",
+          text: courseModuleText(material, module),
+          profile: profile ?? undefined,
+        }),
+      });
+      const data = (await res.json()) as {
+        lesson?: Lesson;
+        error?: string;
+      };
+      if (data.lesson?.steps?.length) {
+        setActive({ course, module, lesson: data.lesson });
+        setMode("slides");
+      } else {
+        setModuleErr(
+          data.lesson?.note ||
+            data.error ||
+            "Couldn't build that module — try again.",
+        );
+      }
+    } catch {
+      setModuleErr("Couldn't build that module right now — try again.");
+    } finally {
+      setModuleBusy(null);
+    }
+  }
+
+  // A module lesson is open — same player card the standalone lesson uses.
+  if (active) {
+    const tickKey = `${active.course.id}:${active.module.id}`;
+    const markDone = (score?: number, total?: number) =>
+      setTicks((prev) => ({ ...prev, [tickKey]: { done: true, score, total } }));
+    return (
+      <div style={styles.card}>
+        <div style={styles.cardHead}>
+          <span style={styles.cardClass}>🗺️ {active.module.title}</span>
+          <button style={styles.linkBtn} onClick={() => setActive(null)}>
+            ← Course map
+          </button>
+        </div>
+        <div style={styles.lessonHint}>
+          {active.course.title} · {active.module.goal}
+        </div>
+        <div style={styles.lessonModeRow}>
+          {(
+            [
+              ["slides", "🎬 Slides"],
+              ["read", "📄 Read"],
+            ] as const
+          ).map(([key, label]) => (
+            <button
+              key={key}
+              style={{
+                ...styles.lessonModeBtn,
+                ...(mode === key ? styles.lessonModeBtnActive : {}),
+              }}
+              onClick={() => setMode(key)}
+            >
+              {label}
+            </button>
+          ))}
+        </div>
+        {mode === "slides" ? (
+          <LessonSlideshow
+            lesson={active.lesson}
+            onMissed={onMissed}
+            onExit={() => setMode("read")}
+            onFinished={() => markDone()}
+          />
+        ) : (
+          <LessonReader
+            lesson={active.lesson}
+            onMissed={onMissed}
+            restartLabel="Back to the course map"
+            onRestart={() => setActive(null)}
+            onFinished={markDone}
+          />
+        )}
+      </div>
+    );
+  }
+
+  return (
+    <div style={styles.card}>
+      <div style={styles.cardHead}>
+        <span style={styles.cardClass}>🗺️ Course from your textbook</span>
+      </div>
+      <div style={styles.lessonHint}>
+        Upload a chapter and Eliora maps it into modules you can work through in
+        order, Khan-Academy style — each one a short lesson with checks, ticked
+        off as you go.
+      </div>
+
+      {materials.map((m) => {
+        const course = courses[m.id];
+        if (!course) {
+          return (
+            <div key={m.id} style={styles.courseMatRow}>
+              <span style={{ flexShrink: 0 }}>📕</span>
+              <span style={{ flex: 1, minWidth: 0 }}>
+                <span style={styles.materialTitle}>{m.title}</span>
+                <span style={styles.materialMeta}>
+                  {m.topics.length} section{m.topics.length === 1 ? "" : "s"} ·{" "}
+                  {m.source}
+                </span>
+              </span>
+              <button
+                style={styles.fypAddPlan}
+                disabled={!!planning}
+                onClick={() => void planCourse(m)}
+              >
+                {planning === m.id ? "Planning…" : "🗺️ Plan my course"}
+              </button>
+            </div>
+          );
+        }
+
+        const doneCount = course.modules.filter(
+          (mod) => ticks[`${course.id}:${mod.id}`]?.done,
+        ).length;
+        const next = course.modules.find(
+          (mod) => !ticks[`${course.id}:${mod.id}`]?.done,
+        );
+        return (
+          <div key={m.id} style={styles.courseBox}>
+            <div style={styles.courseHead}>
+              <span style={styles.courseTitle}>{course.title}</span>
+              <button
+                style={styles.linkBtn}
+                onClick={() => forgetCourse(m.id)}
+                title="Delete this plan and its progress, then plan again"
+              >
+                Re-plan
+              </button>
+            </div>
+            {course.intro && <p style={styles.courseIntro}>{course.intro}</p>}
+            <div style={styles.lessonProgressTrack}>
+              <div
+                style={{
+                  ...styles.lessonProgressFill,
+                  width: `${(doneCount / course.modules.length) * 100}%`,
+                }}
+              />
+            </div>
+            <div style={styles.lessonMeta}>
+              {doneCount === course.modules.length
+                ? `🎉 All ${course.modules.length} modules done — you finished this course!`
+                : `${doneCount} of ${course.modules.length} modules done`}
+            </div>
+            {course.modules.map((mod, i) => {
+              const tick = ticks[`${course.id}:${mod.id}`];
+              const isNext = next?.id === mod.id;
+              return (
+                <div
+                  key={mod.id}
+                  style={{
+                    ...styles.courseModuleRow,
+                    ...(isNext ? styles.courseModuleRowNext : {}),
+                  }}
+                >
+                  <span
+                    style={{
+                      ...styles.courseNum,
+                      ...(tick?.done ? styles.courseNumDone : {}),
+                    }}
+                  >
+                    {tick?.done ? "✓" : i + 1}
+                  </span>
+                  <span style={{ flex: 1, minWidth: 0 }}>
+                    <span style={styles.courseModTitle}>{mod.title}</span>
+                    <span style={styles.courseModGoal}>{mod.goal}</span>
+                    <span style={styles.courseModMeta}>
+                      ~{mod.minutes} min · {mod.sections.length} section
+                      {mod.sections.length === 1 ? "" : "s"}
+                      {tick?.done && tick.total
+                        ? ` · ${tick.score}/${tick.total} checks`
+                        : ""}
+                    </span>
+                  </span>
+                  <button
+                    style={styles.fypAddPlan}
+                    disabled={!!moduleBusy}
+                    onClick={() => void openModule(m, course, mod)}
+                  >
+                    {moduleBusy === mod.id
+                      ? "Building…"
+                      : tick?.done
+                        ? "Review"
+                        : isNext
+                          ? "Continue →"
+                          : "Start"}
+                  </button>
+                </div>
+              );
+            })}
+          </div>
+        );
+      })}
+
+      {busyName && (
+        <div style={styles.materialReading}>
+          ⏳ Reading “{busyName}” — this takes a few seconds for a long chapter.
+        </div>
+      )}
+      {(planErr || moduleErr || error) && (
+        <div style={styles.lessonErr}>{planErr || moduleErr || error}</div>
+      )}
+
+      <input
+        ref={fileRef}
+        type="file"
+        accept=".pdf,.txt,.md,.markdown,.csv,image/*,application/pdf"
+        style={{ display: "none" }}
+        onChange={(e) => {
+          const f = e.target.files?.[0];
+          if (f) onAddMaterial({ file: f });
+          e.target.value = ""; // let them re-pick the same file
+        }}
+      />
+      <button
+        style={{ ...styles.studyToolBtn, marginTop: 10 }}
+        disabled={!!busyName || materials.length >= MATERIAL_MAX}
+        onClick={() => fileRef.current?.click()}
+        title={
+          materials.length >= MATERIAL_MAX
+            ? `Remove one first — ${MATERIAL_MAX} materials is the limit`
+            : "PDF, photo of a page, or a text file"
+        }
+      >
+        {materials.length
+          ? "📤 Upload another chapter"
+          : "📤 Upload your textbook to start"}
+      </button>
+    </div>
   );
 }
 
@@ -13304,6 +16275,1800 @@ function writingStats(text: string) {
     gradeLevel: Math.max(1, Math.round(grade)),
   };
 }
+// Mirrors HelpAnswer / HelpStep in @eliora/shared.
+type HelpMode = "homework" | "test" | "learn";
+type HelpStep = { title: string; detail: string; hint?: string };
+type HelpAnswer = {
+  mode: HelpMode;
+  title: string;
+  summary: string;
+  steps: HelpStep[];
+  keyPoints?: string[];
+  example?: { title: string; body: string };
+  checks?: QuizQuestion[];
+  nextStep?: string;
+  note?: string;
+};
+
+// Mark it before the teacher does. The learner pastes the brief and their draft
+// and gets a grade FIRST — a letter is what makes them act, where a list of
+// comments doesn't — then the rubric line by line, then the three changes worth
+// making. Eliora never rewrites any of it; she says what and where, they write.
+// Revise and hit re-check and the grade delta shows what the revision bought.
+function DraftReviewer({
+  subjects,
+  profile,
+  onAsk,
+}: {
+  subjects: string[];
+  profile: LearnerProfile | null;
+  onAsk?: (message: string) => void;
+}) {
+  const [instructions, setInstructions] = useState("");
+  const [draft, setDraft] = useState("");
+  const [subject, setSubject] = useState("");
+  const [level, setLevel] = useState("");
+  const [doc, setDoc] = useState<{
+    base64: string;
+    mediaType: string;
+    name: string;
+  } | null>(null);
+  const [loading, setLoading] = useState(false);
+  const [review, setReview] = useState<DraftReview | null>(null);
+  const [askFor, setAskFor] = useState("");
+  const [err, setErr] = useState("");
+  const [showRubric, setShowRubric] = useState(true);
+
+  // What the last graded version scored and was told to fix. Held separately
+  // from `review` so a re-check compares against the version they revised, not
+  // against itself.
+  const graded = useRef<DraftReviewRequest["previous"] | null>(null);
+
+  const canSubmit = (draft.trim().length >= 40 || !!doc) && !loading;
+  const VERDICT: Record<RubricVerdict, { icon: string; style: React.CSSProperties }> =
+    {
+      met: { icon: "✅", style: styles.revMet },
+      partial: { icon: "⚠️", style: styles.revPartial },
+      missing: { icon: "❌", style: styles.revMissing },
+    };
+
+  function onFile(files: FileList | null) {
+    const file = files?.[0];
+    if (!file) return;
+    const r = new FileReader();
+    r.onload = () => {
+      const s = String(r.result);
+      setDoc({
+        base64: s.slice(s.indexOf(",") + 1),
+        mediaType: file.type || "text/plain",
+        name: file.name,
+      });
+    };
+    r.readAsDataURL(file);
+  }
+
+  async function grade() {
+    if (!canSubmit) return;
+    setLoading(true);
+    setErr("");
+    setAskFor("");
+    const previous = graded.current ?? undefined;
+    try {
+      const res = await fetch("/api/review", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          draft: draft.trim(),
+          instructions: instructions.trim() || undefined,
+          subject: subject.trim() || undefined,
+          gradeLevel: level.trim() || undefined,
+          fileBase64: doc?.base64,
+          fileMediaType: doc?.mediaType,
+          fileName: doc?.name,
+          previous,
+          profile: profile ?? undefined,
+        }),
+      });
+      const data = (await res.json()) as {
+        review?: DraftReview | null;
+        askFor?: string;
+        error?: string;
+      };
+      if (data.review) {
+        setReview(data.review);
+        graded.current = {
+          grade: data.review.grade,
+          fixes: data.review.fixes.map((f) => f.what),
+          rubric: data.review.rubric.map((r) => ({
+            requirement: r.requirement,
+            verdict: r.verdict,
+          })),
+        };
+      } else if (data.askFor) {
+        setAskFor(data.askFor);
+        setReview(null);
+      } else setErr(data.error || "Couldn't mark that — try again.");
+    } catch {
+      setErr("Couldn't reach the server. Please try again.");
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  // Hand the marking to chat when a fix needs talking through — still coaching,
+  // so the request spells out that Eliora is not to write it for them.
+  function talkItThrough() {
+    if (!review || !onAsk) return;
+    onAsk(
+      `I got my draft back at ${review.grade || "no grade yet"} and I want to fix it${
+        subject.trim() ? ` (${subject.trim()})` : ""
+      }.\n\nHere's what you told me to change:\n${review.fixes
+        .map((f, i) => `${i + 1}. ${f.what}${f.where ? ` — ${f.where}` : ""}`)
+        .join(
+          "\n",
+        )}\n\nStart with the first one and walk me through it by asking me questions. Don't write any of it for me — I need to do the writing myself.`,
+    );
+  }
+
+  return (
+    <div style={styles.card}>
+      <div style={styles.cardHead}>
+        <span style={styles.cardClass}>📝 Check before I hand it in</span>
+      </div>
+      <p style={styles.prioBlurb}>
+        Paste the assignment and your draft. I'll grade it the way your teacher
+        would and tell you what to fix — you still do the writing.
+      </p>
+
+      <label style={styles.classSurveyLabel}>
+        Assignment instructions or rubric{" "}
+        <span style={{ color: "var(--muted)", fontWeight: 400 }}>
+          (optional — but the marking is much sharper with it)
+        </span>
+        <textarea
+          style={{ ...styles.fypTextarea, minHeight: 70, marginTop: 6 }}
+          value={instructions}
+          placeholder="Paste what the teacher asked for, and the rubric if you have one…"
+          onChange={(e) => setInstructions(e.target.value)}
+        />
+      </label>
+
+      <label style={{ ...styles.classSurveyLabel, marginTop: 10 }}>
+        Your draft
+        <textarea
+          style={{ ...styles.fypTextarea, minHeight: 130, marginTop: 6 }}
+          value={draft}
+          placeholder="Paste your draft here…"
+          onChange={(e) => setDraft(e.target.value)}
+        />
+      </label>
+
+      <div style={styles.assignMetaRow}>
+        <input
+          style={styles.assignSelect}
+          list="review-subjects"
+          value={subject}
+          placeholder="Subject (optional)"
+          onChange={(e) => setSubject(e.target.value)}
+        />
+        <datalist id="review-subjects">
+          {subjects.map((s) => (
+            <option key={s} value={s} />
+          ))}
+        </datalist>
+        <input
+          style={styles.assignSelect}
+          value={level}
+          placeholder="Grade level (e.g. 10th grade)"
+          onChange={(e) => setLevel(e.target.value)}
+        />
+      </div>
+
+      <label style={styles.classSurveyLabel}>
+        Or upload it{" "}
+        <span style={{ color: "var(--muted)", fontWeight: 400 }}>
+          (PDF, photo, or text)
+        </span>
+        <input
+          type="file"
+          accept=".pdf,.txt,.md,image/*,application/pdf"
+          style={styles.fypFileInput}
+          onChange={(e) => onFile(e.target.files)}
+        />
+      </label>
+      {doc && (
+        <div style={styles.fypDocList}>
+          <span style={styles.fypDocChip}>
+            📄 {doc.name}
+            <button
+              style={styles.fypDocRemove}
+              onClick={() => setDoc(null)}
+              aria-label="Remove file"
+            >
+              ×
+            </button>
+          </span>
+        </div>
+      )}
+
+      <button
+        style={{
+          ...styles.studyToolBtn,
+          width: "100%",
+          marginTop: 12,
+          ...(canSubmit ? {} : styles.prioBtnOff),
+        }}
+        onClick={grade}
+        disabled={!canSubmit}
+      >
+        {loading
+          ? "Marking…"
+          : graded.current
+            ? "↻ Re-check my revision"
+            : "📝 Grade my draft"}
+      </button>
+
+      {err && <p style={styles.prioErr}>{err}</p>}
+      {askFor && <p style={styles.revAskFor}>🙋 {askFor}</p>}
+
+      {review && (
+        <div style={{ marginTop: 14 }}>
+          <div style={styles.revGradeRow}>
+            {/* "A-" and "17/20" both land here — shrink so a score still fits. */}
+            <span
+              style={{
+                ...styles.revGrade,
+                ...(review.grade.length > 3 ? { fontSize: 22 } : {}),
+              }}
+            >
+              {review.grade || "—"}
+            </span>
+            <div style={{ flex: 1 }}>
+              <div style={styles.revGradeLabel}>Estimated grade</div>
+              {review.gradeWhy && (
+                <div style={styles.revGradeWhy}>{review.gradeWhy}</div>
+              )}
+            </div>
+          </div>
+
+          {review.delta &&
+            (() => {
+              const d = review.delta;
+              // Requirements met is countable and doesn't drift between passes,
+              // so when it disagrees with the re-estimated letter, it leads.
+              const gained =
+                d.metNow != null && d.metBefore != null
+                  ? d.metNow - d.metBefore
+                  : 0;
+              // On a point rubric the letter ladder is too coarse to see by —
+              // 4/20 and 10/20 are both an F — so points lead when we have them.
+              const pts =
+                d.pointsNow != null && d.pointsBefore != null
+                  ? d.pointsNow - d.pointsBefore
+                  : null;
+              const moved = pts ?? d.steps;
+              const up = moved > 0 || gained > 0;
+              const down = !up && (moved < 0 || gained < 0);
+              return (
+                <div
+                  style={{
+                    ...styles.revDelta,
+                    ...(up
+                      ? styles.revDeltaUp
+                      : down
+                        ? styles.revDeltaDown
+                        : styles.revDeltaFlat),
+                  }}
+                >
+                  {pts != null
+                    ? pts > 0
+                      ? `▲ Up ${pts} ${pts === 1 ? "point" : "points"} from ${d.from} — the revision worked.`
+                      : pts < 0
+                        ? `▼ Down ${Math.abs(pts)} from ${d.from} — check what you cut.`
+                        : `→ Still ${d.from}.`
+                    : d.steps > 0
+                      ? `▲ Up ${d.steps} from ${d.from} — the revision worked.`
+                      : d.steps < 0
+                        ? `▼ Down ${Math.abs(d.steps)} from ${d.from}${
+                            gained > 0
+                              ? " on the letter"
+                              : " — check what you cut."
+                          }`
+                        : `→ Still at ${d.from} on the letter.`}
+                  {d.total != null && (
+                    <div style={styles.revDeltaReqs}>
+                      {gained > 0
+                        ? `✅ ${d.metBefore} → ${d.metNow} of ${d.total} requirements fully met. That's real progress — keep going.`
+                        : gained < 0
+                          ? `✅ ${d.metBefore} → ${d.metNow} of ${d.total} requirements fully met — something that was passing no longer is.`
+                          : `✅ Still ${d.metNow} of ${d.total} requirements fully met. The fixes below are the ones that move it.`}
+                    </div>
+                  )}
+                </div>
+              );
+            })()}
+
+          {review.rubric.length > 0 && (
+            <div style={styles.revSection}>
+              <button
+                style={styles.linkBtn}
+                onClick={() => setShowRubric((s) => !s)}
+              >
+                {showRubric
+                  ? "Hide the rubric check"
+                  : `Rubric check (${review.rubric.length})`}
+              </button>
+              {showRubric &&
+                review.rubric.map((r, i) => {
+                  const v = VERDICT[r.verdict];
+                  return (
+                    <div key={i} style={styles.revRubricRow}>
+                      <span style={styles.revVerdict}>{v.icon}</span>
+                      <div style={{ flex: 1 }}>
+                        <div style={{ ...styles.revReq, ...v.style }}>
+                          {r.requirement}
+                        </div>
+                        {r.note && <div style={styles.revNote}>{r.note}</div>}
+                      </div>
+                      {r.outOf != null && (
+                        <span style={styles.revPoints}>
+                          {r.points}/{r.outOf}
+                        </span>
+                      )}
+                    </div>
+                  );
+                })}
+            </div>
+          )}
+
+          {review.fixes.length > 0 && (
+            <div style={styles.revSection}>
+              <div style={styles.revSectionHead}>
+                🎯 Top {review.fixes.length === 1 ? "fix" : `${review.fixes.length} fixes`}
+                <span style={styles.revSectionHint}> — biggest impact first</span>
+              </div>
+              {review.fixes.map((f, i) => (
+                <div key={i} style={styles.revFix}>
+                  <span style={styles.revFixNum}>{i + 1}</span>
+                  <div style={{ flex: 1 }}>
+                    {f.where && <div style={styles.revFixWhere}>{f.where}</div>}
+                    <div style={styles.revFixWhat}>{f.what}</div>
+                    {f.why && <div style={styles.revFixWhy}>{f.why}</div>}
+                  </div>
+                </div>
+              ))}
+            </div>
+          )}
+
+          {review.strengths.length > 0 && (
+            <div style={styles.revSection}>
+              <div style={styles.revSectionHead}>💚 What's working — keep it</div>
+              {review.strengths.map((s, i) => (
+                <div key={i} style={styles.revStrength}>
+                  {s}
+                </div>
+              ))}
+            </div>
+          )}
+
+          {review.note && <p style={styles.prioNote}>{review.note}</p>}
+
+          {onAsk && review.fixes.length > 0 && (
+            <button style={styles.linkBtn} onClick={talkItThrough}>
+              Talk me through fix #1 →
+            </button>
+          )}
+          <div style={styles.prioApplyHint}>
+            Revise your draft above, then hit re-check to see the grade move.
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+// The help desk — three doors into "help me right now": homework help (guided,
+// hints not answers), test prep (a plan across the days actually left), and
+// learning a topic from zero. All three hit /api/help and come back as the same
+// shape: ordered steps you can do, with a hint hidden behind each one.
+function HelpDesk({
+  subjects,
+  profile,
+  onMissed,
+  onMistake,
+  onAsk,
+}: {
+  subjects: string[];
+  profile: LearnerProfile | null;
+  onMissed: (topic: string) => void;
+  onMistake?: (m: { concept: string; why?: string; fix?: string }) => void;
+  onAsk?: (message: string) => void;
+}) {
+  const [mode, setMode] = useState<HelpMode>("homework");
+  const [ask, setAsk] = useState("");
+  const [subject, setSubject] = useState("");
+  const [testDate, setTestDate] = useState("");
+  const [doc, setDoc] = useState<{
+    base64: string;
+    mediaType: string;
+    name: string;
+  } | null>(null);
+  const [loading, setLoading] = useState(false);
+  const [help, setHelp] = useState<HelpAnswer | null>(null);
+  const [err, setErr] = useState("");
+  // Hints stay hidden until asked for — the point of homework help is that the
+  // learner does the work, so the concrete nudge is one deliberate tap away.
+  const [openHints, setOpenHints] = useState<number[]>([]);
+
+  const meta = HELP_MODES.find((m) => m.id === mode) ?? HELP_MODES[0];
+  const canSubmit = (ask.trim().length >= 4 || !!doc) && !loading;
+
+  function pickMode(next: HelpMode) {
+    if (next === mode) return;
+    setMode(next);
+    // The old answer belongs to the old door.
+    setHelp(null);
+    setErr("");
+    setOpenHints([]);
+  }
+
+  function onFile(files: FileList | null) {
+    const file = files?.[0];
+    if (!file) return;
+    const r = new FileReader();
+    r.onload = () => {
+      const s = String(r.result);
+      setDoc({
+        base64: s.slice(s.indexOf(",") + 1),
+        mediaType: file.type || "text/plain",
+        name: file.name,
+      });
+    };
+    r.readAsDataURL(file);
+  }
+
+  async function getHelp() {
+    if (!canSubmit) return;
+    setLoading(true);
+    setErr("");
+    setHelp(null);
+    setOpenHints([]);
+    try {
+      const res = await fetch("/api/help", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          mode,
+          ask: ask.trim(),
+          subject: subject.trim() || undefined,
+          dueDate: mode === "test" && testDate ? testDate : undefined,
+          today: localISO(),
+          fileBase64: doc?.base64,
+          fileMediaType: doc?.mediaType,
+          fileName: doc?.name,
+          profile: profile ?? undefined,
+        }),
+      });
+      const data = (await res.json()) as { help?: HelpAnswer; error?: string };
+      if (data.help) setHelp(data.help);
+      else setErr(data.error || "Couldn't put that together — try again.");
+    } catch {
+      setErr("Couldn't reach the server. Please try again.");
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  // Hand the whole thing to chat when steps alone aren't enough.
+  function talkItThrough() {
+    if (!help || !onAsk) return;
+    const what =
+      mode === "homework"
+        ? `I'm working on this and I'm still stuck: ${ask.trim() || help.title}`
+        : mode === "test"
+          ? `I'm studying for this test: ${ask.trim() || help.title}${
+              // Natural phrasing — Eliora shouldn't recite YYYY-MM-DD back at
+              // the learner, and she echoes whatever wording she's handed.
+              testDate
+                ? ` (it's on ${formatDate(testDate)}, ${countdown(
+                    testDate,
+                  ).toLowerCase()})`
+                : ""
+            }`
+          : `I'm trying to understand: ${ask.trim() || help.title}`;
+    onAsk(
+      `${what}\n\nYou already gave me these steps:\n${help.steps
+        .map((s, i) => `${i + 1}. ${s.title}`)
+        .join(
+          "\n",
+        )}\n\nWalk me through it one step at a time — start with the first thing I should do, and ask me a question instead of telling me the answer.`,
+    );
+  }
+
+  return (
+    <div style={styles.card}>
+      <div style={styles.cardHead}>
+        <span style={styles.cardClass}>🆘 Get help now</span>
+      </div>
+      <div style={{ ...styles.horizonRow, marginTop: 4 }}>
+        {HELP_MODES.map((m) => (
+          <button
+            key={m.id}
+            style={{
+              ...styles.horizonBtn,
+              ...(mode === m.id ? styles.horizonBtnActive : {}),
+            }}
+            onClick={() => pickMode(m.id)}
+          >
+            <span>
+              {m.emoji} {m.label}
+            </span>
+          </button>
+        ))}
+      </div>
+      <span style={styles.horizonDesc}>{meta.blurb}</span>
+      <textarea
+        style={{ ...styles.fypTextarea, marginTop: 8 }}
+        value={ask}
+        placeholder={meta.placeholder}
+        onChange={(e) => setAsk(e.target.value)}
+      />
+      <div style={styles.assignMetaRow}>
+        <input
+          style={styles.assignSelect}
+          list="help-subjects"
+          value={subject}
+          placeholder="Subject (optional)"
+          onChange={(e) => setSubject(e.target.value)}
+        />
+        <datalist id="help-subjects">
+          {subjects.map((s) => (
+            <option key={s} value={s} />
+          ))}
+        </datalist>
+        {mode === "test" && (
+          <input
+            style={styles.assignSelect}
+            type="date"
+            value={testDate}
+            title="When is the test?"
+            onChange={(e) => setTestDate(e.target.value)}
+          />
+        )}
+      </div>
+      <label style={styles.classSurveyLabel}>
+        Or upload it{" "}
+        <span style={{ color: "var(--muted)", fontWeight: 400 }}>
+          (photo of the worksheet, PDF, or text)
+        </span>
+        <input
+          type="file"
+          accept=".pdf,.txt,.md,image/*,application/pdf"
+          style={styles.fypFileInput}
+          onChange={(e) => onFile(e.target.files)}
+        />
+      </label>
+      {doc && (
+        <div style={styles.fypDocList}>
+          <span style={styles.fypDocChip}>
+            📄 {doc.name}
+            <button
+              style={styles.fypDocRemove}
+              onClick={() => setDoc(null)}
+              aria-label="Remove file"
+            >
+              ×
+            </button>
+          </span>
+        </div>
+      )}
+      <button
+        style={{
+          ...styles.studyToolBtn,
+          width: "100%",
+          marginTop: 12,
+          ...(canSubmit ? {} : { opacity: 0.5, cursor: "default" }),
+        }}
+        disabled={!canSubmit}
+        onClick={getHelp}
+      >
+        {loading
+          ? mode === "test"
+            ? "Building your plan…"
+            : "Working it out…"
+          : `${meta.emoji} ${
+              mode === "homework"
+                ? "Help me with this"
+                : mode === "test"
+                  ? "Build my test plan"
+                  : "Teach me this"
+            }`}
+      </button>
+      {err && (
+        <p style={{ color: "#c0392b", fontSize: 13, marginTop: 8 }}>{err}</p>
+      )}
+      {help && (
+        <div style={styles.afbResult}>
+          <div style={styles.helpTitle}>{help.title}</div>
+          {help.summary && <p style={styles.afbOverall}>{help.summary}</p>}
+          {help.steps.map((s, i) => {
+            const open = openHints.includes(i);
+            return (
+              <div key={i} style={styles.helpStep}>
+                <div style={styles.helpStepHead}>
+                  <span style={styles.helpStepNum}>{i + 1}</span>
+                  <span style={styles.helpStepTitle}>{s.title}</span>
+                </div>
+                <div style={styles.helpStepBody}>
+                  {renderMarkdown(s.detail, "var(--accent)")}
+                </div>
+                {s.hint &&
+                  (open ? (
+                    <div style={styles.helpHint}>💡 {s.hint}</div>
+                  ) : (
+                    <button
+                      style={styles.helpHintBtn}
+                      onClick={() => setOpenHints((p) => [...p, i])}
+                    >
+                      💡 Show hint
+                    </button>
+                  ))}
+              </div>
+            );
+          })}
+          {help.keyPoints && help.keyPoints.length > 0 && (
+            <>
+              <div style={styles.afbSecHead}>📌 Worth remembering</div>
+              {help.keyPoints.map((k, i) => (
+                <div key={i} style={styles.afbLi}>
+                  • {k}
+                </div>
+              ))}
+            </>
+          )}
+          {help.example && (
+            <>
+              <div style={styles.afbSecHead}>🧩 {help.example.title}</div>
+              <div style={styles.helpExample}>
+                {renderMarkdown(help.example.body, "var(--accent)")}
+              </div>
+            </>
+          )}
+          {help.checks && help.checks.length > 0 && (
+            <>
+              <div style={styles.afbSecHead}>✅ Quick check</div>
+              <QuizView
+                quiz={help.checks}
+                onMissed={onMissed}
+                onMistake={onMistake}
+              />
+            </>
+          )}
+          {help.nextStep && (
+            <div style={styles.afbNext}>🎯 Start here: {help.nextStep}</div>
+          )}
+          {help.note && <p style={styles.helpNote}>{help.note}</p>}
+          {onAsk && (
+            <button style={styles.helpTalkBtn} onClick={talkItThrough}>
+              💬 Talk it through with Eliora
+            </button>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
+// A small 🔊 for a single phrase — the full SpeakButton is a whole-message
+// control, and a phrase list needs one per row without eating the layout.
+function SayBtn({
+  text,
+  label,
+  voice,
+}: {
+  text: string;
+  label?: string;
+  voice?: SpeechVoice;
+}) {
+  const [state, setState] = useState<"loading" | "playing" | "idle">("idle");
+  return (
+    <button
+      style={styles.langSay}
+      onClick={() => void speak(text, setState, voice)}
+      aria-label={label ?? `Hear "${text}"`}
+      title={label ?? "Hear it"}
+    >
+      {state === "loading" ? "⏳" : state === "playing" ? "⏹" : "🔊"}
+    </button>
+  );
+}
+
+// What the tutor fixed, and why. Shown under your own line so the correction
+// sits next to the thing it corrects.
+function Corrections({
+  items,
+  voice,
+}: {
+  items: TutorCorrection[];
+  voice?: SpeechVoice;
+}) {
+  if (!items.length) return null;
+  return (
+    <div style={styles.langFixes}>
+      {items.map((c, i) => (
+        <div key={i} style={styles.langFix}>
+          <div style={styles.langFixLine}>
+            <span style={styles.langFixWrong}>{c.yours}</span>
+            <span style={styles.langFixArrow}>→</span>
+            <span style={styles.langFixRight}>{c.better}</span>
+            <SayBtn text={c.better} />
+          </div>
+          {c.why && <div style={styles.langFixWhy}>{c.why}</div>}
+        </div>
+      ))}
+    </div>
+  );
+}
+
+function PhraseList({
+  items,
+  voice,
+}: {
+  items: TutorPhrase[];
+  voice?: SpeechVoice;
+}) {
+  if (!items.length) return null;
+  return (
+    <div style={styles.langPhrases}>
+      {items.map((p, i) => (
+        <div key={i} style={styles.langPhrase}>
+          <div style={styles.langPhraseHead}>
+            <span style={styles.langPhraseTarget}>{p.target}</span>
+            <SayBtn text={p.target} voice={voice} />
+          </div>
+          <div style={styles.langPhraseEn}>{p.english}</div>
+          {p.say && <div style={styles.langPhraseSay}>🗣️ {p.say}</div>}
+          {p.when && <div style={styles.langPhraseWhen}>{p.when}</div>}
+        </div>
+      ))}
+    </div>
+  );
+}
+
+// One exchange in the conversation: what you said, what she fixed, what she
+// said back. Kept as its own block so the thread reads top-to-bottom. `you` is
+// empty on the turns she takes unprompted — the opening and the wrap-up.
+type TutorExchange = { you: string; answer: TutorReply };
+
+// The plan she set at the top of the session, with the beat she's on marked.
+// A human tutor writes this on the corner of the page so you both know where
+// you are and how much is left — the point is that it's visible, not that it's
+// clickable.
+function SessionBoard({
+  plan,
+  onBeat,
+  done,
+}: {
+  plan: SessionBeat[];
+  onBeat: number;
+  done: boolean;
+}) {
+  if (!plan.length) return null;
+  return (
+    <div style={styles.sesBoard}>
+      {plan.map((b, i) => {
+        const finished = done || i < onBeat;
+        const current = !done && i === onBeat;
+        return (
+          <div
+            key={i}
+            style={{
+              ...styles.sesBeat,
+              ...(current ? styles.sesBeatOn : null),
+              ...(finished ? styles.sesBeatDone : null),
+            }}
+          >
+            <span style={styles.sesBeatMark}>
+              {finished ? "✓" : current ? "▶" : "○"}
+            </span>
+            <span style={styles.sesBeatBody}>
+              <span style={styles.sesBeatTitle}>
+                {b.title}
+                {b.minutes ? (
+                  <span style={styles.sesBeatMins}> · {b.minutes} min</span>
+                ) : null}
+              </span>
+              {b.goal && <span style={styles.sesBeatGoal}>{b.goal}</span>}
+            </span>
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
+// How long you've been sitting with her. Ticks once a minute — a second-by-
+// second clock in the corner is exactly the kind of thing that pulls an ADHD
+// learner out of the work.
+function useSessionMinutes(
+  startedAt: number | null,
+  endedAt: number | null,
+): number {
+  const [minutes, setMinutes] = useState(0);
+  useEffect(() => {
+    if (!startedAt) {
+      setMinutes(0);
+      return;
+    }
+    // Once she's wrapped, the clock stops where it stopped — the recap says how
+    // long the session ran, not how long ago it was.
+    if (endedAt) {
+      setMinutes(Math.max(Math.round((endedAt - startedAt) / 60000), 0));
+      return;
+    }
+    const tick = () => setMinutes(Math.floor((Date.now() - startedAt) / 60000));
+    tick();
+    const id = setInterval(tick, 30000);
+    return () => clearInterval(id);
+  }, [startedAt, endedAt]);
+  return minutes;
+}
+
+// Where the session got to. This is the bit they take out of the room, so it
+// lands last and reads as a page of notes rather than another chat bubble.
+function SessionRecapCard({
+  recap,
+  tutorName,
+}: {
+  recap: SessionRecap;
+  tutorName: string;
+}) {
+  const section = (emoji: string, head: string, items: string[]) =>
+    items.length ? (
+      <>
+        <div style={styles.afbSecHead}>
+          {emoji} {head}
+        </div>
+        <ul style={styles.sesRecapList}>
+          {items.map((s, i) => (
+            <li key={i} style={styles.sesRecapItem}>
+              {s}
+            </li>
+          ))}
+        </ul>
+      </>
+    ) : null;
+  return (
+    <div style={styles.sesRecap}>
+      <div style={styles.sesRecapHead}>📋 Session notes</div>
+      {section("🧭", "What we covered", recap.covered)}
+      {section("✅", "What you've got now", recap.landed)}
+      {section("🎯", "Before next time", recap.practise)}
+      {recap.nextTime && (
+        <div style={styles.afbNext}>
+          ⏭️ Next session, {tutorName} opens with: {recap.nextTime}
+        </div>
+      )}
+    </div>
+  );
+}
+
+// The AI tutor — a session with whichever tutor you picked, on whatever you're
+// working on. Three doors, and the first one is an actual tutoring session: you
+// say how long you've got, she opens (greeting, a plan for those minutes, and
+// the one question that finds out where you are), you work through the plan a
+// turn at a time with the clock and the board on screen, and she wraps it up
+// with what landed and what to practise. The other two are one-shot: phrases
+// (the terms or lines a real topic/situation needs) and check (you produced
+// something, she marks it and shows what changed).
+//
+// Two tracks share those doors. On a subject she talks in English and the
+// "phrases" are key terms and formulas; on a language she replies IN the
+// language, and every line of it is one tap from being read aloud by /api/tts,
+// because a language you can't hear isn't a language you can speak. Typing a
+// known language flips the track on its own, so the toggle is a correction
+// rather than a step.
+// Her reply, read aloud, with the English underneath on the language track.
+function TargetLine({
+  answer: a,
+  mode,
+  voice,
+}: {
+  answer: TutorReply;
+  mode: TutorMode;
+  voice: SpeechVoice;
+}) {
+  if (!a.reply) return null;
+  return (
+    <div style={styles.langReply}>
+      <div style={styles.langReplyHead}>
+        <span style={styles.langReplyText}>{a.reply}</span>
+        {mode === "converse" && (
+          <SayBtn text={a.reply} label="Hear her reply" voice={voice} />
+        )}
+      </div>
+      {a.replySay && <div style={styles.langPhraseSay}>🗣️ {a.replySay}</div>}
+      {a.replyEnglish && (
+        <div style={styles.langReplyEn}>{a.replyEnglish}</div>
+      )}
+    </div>
+  );
+}
+
+function Extras({
+  answer: a,
+  isLang,
+  voice,
+  onMissed,
+  onMistake,
+}: {
+  answer: TutorReply;
+  isLang: boolean;
+  voice: SpeechVoice;
+  onMissed: (topic: string) => void;
+  onMistake?: (m: { concept: string; why?: string; fix?: string }) => void;
+}) {
+  return (
+    <>
+      {a.tip && <div style={styles.langTip}>💡 {a.tip}</div>}
+      {a.phrases.length > 0 && (
+        <>
+          <div style={styles.afbSecHead}>
+            🗂️ {isLang ? "Words worth keeping" : "Terms worth keeping"}
+          </div>
+          <PhraseList items={a.phrases} voice={voice} />
+        </>
+      )}
+      {a.checks && a.checks.length > 0 && (
+        <>
+          <div style={styles.afbSecHead}>✅ Quick check</div>
+          <QuizView
+            quiz={a.checks}
+            onMissed={onMissed}
+            onMistake={onMistake}
+          />
+        </>
+      )}
+      {a.followUp && (
+        <div style={styles.afbNext}>
+          🎯 {isLang ? "Try saying" : "Try this next"}: {a.followUp}
+        </div>
+      )}
+      {a.note && <p style={styles.helpNote}>{a.note}</p>}
+    </>
+  );
+}
+
+function AiTutor({
+  profile,
+  tutorId,
+  onMissed,
+  onMistake,
+  onAsk,
+}: {
+  profile: LearnerProfile | null;
+  tutorId: string;
+  onMissed: (topic: string) => void;
+  onMistake?: (m: { concept: string; why?: string; fix?: string }) => void;
+  onAsk?: (message: string) => void;
+}) {
+  const [mode, setMode] = useState<TutorMode>("converse");
+  const [track, setTrack] = useState<TutorTrack>("subject");
+  const [subject, setSubject] = useState("");
+  const [level, setLevel] = useState<TutorLevel>("beginner");
+  const [text, setText] = useState("");
+  const [loading, setLoading] = useState(false);
+  const [err, setErr] = useState("");
+  // Converse keeps a thread; the other two modes show one answer at a time.
+  const [thread, setThread] = useState<TutorExchange[]>([]);
+  const [answer, setAnswer] = useState<TutorReply | null>(null);
+  // The session itself: how long they've got, what she's planned for it, which
+  // beat she's on, and — once it's over — where they got to.
+  const [planMinutes, setPlanMinutes] = useState(TUTOR_SESSION_DEFAULT_MINUTES);
+  const [goal, setGoal] = useState("");
+  const [plan, setPlan] = useState<SessionBeat[]>([]);
+  const [onBeat, setOnBeat] = useState(0);
+  const [startedAt, setStartedAt] = useState<number | null>(null);
+  const [endedAt, setEndedAt] = useState<number | null>(null);
+  const [recap, setRecap] = useState<SessionRecap | null>(null);
+  // The line you just said, held on screen while she thinks. In a session your
+  // turn has already happened — waiting for her shouldn't look like nothing did.
+  const [pending, setPending] = useState("");
+
+  const isLang = track === "language";
+  const modes = TUTOR_MODES[track];
+  const meta = modes.find((m) => m.id === mode) ?? modes[0];
+  const persona = tutorById(tutorId);
+  // How everything in this panel should sound: the tutor's own voice and
+  // manner, and — on the language track — the language the words are actually
+  // in, so a Spanish line isn't read to them in an American accent.
+  const spokenLang = isLang ? speechLangTag(subject) : undefined;
+  const voice: SpeechVoice = useMemo(
+    () => ({
+      voice: persona.voice,
+      pace: persona.pace,
+      browser: persona.browserVoice,
+      lang: spokenLang,
+      instructions: tutorVoiceDirection(
+        persona.id,
+        isLang ? subject.trim() : undefined,
+      ),
+    }),
+    [persona, spokenLang, isLang, subject],
+  );
+  const live = mode === "converse" && !!startedAt && !endedAt;
+  const minutes = useSessionMinutes(startedAt, endedAt);
+  const overtime = live && minutes >= planMinutes;
+  const canSubmit =
+    !!subject.trim() &&
+    text.trim().length >= 2 &&
+    !loading &&
+    (mode !== "converse" || live);
+
+  function reset() {
+    setThread([]);
+    setAnswer(null);
+    setErr("");
+    setPlan([]);
+    setOnBeat(0);
+    setStartedAt(null);
+    setEndedAt(null);
+    setRecap(null);
+    setPending("");
+  }
+
+  function pickMode(next: TutorMode) {
+    if (next === mode) return;
+    setMode(next);
+    setText("");
+    reset();
+  }
+
+  // Switching tracks changes what the box is even asking for, so the subject
+  // and anything said under the old one go with it.
+  function pickTrack(next: TutorTrack) {
+    if (next === track) return;
+    setTrack(next);
+    setSubject("");
+    setText("");
+    reset();
+  }
+
+  // One request for every turn she takes. `phase` is what changes: on "open"
+  // and "wrap" there's nothing typed, because those are the turns she takes on
+  // her own — sitting down with you, and closing the book.
+  async function turn(phase: TutorPhase, said: string) {
+    setLoading(true);
+    setErr("");
+    if (mode !== "converse") setAnswer(null);
+    try {
+      // Only the session carries history — the other modes are one-shot. Her
+      // own opening line is in there too, so the session reads as continuous.
+      // A fresh session starts empty even if the last one is still on screen:
+      // the reset that clears it hasn't landed in this closure yet.
+      const fresh = phase === "open";
+      const history: TutorTurn[] =
+        mode === "converse" && !fresh
+          ? thread.flatMap((x) =>
+              x.you
+                ? [
+                    { role: "learner" as const, text: x.you },
+                    { role: "tutor" as const, text: x.answer.reply },
+                  ]
+                : [{ role: "tutor" as const, text: x.answer.reply }],
+            )
+          : [];
+      const res = await fetch("/api/tutor", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          mode,
+          track,
+          subject: subject.trim(),
+          level,
+          text: said,
+          history: history.length ? history : undefined,
+          profile: profile ?? undefined,
+          tutor: tutorId,
+          phase,
+          plan: fresh || !plan.length ? undefined : plan,
+          onBeat: fresh ? 0 : onBeat,
+          minutes: fresh ? 0 : minutes,
+          planMinutes,
+          goal: goal.trim() || undefined,
+        }),
+      });
+      const data = (await res.json()) as {
+        answer?: TutorReply;
+        error?: string;
+      };
+      if (!data.answer) {
+        setErr(data.error || "Couldn't put that together — try again.");
+        setText(said); // hand their line back rather than swallowing it
+        return;
+      }
+      const a = data.answer;
+      if (mode === "converse") {
+        setThread((prev) => [...prev, { you: said, answer: a }]);
+        // Every correction is a real mistake worth revisiting later.
+        for (const c of a.corrections) {
+          onMistake?.({ concept: c.yours, why: c.why, fix: c.better });
+        }
+        if (phase === "open") {
+          setPlan(a.plan ?? []);
+          setOnBeat(0);
+          setStartedAt(Date.now());
+        } else if (phase === "wrap") {
+          setEndedAt(Date.now());
+          if (a.recap) setRecap(a.recap);
+        } else if (typeof a.onBeat === "number") {
+          setOnBeat(a.onBeat);
+        }
+      } else {
+        setAnswer(a);
+      }
+    } catch {
+      setErr("Couldn't reach the server. Please try again.");
+      if (said) setText(said);
+    } finally {
+      setLoading(false);
+      setPending("");
+    }
+  }
+
+  function ask() {
+    if (!canSubmit) return;
+    const said = text.trim();
+    // The box empties the moment you send, the way it would if you'd said it.
+    if (mode === "converse") {
+      setPending(said);
+      setText("");
+    }
+    void turn("work", said);
+  }
+
+  // She goes first. Nobody sits down to a tutor and gets a blank page.
+  async function startSession() {
+    if (!subject.trim() || loading) return;
+    reset();
+    await turn("open", "");
+  }
+
+  async function wrapUp() {
+    if (!live || loading) return;
+    await turn("wrap", "");
+  }
+
+  return (
+    <div style={styles.card}>
+      <div style={styles.cardHead}>
+        <span style={styles.cardClass}>🧑‍🏫 AI tutor</span>
+        <span style={{ color: "var(--muted)", fontSize: 13 }}>
+          {persona.emoji} {persona.name}
+        </span>
+      </div>
+      {/* Subject or language — this decides what every control below means. */}
+      <div style={styles.horizonRow}>
+        {(
+          [
+            ["subject", "📚", "A subject"],
+            ["language", "🗣️", "A language"],
+          ] as const
+        ).map(([id, emoji, label]) => (
+          <button
+            key={id}
+            style={{
+              ...styles.horizonBtn,
+              ...(track === id ? styles.horizonBtnActive : {}),
+            }}
+            onClick={() => pickTrack(id)}
+          >
+            <span>
+              {emoji} {label}
+            </span>
+          </button>
+        ))}
+      </div>
+      <div style={{ ...styles.assignMetaRow, marginTop: 8 }}>
+        <input
+          style={styles.assignSelect}
+          list="tutor-subject-choices"
+          value={subject}
+          placeholder={isLang ? "Which language?" : "Which subject?"}
+          onChange={(e) => {
+            const next = e.target.value;
+            setSubject(next);
+            // Typing "French" into the subject box means the language track —
+            // flip it for them rather than answering in the wrong shape.
+            if (!isLang && isLanguageSubject(next)) setTrack("language");
+            // A thread about Spanish means nothing once you switch to French.
+            reset();
+          }}
+        />
+        <datalist id="tutor-subject-choices">
+          {(isLang ? LANGUAGE_CHOICES : TUTOR_SUBJECTS).map((s) => (
+            <option key={s} value={s} />
+          ))}
+        </datalist>
+        <select
+          style={styles.assignSelect}
+          value={level}
+          title={TUTOR_LEVELS[track].find((l) => l.id === level)?.blurb}
+          onChange={(e) => setLevel(e.target.value as TutorLevel)}
+        >
+          {TUTOR_LEVELS[track].map((l) => (
+            <option key={l.id} value={l.id}>
+              {l.label}
+            </option>
+          ))}
+        </select>
+      </div>
+      <div style={{ ...styles.horizonRow, marginTop: 8 }}>
+        {modes.map((m) => (
+          <button
+            key={m.id}
+            style={{
+              ...styles.horizonBtn,
+              ...(mode === m.id ? styles.horizonBtnActive : {}),
+            }}
+            onClick={() => pickMode(m.id)}
+          >
+            <span>
+              {m.emoji} {m.label}
+            </span>
+          </button>
+        ))}
+      </div>
+      <span style={styles.horizonDesc}>{meta.blurb}</span>
+
+      {/* Before the session: how long you've got and what you want out of it.
+          Two questions a tutor asks at the door — then she takes it from there. */}
+      {mode === "converse" && !startedAt && (
+        <div style={styles.sesStart}>
+          <div style={styles.sesStartHead}>
+            {persona.emoji} A session with {persona.name}
+          </div>
+          <p style={styles.sesStartBlurb}>
+            She opens, sets a plan for the time you&apos;ve got, and works
+            through it with you one question at a time — then wraps up with what
+            to practise.
+          </p>
+          <div style={{ ...styles.assignMetaRow, marginTop: 10 }}>
+            <select
+              style={styles.assignSelect}
+              value={planMinutes}
+              onChange={(e) => setPlanMinutes(Number(e.target.value))}
+            >
+              {TUTOR_SESSION_LENGTHS.map((m) => (
+                <option key={m} value={m}>
+                  {m} minutes
+                </option>
+              ))}
+            </select>
+            <input
+              style={styles.assignSelect}
+              value={goal}
+              placeholder="Anything specific today? (optional)"
+              onChange={(e) => setGoal(e.target.value)}
+            />
+          </div>
+          <button
+            style={{
+              ...styles.studyToolBtn,
+              width: "100%",
+              marginTop: 10,
+              ...(subject.trim() && !loading
+                ? {}
+                : { opacity: 0.5, cursor: "default" }),
+            }}
+            disabled={!subject.trim() || loading}
+            onClick={startSession}
+          >
+            {loading
+              ? `${persona.name} is getting started…`
+              : !subject.trim()
+                ? isLang
+                  ? "Pick a language first"
+                  : "Pick a subject first"
+                : `▶️ Start the session`}
+          </button>
+        </div>
+      )}
+
+      {/* The session in progress: who you're with, how long you've been at it,
+          and the plan she set — the corner of the page you both keep glancing at. */}
+      {mode === "converse" && startedAt && (
+        <div style={styles.sesHead}>
+          <div style={styles.sesHeadRow}>
+            <span style={styles.sesHeadWho}>
+              {persona.emoji} {subject.trim()} with {persona.name}
+            </span>
+            <span
+              style={{
+                ...styles.sesClock,
+                ...(overtime ? styles.sesClockOver : null),
+              }}
+            >
+              {endedAt
+                ? `${minutes} min · done`
+                : overtime
+                  ? `${minutes} / ${planMinutes} min · wrapping up`
+                  : `${minutes} / ${planMinutes} min`}
+            </span>
+          </div>
+          <SessionBoard plan={plan} onBeat={onBeat} done={!!endedAt} />
+        </div>
+      )}
+
+      {/* The session so far, oldest first — her turn, your turn, her fixes. */}
+      {mode === "converse" && thread.length > 0 && (
+        <div style={styles.langThread}>
+          {thread.map((x, i) => (
+            <div key={i} style={styles.langExchange}>
+              {x.you && <div style={styles.langYou}>{x.you}</div>}
+              <Corrections items={x.answer.corrections} voice={voice} />
+              <TargetLine answer={x.answer} mode={mode} voice={voice} />
+              {i === thread.length - 1 && (
+                <Extras
+                  answer={x.answer}
+                  isLang={isLang}
+                  voice={voice}
+                  onMissed={onMissed}
+                  onMistake={onMistake}
+                />
+              )}
+            </div>
+          ))}
+          {pending && (
+            <div style={styles.langExchange}>
+              <div style={styles.langYou}>{pending}</div>
+            </div>
+          )}
+          {loading && (
+            <div style={styles.sesThinking}>
+              {persona.emoji} {persona.name} is thinking…
+            </div>
+          )}
+        </div>
+      )}
+
+      {recap && <SessionRecapCard recap={recap} tutorName={persona.name} />}
+
+      {/* Your turn. Gone once she's wrapped — a finished session doesn't take
+          another line, it takes a new session. */}
+      {(mode !== "converse" || live) && (
+        <>
+          <textarea
+            style={{ ...styles.fypTextarea, marginTop: 8 }}
+            value={text}
+            placeholder={
+              mode === "converse" ? "Your turn — answer her" : meta.placeholder
+            }
+            onChange={(e) => setText(e.target.value)}
+            onKeyDown={(e) => {
+              // Enter sends in a session; the other modes are paragraphs.
+              if (mode === "converse" && e.key === "Enter" && !e.shiftKey) {
+                e.preventDefault();
+                ask();
+              }
+            }}
+          />
+          <button
+            style={{
+              ...styles.studyToolBtn,
+              width: "100%",
+              marginTop: 12,
+              ...(canSubmit ? {} : { opacity: 0.5, cursor: "default" }),
+            }}
+            disabled={!canSubmit}
+            onClick={ask}
+          >
+            {loading
+              ? "Thinking…"
+              : !subject.trim()
+                ? isLang
+                  ? "Pick a language first"
+                  : "Pick a subject first"
+                : `${meta.emoji} ${
+                    mode === "converse"
+                      ? "Say it back"
+                      : mode === "phrases"
+                        ? isLang
+                          ? "Give me the phrases"
+                          : "Give me the terms"
+                        : isLang
+                          ? "Check my writing"
+                          : "Check my work"
+                  }`}
+          </button>
+        </>
+      )}
+      {err && (
+        <p style={{ color: "#c0392b", fontSize: 13, marginTop: 8 }}>{err}</p>
+      )}
+
+      {mode === "converse" && thread.length > 0 && (
+        <div style={styles.stepsBtnRow}>
+          {live && (
+            <button
+              style={{
+                ...styles.planRebuildBtn,
+                ...(overtime ? styles.sesWrapUrgent : null),
+              }}
+              disabled={loading}
+              onClick={wrapUp}
+            >
+              🏁 {overtime ? "Time's up — wrap up" : "Wrap up the session"}
+            </button>
+          )}
+          <button style={styles.planRebuildBtn} onClick={reset}>
+            ↻ {endedAt ? "New session" : "Start over"}
+          </button>
+          {onAsk && (
+            <button
+              style={styles.goalSuggestBtn}
+              onClick={() =>
+                onAsk(
+                  `I'm ${isLang ? "practising" : "studying"} ${subject.trim()} ` +
+                    `at a ${level} level. Here's what I keep getting wrong:\n${thread
+                      .flatMap((x) => x.answer.corrections)
+                      .slice(0, 8)
+                      .map((c) => `- "${c.yours}" → "${c.better}" (${c.why})`)
+                      .join("\n")}\n\nHelp me drill the pattern behind these ` +
+                    `mistakes — quiz me on it instead of just explaining.`,
+                )
+              }
+            >
+              💬 Drill my mistakes
+            </button>
+          )}
+        </div>
+      )}
+
+      {mode !== "converse" && answer && (
+        <div style={styles.afbResult}>
+          {answer.reply && <div style={styles.helpTitle}>{answer.reply}</div>}
+          {answer.rewrite && (
+            <>
+              <div style={styles.afbSecHead}>
+                ✍️ {isLang ? "Your writing, fixed" : "Your work, corrected"}
+              </div>
+              <div style={styles.langRewrite}>
+                <div style={styles.langReplyHead}>
+                  <span style={styles.langReplyText}>{answer.rewrite}</span>
+                  <SayBtn
+                    text={answer.rewrite}
+                    label="Hear the corrected version"
+                    voice={voice}
+                  />
+                </div>
+                {answer.rewriteEnglish && (
+                  <div style={styles.langReplyEn}>{answer.rewriteEnglish}</div>
+                )}
+              </div>
+            </>
+          )}
+          {answer.corrections.length > 0 && (
+            <>
+              <div style={styles.afbSecHead}>
+                🔧 What changed ({answer.corrections.length})
+              </div>
+              <Corrections items={answer.corrections} voice={voice} />
+            </>
+          )}
+          <Extras
+            answer={answer}
+            isLang={isLang}
+            voice={voice}
+            onMissed={onMissed}
+            onMistake={onMistake}
+          />
+        </div>
+      )}
+    </div>
+  );
+}
+
+// A tutor's first session is diagnostic: you talk, you listen for what they
+// already have, and you leave with a plan for the sessions ahead. This does the
+// same from the first session's transcript — /api/lesson-plan reads it back and
+// returns what it revealed (level, strengths, gaps, pace) plus an ordered course
+// of sessions. Mirrors LessonPlan in @eliora/shared.
+type SessionRead = {
+  level: string;
+  strengths: string[];
+  gaps: string[];
+  pace: string;
+};
+type PlannedSession = {
+  number: number;
+  title: string;
+  focus: string;
+  objectives: string[];
+  activities: string[];
+  homework?: string;
+  checkpoint?: boolean;
+};
+type LessonPlan = {
+  title: string;
+  subject?: string;
+  summary: string;
+  read: SessionRead;
+  sessions: PlannedSession[];
+  nextSession: string;
+  note?: string;
+};
+
+const PLAN_LENGTHS = [4, 6, 8] as const;
+
+function LessonPlanCard({
+  session,
+  subjects,
+  profile,
+  onAdopt,
+  onAsk,
+}: {
+  // The first session with real content — null until they've actually talked.
+  session: { title: string; messages: Message[] } | null;
+  subjects: string[];
+  profile: LearnerProfile | null;
+  onAdopt: (steps: IncomingMilestone[]) => void;
+  onAsk?: (message: string) => void;
+}) {
+  const [subject, setSubject] = useState("");
+  const [goal, setGoal] = useState("");
+  const [count, setCount] = useState<number>(6);
+  const [loading, setLoading] = useState(false);
+  const [plan, setPlan] = useState<LessonPlan | null>(null);
+  const [err, setErr] = useState("");
+  const [adopted, setAdopted] = useState(false);
+  // Sessions open one at a time — six sessions of objectives and activities all
+  // expanded is the wall of text this whole app exists to avoid.
+  const [open, setOpen] = useState<number | null>(1);
+
+  const turns = session?.messages.filter((m) => m.role === "user").length ?? 0;
+  const ready = turns >= 2;
+  const canSubmit = ready && !loading;
+
+  async function buildPlan() {
+    if (!canSubmit || !session) return;
+    setLoading(true);
+    setErr("");
+    setPlan(null);
+    setAdopted(false);
+    try {
+      const res = await fetch("/api/lesson-plan", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          messages: session.messages.map((m) => ({
+            role: m.role,
+            content: m.content,
+            attachments: m.attachments?.map((a) => ({
+              kind: a.kind,
+              name: a.name,
+              mime: a.mime,
+              note: a.note,
+            })),
+          })),
+          subject: subject.trim() || undefined,
+          goal: goal.trim() || undefined,
+          sessionCount: count,
+          profile: profile ?? undefined,
+        }),
+      });
+      const data = (await res.json()) as { plan?: LessonPlan; error?: string };
+      if (data.plan) {
+        setPlan(data.plan);
+        setOpen(1);
+      } else setErr(data.error || "Couldn't build that plan — try again.");
+    } catch {
+      setErr("Couldn't reach the server. Please try again.");
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  // Each planned session becomes one milestone on the study plan, so the course
+  // lands somewhere they'll actually see it and can tick it off.
+  function adopt() {
+    if (!plan) return;
+    onAdopt(
+      plan.sessions.map((s) => ({
+        title: `Session ${s.number} · ${s.title}`,
+        detail: [s.focus, s.homework ? `Homework: ${s.homework}` : ""]
+          .filter(Boolean)
+          .join(" "),
+        checkpoint: s.checkpoint,
+      })),
+    );
+    setAdopted(true);
+  }
+
+  function startSession(s: PlannedSession) {
+    if (!onAsk) return;
+    onAsk(
+      `Let's do session ${s.number} of my lesson plan: ${s.title}.\n\nThe focus: ${
+        s.focus
+      }\nBy the end I should be able to:\n${s.objectives
+        .map((o) => `- ${o}`)
+        .join("\n")}\n\nTeach it to me one piece at a time, and check I've got it before moving on.`,
+    );
+  }
+
+  return (
+    <div style={styles.card}>
+      <div style={styles.cardHead}>
+        <span style={styles.cardClass}>🗺️ Lesson plan from our first session</span>
+      </div>
+      <p style={{ color: "var(--muted)", margin: "4px 0 10px", fontSize: 13.5 }}>
+        {ready
+          ? `I'll read back our first conversation${
+              session?.title ? ` (“${session.title}”)` : ""
+            } — what you already had, what tripped you up — and plan the sessions ahead from it.`
+          : "Once we've worked through something together, I'll read that first session back and build your plan from what it showed me."}
+      </p>
+      {ready && (
+        <>
+          <div style={styles.assignMetaRow}>
+            <input
+              style={styles.assignSelect}
+              list="lesson-plan-subjects"
+              value={subject}
+              placeholder="Subject (optional)"
+              onChange={(e) => setSubject(e.target.value)}
+            />
+            <datalist id="lesson-plan-subjects">
+              {subjects.map((s) => (
+                <option key={s} value={s} />
+              ))}
+            </datalist>
+          </div>
+          <textarea
+            style={{ ...styles.fypTextarea, marginTop: 8, minHeight: 60 }}
+            value={goal}
+            placeholder="Where do you want to get to? (optional) — e.g. “pass the unit test in three weeks”"
+            onChange={(e) => setGoal(e.target.value)}
+          />
+          <div style={{ ...styles.horizonRow, marginTop: 8 }}>
+            {PLAN_LENGTHS.map((n) => (
+              <button
+                key={n}
+                style={{
+                  ...styles.horizonBtn,
+                  ...(count === n ? styles.horizonBtnActive : {}),
+                }}
+                onClick={() => setCount(n)}
+              >
+                <span>{n} sessions</span>
+              </button>
+            ))}
+          </div>
+        </>
+      )}
+      <button
+        style={{
+          ...styles.studyToolBtn,
+          width: "100%",
+          marginTop: 12,
+          ...(canSubmit ? {} : { opacity: 0.5, cursor: "default" }),
+        }}
+        disabled={!canSubmit}
+        onClick={buildPlan}
+      >
+        {loading
+          ? "Reading our first session…"
+          : ready
+            ? "🗺️ Build my lesson plan"
+            : "💬 Talk with me first"}
+      </button>
+      {err && (
+        <p style={{ color: "#c0392b", fontSize: 13, marginTop: 8 }}>{err}</p>
+      )}
+      {plan && (
+        <div style={styles.afbResult}>
+          <div style={styles.helpTitle}>{plan.title}</div>
+          {plan.summary && <p style={styles.afbOverall}>{plan.summary}</p>}
+
+          <div style={styles.afbSecHead}>🔎 What that session showed me</div>
+          {plan.read.level && <div style={styles.helpExample}>{plan.read.level}</div>}
+          {plan.read.strengths.length > 0 && (
+            <>
+              <div style={styles.afbSecHead}>💪 You already have</div>
+              {plan.read.strengths.map((s, i) => (
+                <div key={i} style={styles.afbLi}>
+                  • {s}
+                </div>
+              ))}
+            </>
+          )}
+          {plan.read.gaps.length > 0 && (
+            <>
+              <div style={styles.afbSecHead}>🎯 What we'll fix, in order</div>
+              {plan.read.gaps.map((g, i) => (
+                <div key={i} style={styles.afbLi}>
+                  {i + 1}. {g}
+                </div>
+              ))}
+            </>
+          )}
+          {plan.read.pace && <p style={styles.helpNote}>{plan.read.pace}</p>}
+
+          <div style={styles.afbSecHead}>📚 The sessions ahead</div>
+          {plan.sessions.map((s) => {
+            const isOpen = open === s.number;
+            return (
+              <div key={s.number} style={styles.helpStep}>
+                <div
+                  style={{ ...styles.helpStepHead, cursor: "pointer" }}
+                  onClick={() => setOpen(isOpen ? null : s.number)}
+                >
+                  <span style={styles.helpStepNum}>{s.number}</span>
+                  <span style={styles.helpStepTitle}>{s.title}</span>
+                  {s.checkpoint && (
+                    <span style={styles.checkpointBadge}>🚩 Checkpoint</span>
+                  )}
+                </div>
+                <div style={styles.helpStepBody}>{s.focus}</div>
+                {isOpen && (
+                  <>
+                    {s.objectives.length > 0 && (
+                      <>
+                        <div style={styles.afbSecHead}>By the end you can</div>
+                        {s.objectives.map((o, i) => (
+                          <div key={i} style={styles.afbLi}>
+                            • {o}
+                          </div>
+                        ))}
+                      </>
+                    )}
+                    {s.activities.length > 0 && (
+                      <>
+                        <div style={styles.afbSecHead}>What we'll do</div>
+                        {s.activities.map((a, i) => (
+                          <div key={i} style={styles.afbLi}>
+                            • {a}
+                          </div>
+                        ))}
+                      </>
+                    )}
+                    {s.homework && (
+                      <div style={styles.helpHint}>📩 Between sessions: {s.homework}</div>
+                    )}
+                    {onAsk && (
+                      <button
+                        style={styles.helpHintBtn}
+                        onClick={() => startSession(s)}
+                      >
+                        ▶️ Start this session
+                      </button>
+                    )}
+                  </>
+                )}
+              </div>
+            );
+          })}
+
+          {plan.nextSession && (
+            <div style={styles.afbNext}>🎯 Next time we'll start with: {plan.nextSession}</div>
+          )}
+          {plan.note && <p style={styles.helpNote}>{plan.note}</p>}
+          <button
+            style={{
+              ...styles.helpTalkBtn,
+              ...(adopted ? { opacity: 0.6, cursor: "default" } : {}),
+            }}
+            disabled={adopted}
+            onClick={adopt}
+          >
+            {adopted ? "✓ Added to your study plan" : "📌 Add these to my study plan"}
+          </button>
+        </div>
+      )}
+    </div>
+  );
+}
+
 function AssignmentFeedback({
   subjects,
   profile,
@@ -13958,6 +18723,7 @@ type NoteDoc = {
   stickies: StickyNote[];
   nodes: CanvasNode[]; // infinite-canvas / mind-map nodes
   edges: CanvasEdge[]; // connections between nodes
+  docId?: string; // linked Google Doc, once the note has been synced there
   updatedAt: number;
 };
 type NoteColor = "yellow" | "green" | "blue" | "pink" | "orange";
@@ -14012,7 +18778,7 @@ function renderNoteInline(
             key={i}
             style={{
               background: NOTE_HIGHLIGHTS[color],
-              color: "#1f2a24",
+              color: "#2a2350",
               padding: "0 3px",
               borderRadius: 4,
             }}
@@ -14239,7 +19005,7 @@ function StickyBoard({
                 resize: "none",
                 outline: "none",
                 fontSize: 13,
-                color: "#1f2a24",
+                color: "#2a2350",
                 fontFamily: "inherit",
                 minHeight: 56,
               }}
@@ -14463,7 +19229,7 @@ function CanvasBoard({
       <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 6, flexWrap: "wrap" }}>
         <button
           onClick={addNode}
-          style={{ padding: "5px 12px", borderRadius: 999, border: "none", background: "var(--accent)", color: "#fff", fontSize: 13, fontWeight: 700, cursor: "pointer" }}
+          style={{ padding: "5px 12px", borderRadius: 999, border: "none", background: "var(--accent)", color: "var(--primary-foreground)", fontSize: 13, fontWeight: 700, cursor: "pointer" }}
         >
           ＋ Add node
         </button>
@@ -14580,7 +19346,7 @@ function CanvasBoard({
                   outline: "none",
                   fontSize: 13,
                   fontWeight: 600,
-                  color: "#1f2a24",
+                  color: "#2a2350",
                   fontFamily: "inherit",
                   textAlign: "center",
                   minHeight: 20,
@@ -14595,10 +19361,18 @@ function CanvasBoard({
 }
 
 // "Sync to Google Docs" for a single note. Rides the existing Google login and
-// posts the note to /api/notes/export-doc, which creates a formatted doc and
-// returns its link. Falls back to a Google-sign-in nudge if the account isn't
-// Google (the Docs scope only comes with a Google login).
-function GoogleDocsSync({ note }: { note: NoteDoc }) {
+// posts the note to /api/notes/export-doc. The first sync creates a formatted
+// doc and links it to the note; later syncs reuse that link and update only the
+// sections that changed, so whatever the student added inside the doc stays put.
+// Falls back to a Google-sign-in nudge if the account isn't Google (the Docs
+// scope only comes with a Google login).
+function GoogleDocsSync({
+  note,
+  onLink,
+}: {
+  note: NoteDoc;
+  onLink: (docId: string) => void;
+}) {
   const { data: session } = useSession();
   const isGoogle =
     (session as { authProvider?: string } | null)?.authProvider === "google";
@@ -14607,6 +19381,7 @@ function GoogleDocsSync({ note }: { note: NoteDoc }) {
   );
   const [msg, setMsg] = useState("");
   const [url, setUrl] = useState("");
+  const linked = !!note.docId;
 
   async function sync() {
     setState("saving");
@@ -14622,17 +19397,34 @@ function GoogleDocsSync({ note }: { note: NoteDoc }) {
           body: note.body,
           cue: note.cue,
           summary: note.summary,
+          docId: note.docId,
         }),
       });
       const data = (await res.json()) as {
         url?: string;
+        docId?: string;
+        created?: boolean;
+        changed?: string[];
         error?: string;
         needsGoogle?: boolean;
       };
       if (data.url) {
         setUrl(data.url);
         setState("done");
-        window.open(data.url, "_blank", "noopener,noreferrer");
+        if (data.docId) onLink(data.docId);
+        if (data.created) {
+          setMsg("");
+          window.open(data.url, "_blank", "noopener,noreferrer");
+        } else {
+          // Name what moved, so it's obvious the sync is surgical and not a
+          // silent overwrite of the whole doc.
+          const changed = data.changed || [];
+          setMsg(
+            changed.length
+              ? `Updated ${changed.join(", ")}`
+              : "Already up to date",
+          );
+        }
       } else if (data.needsGoogle) {
         setState("error");
         setMsg(data.error || "Sign in with Google to save to Docs.");
@@ -14667,7 +19459,14 @@ function GoogleDocsSync({ note }: { note: NoteDoc }) {
             gap: 6,
           }}
         >
-          📄 {state === "saving" ? "Saving to Google Docs…" : "Sync to Google Docs"}
+          📄{" "}
+          {state === "saving"
+            ? linked
+              ? "Updating your doc…"
+              : "Saving to Google Docs…"
+            : linked
+              ? "Update Google Doc"
+              : "Sync to Google Docs"}
         </button>
       ) : (
         <button
@@ -14686,6 +19485,26 @@ function GoogleDocsSync({ note }: { note: NoteDoc }) {
           📄 Sign in with Google to save to Docs
         </button>
       )}
+      <button
+        onClick={() =>
+          printAsPdf(
+            note.title || noteTitle(note.body || ""),
+            [note.cue, note.body, note.summary].filter(Boolean).join("\n\n"),
+          )
+        }
+        style={{
+          padding: "6px 14px",
+          borderRadius: 999,
+          border: "1px solid var(--border)",
+          background: "var(--bg)",
+          color: "var(--assistant-text)",
+          fontSize: 13,
+          fontWeight: 700,
+          cursor: "pointer",
+        }}
+      >
+        📄 Save as PDF
+      </button>
       {state === "done" && url && (
         <a
           href={url}
@@ -14693,7 +19512,7 @@ function GoogleDocsSync({ note }: { note: NoteDoc }) {
           rel="noopener noreferrer"
           style={{ fontSize: 12.5, color: "var(--accent)", fontWeight: 700 }}
         >
-          ✓ Opened in Google Docs
+          ✓ {msg || "Opened in Google Docs"}
         </a>
       )}
       {state === "error" && msg && (
@@ -14709,6 +19528,11 @@ function NotesWorkspace({ ns }: { ns: string }) {
   const [activeId, setActiveId] = useState<string | null>(null);
   const [loaded, setLoaded] = useState(false);
   const bodyRef = useRef<HTMLTextAreaElement | null>(null);
+  // The speech recognizer holds onto appendToActiveBody from the moment
+  // recording starts — read the active id through a ref so switching notes
+  // mid-recording lands the words in the note that's actually open.
+  const activeIdRef = useRef(activeId);
+  activeIdRef.current = activeId;
 
   // Load once per learner.
   useEffect(() => {
@@ -14813,9 +19637,10 @@ function NotesWorkspace({ ns }: { ns: string }) {
   // so streamed final phrases each read the latest body (no stale closure).
   function appendToActiveBody(text: string) {
     if (!text.trim()) return;
+    const id = activeIdRef.current;
     setDocs((prev) =>
       prev.map((d) => {
-        if (d.id !== activeId) return d;
+        if (d.id !== id) return d;
         const sep = !d.body || /\s$/.test(d.body) ? "" : " ";
         return { ...d, body: d.body + sep + text, updatedAt: Date.now() };
       }),
@@ -14882,7 +19707,7 @@ function NotesWorkspace({ ns }: { ns: string }) {
               borderRadius: 10,
               border: "none",
               background: "var(--accent)",
-              color: "#fff",
+              color: "var(--primary-foreground)",
               fontWeight: 700,
               fontSize: 13.5,
               cursor: "pointer",
@@ -14997,7 +19822,10 @@ function NotesWorkspace({ ns }: { ns: string }) {
               />
             ) : (
               <>
-            <GoogleDocsSync note={active} />
+            <GoogleDocsSync
+              note={active}
+              onLink={(docId) => patch(active.id, { docId })}
+            />
             {/* Concept color toolbar */}
             <div style={{ display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap" }}>
               <span style={{ fontSize: 12.5, color: "var(--muted)", fontWeight: 600 }}>
@@ -15106,7 +19934,7 @@ function greetingFor(p: LearnerProfile): Message {
   return {
     role: "assistant",
     content:
-      `Hi${name} 🌱 Thanks for sharing all that — I've got your info for ` +
+      `Hi${name} 💡 Thanks for sharing all that — I've got your info for ` +
       `${p.klass.trim()}. Want me to build your learning plan and find a few ` +
       `study videos to get started?`,
   };
@@ -15182,6 +20010,16 @@ function SignUp({
   const [hobbies, setHobbies] = useState(initial?.hobbies ?? "");
   const [focusTime, setFocusTime] = useState(initial?.focusTime ?? "");
   const [needHelpMost, setNeedHelpMost] = useState(initial?.needHelpMost ?? "");
+  // What's in each question's "Something else…" box, keyed by question text.
+  // The answer itself lives in the question's own value, but that list is
+  // comma-joined and trimmed on the way back out, which would eat a space the
+  // moment they typed one — so the box keeps its own copy of the raw text.
+  const [otherText, setOtherText] = useState<Record<string, string>>({});
+  // The intake runs one question per slide. Editing an existing profile opens
+  // on the all-at-once view instead, so a single answer can be changed without
+  // paging through everything.
+  const [step, setStep] = useState(0);
+  const [showAll, setShowAll] = useState(Boolean(initial));
 
   const canSubmit = klass.trim().length > 0;
 
@@ -15260,6 +20098,25 @@ function SignUp({
       else next.add(opt);
       setValue([...next].join(", "));
     };
+    // Their own answer sits in the same comma-joined list as the options, so it
+    // is whatever was picked that isn't one of them — and can't hold a comma.
+    const saved = [...chosen].find((c) => !options.includes(c)) ?? "";
+    const other = otherText[question] ?? saved;
+    const otherIsOpen = question in otherText || saved !== "";
+    const setOther = (v: string) => {
+      const typed = v.replace(/,\s*/g, " ");
+      setOtherText((p) => ({ ...p, [question]: typed }));
+      const picked = [...chosen].filter((c) => options.includes(c));
+      setValue([...picked, ...(typed.trim() ? [typed.trim()] : [])].join(", "));
+    };
+    const closeOther = () => {
+      setOtherText((p) => {
+        const next = { ...p };
+        delete next[question];
+        return next;
+      });
+      setValue([...chosen].filter((c) => options.includes(c)).join(", "));
+    };
     return (
       <div style={styles.label}>
         {question}{" "}
@@ -15289,214 +20146,480 @@ function SignUp({
               </button>
             );
           })}
+          <OtherChoice
+            open={otherIsOpen}
+            value={other}
+            // Closing drops what they typed.
+            onToggle={() => (otherIsOpen ? closeOther() : setOther(""))}
+            onChange={setOther}
+          />
         </div>
       </div>
     );
   };
 
-  return (
-    <main style={styles.formPage}>
-      <h1 style={styles.title}>Welcome to Eliora 🌱</h1>
-      <p style={styles.formIntro}>
-        A few quick questions so I can build a learning plan that fits you. Only
-        the class is required — share what you like.
-      </p>
-
-      <label style={styles.label}>
-        Your name (optional)
-        <input
-          style={styles.formInput}
-          value={name}
-          onChange={(e) => setName(e.target.value)}
-          placeholder="What should I call you?"
-        />
-      </label>
-
-      <label style={styles.label}>
-        What class are you taking? *
-        <input
-          style={styles.formInput}
-          value={klass}
-          onChange={(e) => setKlass(e.target.value)}
-          placeholder="e.g. Algebra 1, AP Biology, Intro Spanish"
-          spellCheck
-          autoCapitalize="words"
-        />
-      </label>
-
-      <label style={styles.label}>
-        What do you struggle with while learning?
-        <textarea
-          spellCheck
-          style={styles.formTextarea}
-          value={struggles}
-          onChange={(e) => setStruggles(e.target.value)}
-          placeholder="e.g. staying focused, reading, remembering, test anxiety"
-          rows={2}
-        />
-      </label>
-
-      <label style={styles.label}>
-        How do you like to learn?
-        <textarea
-          spellCheck
-          style={styles.formTextarea}
-          value={learningStyle}
-          onChange={(e) => setLearningStyle(e.target.value)}
-          placeholder="e.g. videos, examples, hands-on, talking it through, visuals"
-          rows={2}
-        />
-      </label>
-
-      <label style={styles.label}>
-        What do you like to do? (hobbies / interests)
-        <textarea
-          spellCheck
-          style={styles.formTextarea}
-          value={interests}
-          onChange={(e) => setInterests(e.target.value)}
-          placeholder="e.g. soccer, drawing, video games, music"
-          rows={2}
-        />
-      </label>
-
-      <label style={styles.label}>
-        What has worked for you in the past? (optional)
-        <textarea
-          spellCheck
-          style={styles.formTextarea}
-          value={pastSuccess}
-          onChange={(e) => setPastSuccess(e.target.value)}
-          placeholder="e.g. flashcards, studying with a friend, short sessions"
-          rows={2}
-        />
-      </label>
-
-      {multiChoiceGroup(
+  // One entry per question. `answered` drives the Next / Skip wording; only the
+  // class is `required`, so every other slide can be waved through.
+  const slides: {
+    id: string;
+    answered: boolean;
+    required?: boolean;
+    node: React.ReactNode;
+  }[] = [
+    {
+      id: "name",
+      answered: name.trim().length > 0,
+      node: (
+        <label style={styles.label}>
+          Your name (optional)
+          <input
+            style={styles.formInput}
+            value={name}
+            onChange={(e) => setName(e.target.value)}
+            placeholder="What should I call you?"
+          />
+        </label>
+      ),
+    },
+    {
+      id: "klass",
+      answered: klass.trim().length > 0,
+      required: true,
+      node: (
+        <label style={styles.label}>
+          What class are you taking? *
+          <input
+            style={styles.formInput}
+            value={klass}
+            onChange={(e) => setKlass(e.target.value)}
+            placeholder="e.g. Algebra 1, AP Biology, Intro Spanish"
+            spellCheck
+            autoCapitalize="words"
+          />
+        </label>
+      ),
+    },
+    {
+      id: "struggles",
+      answered: struggles.trim().length > 0,
+      node: (
+        <label style={styles.label}>
+          What do you struggle with while learning?
+          <textarea
+            spellCheck
+            style={styles.formTextarea}
+            value={struggles}
+            onChange={(e) => setStruggles(e.target.value)}
+            placeholder="e.g. staying focused, reading, remembering, test anxiety"
+            rows={2}
+          />
+        </label>
+      ),
+    },
+    {
+      id: "learningStyle",
+      answered: learningStyle.trim().length > 0,
+      node: (
+        <label style={styles.label}>
+          How do you like to learn?
+          <textarea
+            spellCheck
+            style={styles.formTextarea}
+            value={learningStyle}
+            onChange={(e) => setLearningStyle(e.target.value)}
+            placeholder="e.g. videos, examples, hands-on, talking it through, visuals"
+            rows={2}
+          />
+        </label>
+      ),
+    },
+    {
+      id: "interests",
+      answered: interests.trim().length > 0,
+      node: (
+        <label style={styles.label}>
+          What do you like to do? (hobbies / interests)
+          <textarea
+            spellCheck
+            style={styles.formTextarea}
+            value={interests}
+            onChange={(e) => setInterests(e.target.value)}
+            placeholder="e.g. soccer, drawing, video games, music"
+            rows={2}
+          />
+        </label>
+      ),
+    },
+    {
+      id: "pastSuccess",
+      answered: pastSuccess.trim().length > 0,
+      node: (
+        <label style={styles.label}>
+          What has worked for you in the past? (optional)
+          <textarea
+            spellCheck
+            style={styles.formTextarea}
+            value={pastSuccess}
+            onChange={(e) => setPastSuccess(e.target.value)}
+            placeholder="e.g. flashcards, studying with a friend, short sessions"
+            rows={2}
+          />
+        </label>
+      ),
+    },
+    {
+      id: "studyHabits",
+      answered: studyHabits.length > 0,
+      node: multiChoiceGroup(
         "How would you describe your current study habits?",
         STUDY_HABIT_OPTIONS,
         studyHabits,
         setStudyHabits,
-      )}
-
-      {multiChoiceGroup(
+      ),
+    },
+    {
+      id: "biggestChallenge",
+      answered: biggestChallenge.length > 0,
+      node: multiChoiceGroup(
         "What are your biggest challenges when studying?",
         CHALLENGE_OPTIONS,
         biggestChallenge,
         setBiggestChallenge,
-      )}
-
-      <label style={styles.label}>
-        What grade or year are you currently in?
-        <input
-          style={styles.formInput}
-          value={gradeYear}
-          onChange={(e) => setGradeYear(e.target.value)}
-          placeholder="e.g. 10th grade, sophomore, Year 11"
-        />
-      </label>
-
-      <label style={styles.label}>
-        What subjects are you currently studying?
-        <input
-          style={styles.formInput}
-          value={subjectsStudying}
-          onChange={(e) => setSubjectsStudying(e.target.value)}
-          placeholder="e.g. World History, Algebra 2, Chemistry, Spanish"
-          spellCheck
-        />
-      </label>
-
-      {multiChoiceGroup(
+      ),
+    },
+    {
+      id: "gradeYear",
+      answered: gradeYear.trim().length > 0,
+      node: choiceGroup(
+        "What grade or year are you currently in?",
+        GRADE_YEAR_OPTIONS,
+        gradeYear,
+        setGradeYear,
+      ),
+    },
+    {
+      id: "subjectsStudying",
+      answered: subjectsStudying.trim().length > 0,
+      node: (
+        <label style={styles.label}>
+          What subjects are you currently studying?
+          <input
+            style={styles.formInput}
+            value={subjectsStudying}
+            onChange={(e) => setSubjectsStudying(e.target.value)}
+            placeholder="e.g. World History, Algebra 2, Chemistry, Spanish"
+            spellCheck
+          />
+        </label>
+      ),
+    },
+    {
+      id: "planningStyle",
+      answered: planningStyle.length > 0,
+      node: multiChoiceGroup(
         "How do you usually plan your study sessions?",
         PLANNING_OPTIONS,
         planningStyle,
         setPlanningStyle,
-      )}
-
-      {choiceGroup(
+      ),
+    },
+    {
+      id: "sessionLength",
+      answered: sessionLength.length > 0,
+      node: choiceGroup(
         "How long is a typical study session for you?",
         SESSION_LENGTH_OPTIONS,
         sessionLength,
         setSessionLength,
-      )}
-
-      {multiChoiceGroup(
+      ),
+    },
+    {
+      id: "focusHelp",
+      answered: focusHelp.length > 0,
+      node: multiChoiceGroup(
         "What helps you focus the most while studying?",
         FOCUS_HELP_OPTIONS,
         focusHelp,
         setFocusHelp,
-      )}
-
-      {choiceGroup(
+      ),
+    },
+    {
+      id: "usedStudyApp",
+      answered: usedStudyApp.length > 0,
+      node: choiceGroup(
         "Have you used a study or productivity app before?",
         USED_APP_OPTIONS,
         usedStudyApp,
         setUsedStudyApp,
-      )}
-
-      {multiChoiceGroup(
+      ),
+    },
+    {
+      id: "wantedFeature",
+      answered: wantedFeature.length > 0,
+      node: multiChoiceGroup(
         "What features would help you the most in a study app?",
         WANTED_FEATURE_OPTIONS,
         wantedFeature,
         setWantedFeature,
-      )}
-
-      {multiChoiceGroup(
+      ),
+    },
+    {
+      id: "planBlocker",
+      answered: planBlocker.length > 0,
+      node: multiChoiceGroup(
         "What usually stops you from sticking to a study plan?",
         PLAN_BLOCKER_OPTIONS,
         planBlocker,
         setPlanBlocker,
-      )}
-
-      {multiChoiceGroup(
+      ),
+    },
+    {
+      id: "mainGoal",
+      answered: mainGoal.length > 0,
+      node: multiChoiceGroup(
         "What are your main goals when using a study planning app?",
         MAIN_GOAL_OPTIONS,
         mainGoal,
         setMainGoal,
-      )}
-
-      {multiChoiceGroup(
+      ),
+    },
+    {
+      id: "hobbies",
+      answered: hobbies.length > 0,
+      node: multiChoiceGroup(
         "What are your hobbies or interests?",
         HOBBY_OPTIONS,
         hobbies,
         setHobbies,
-      )}
-
-      {choiceGroup(
+      ),
+    },
+    {
+      id: "focusTime",
+      answered: focusTime.length > 0,
+      node: choiceGroup(
         "What time of day do you focus best?",
         FOCUS_TIME_OPTIONS,
         focusTime,
         setFocusTime,
-      )}
+      ),
+    },
+    {
+      id: "needHelpMost",
+      answered: needHelpMost.trim().length > 0,
+      node: (
+        <label style={styles.label}>
+          How do you struggle or need help in your studies the most? (optional)
+          <textarea
+            spellCheck
+            style={styles.formTextarea}
+            value={needHelpMost}
+            onChange={(e) => setNeedHelpMost(e.target.value)}
+            placeholder="In your own words — anything you want me to know"
+            rows={2}
+          />
+        </label>
+      ),
+    },
+  ];
 
-      <label style={styles.label}>
-        How do you struggle or need help in your studies the most? (optional)
-        <textarea
-          spellCheck
-          style={styles.formTextarea}
-          value={needHelpMost}
-          onChange={(e) => setNeedHelpMost(e.target.value)}
-          placeholder="In your own words — anything you want me to know"
-          rows={2}
-        />
-      </label>
+  const total = slides.length;
+  const idx = Math.min(step, total - 1);
+  const current = slides[idx];
+  const onLast = idx === total - 1;
+  // The only thing that can hold a slide up is the required class question.
+  const held = Boolean(current.required) && !current.answered;
+  const answeredCount = slides.filter((s) => s.answered).length;
 
-      <div style={styles.formActions}>
-        {onCancel && (
-          <button onClick={onCancel} style={styles.secondaryBtn}>
-            Cancel
+  if (showAll) {
+    return (
+      <main style={styles.formPage}>
+        <h1 className="eliora-lockup" style={styles.title}>
+          <ElioraMark size={34} />
+          {initial ? (
+            "Your profile"
+          ) : (
+            <span>
+              Welcome to <ElioraWordmark size="inherit" />
+            </span>
+          )}
+        </h1>
+        <div style={styles.wizardTop}>
+          <span style={styles.wizardCount}>
+            {answeredCount} of {total} answered
+          </span>
+          <button
+            type="button"
+            style={styles.linkBtn}
+            onClick={() => setShowAll(false)}
+          >
+            One at a time
           </button>
+        </div>
+        {slides.map((s) => (
+          <div key={s.id}>{s.node}</div>
+        ))}
+        <div style={styles.formActions}>
+          {onCancel && (
+            <button onClick={onCancel} style={styles.secondaryBtn}>
+              Cancel
+            </button>
+          )}
+          <button
+            onClick={submit}
+            disabled={!canSubmit}
+            style={styles.primaryBtn}
+          >
+            {initial ? "Save" : "Start learning"}
+          </button>
+        </div>
+        {!initial && (
+          <p style={styles.wizardAuthSwitch}>
+            Not you?{" "}
+            <button
+              type="button"
+              style={styles.linkBtn}
+              onClick={() => signOut({ callbackUrl: "/" })}
+            >
+              Log in
+            </button>{" "}
+            or{" "}
+            <button
+              type="button"
+              style={styles.linkBtn}
+              onClick={() => signOut({ callbackUrl: "/signup" })}
+            >
+              sign up
+            </button>{" "}
+            with a different account.
+          </p>
         )}
-        <button onClick={submit} disabled={!canSubmit} style={styles.primaryBtn}>
-          {initial ? "Save" : "Start learning"}
+      </main>
+    );
+  }
+
+  return (
+    <main
+      style={styles.formPage}
+      onKeyDown={(e) => {
+        // Enter advances, except in a textarea where it means a new line.
+        if (e.key !== "Enter") return;
+        const tag = (e.target as HTMLElement).tagName;
+        if (tag === "TEXTAREA" || tag === "BUTTON") return;
+        e.preventDefault();
+        if (held) return;
+        if (onLast) submit();
+        else setStep(idx + 1);
+      }}
+    >
+      <h1 className="eliora-lockup" style={styles.title}>
+        <ElioraMark size={34} />
+        <span>
+          Welcome to <ElioraWordmark size="inherit" />
+        </span>
+      </h1>
+      {idx === 0 && (
+        <p style={styles.formIntro}>
+          A few quick questions so I can build a learning plan that fits you.
+          Only the class is required — skip anything you&apos;d rather not
+          answer.
+        </p>
+      )}
+      <div style={styles.wizardTop}>
+        <span style={styles.wizardCount}>
+          Question {idx + 1} of {total}
+        </span>
+        <button
+          type="button"
+          style={styles.linkBtn}
+          onClick={() => setShowAll(true)}
+        >
+          See all questions
         </button>
       </div>
+      <div style={styles.progressTrack}>
+        <div
+          style={{
+            ...styles.progressFill,
+            width: `${((idx + 1) / total) * 100}%`,
+          }}
+        />
+      </div>
+
+      <div key={current.id} style={styles.wizardSlide}>
+        {current.node}
+      </div>
+
+      {held && (
+        <p style={styles.wizardHint}>
+          This is the one I really need — what class should I plan around?
+        </p>
+      )}
+
+      <div style={styles.wizardActions}>
+        <button
+          type="button"
+          style={styles.secondaryBtn}
+          onClick={
+            idx === 0
+              ? // First-run has no in-app screen behind the wizard — Back
+                // returns to the sign-in landing, which means ending the
+                // session that got us here.
+                (onCancel ?? (() => signOut({ callbackUrl: "/" })))
+              : () => setStep(idx - 1)
+          }
+        >
+          {idx === 0 && onCancel ? "Cancel" : "← Back"}
+        </button>
+        <div style={styles.wizardNextGroup}>
+          {canSubmit && !onLast && (
+            <button type="button" style={styles.linkBtn} onClick={submit}>
+              Skip the rest
+            </button>
+          )}
+          <button
+            type="button"
+            style={{ ...styles.primaryBtn, opacity: held ? 0.5 : 1 }}
+            disabled={held}
+            onClick={onLast ? submit : () => setStep(idx + 1)}
+          >
+            {onLast
+              ? initial
+                ? "Save"
+                : "Start learning"
+              : current.answered
+                ? "Next →"
+                : "Skip →"}
+          </button>
+        </div>
+      </div>
+      {!initial && (
+        <p style={styles.wizardAuthSwitch}>
+          Not you?{" "}
+          <button
+            type="button"
+            style={styles.linkBtn}
+            onClick={() => signOut({ callbackUrl: "/" })}
+          >
+            Log in
+          </button>{" "}
+          or{" "}
+          <button
+            type="button"
+            style={styles.linkBtn}
+            onClick={() => signOut({ callbackUrl: "/signup" })}
+          >
+            sign up
+          </button>{" "}
+          with a different account.
+        </p>
+      )}
     </main>
   );
 }
 
-// Login gate: show the Google sign-in screen until the user is authenticated.
+// Login gate: signed-out visitors get the landing page — sign-in on the left,
+// a scrolling demo of what Eliora does on the right — and never reach the app
+// shell (or its first-run profile questions) until they have a session.
 export default function Home() {
   const { status } = useSession();
   if (status === "loading") {
@@ -15506,1201 +20629,17 @@ export default function Home() {
       </main>
     );
   }
-  if (status === "unauthenticated") return <Login />;
+  if (status === "unauthenticated") return <AuthLanding initialMode="login" />;
   return <ElioraApp />;
 }
 
-// ---- Landing-page feature demos (shown to signed-out visitors) ----
-// Small self-contained mock previews of each feature so new users can see
-// what Eliora does before creating an account. No real data or API calls.
-
-const demoStyles: Record<string, React.CSSProperties> = {
-  page: {
-    minHeight: "100vh",
-    display: "flex",
-    flexDirection: "column",
-    alignItems: "center",
-    gap: 48,
-    padding: "48px 24px 72px",
-  },
-  hero: {
-    display: "flex",
-    flexWrap: "wrap",
-    alignItems: "center",
-    justifyContent: "center",
-    gap: 40,
-    maxWidth: 960,
-    width: "100%",
-  },
-  heroCopy: {
-    flex: "1 1 340px",
-    minWidth: 300,
-    maxWidth: 480,
-    display: "flex",
-    flexDirection: "column",
-    gap: 14,
-  },
-  heroTitle: { margin: 0, fontSize: 40, lineHeight: 1.1 },
-  heroTagline: {
-    margin: 0,
-    fontSize: 17,
-    lineHeight: 1.55,
-    color: "var(--muted)",
-  },
-  heroChips: { display: "flex", flexWrap: "wrap", gap: 8, marginTop: 4 },
-  heroChip: {
-    fontSize: 13,
-    fontWeight: 600,
-    padding: "6px 12px",
-    borderRadius: 999,
-    background: "var(--accent-soft)",
-    color: "var(--accent)",
-  },
-  heroScrollHint: {
-    marginTop: 6,
-    fontSize: 14,
-    fontWeight: 600,
-    color: "var(--accent)",
-    textDecoration: "none",
-  },
-  demosSection: {
-    width: "100%",
-    maxWidth: 1100,
-    display: "flex",
-    flexDirection: "column",
-    gap: 20,
-  },
-  demosHeading: { margin: 0, fontSize: 26, textAlign: "center" },
-  demosSub: {
-    margin: 0,
-    textAlign: "center",
-    color: "var(--muted)",
-    fontSize: 15,
-  },
-  grid: {
-    display: "grid",
-    gridTemplateColumns: "repeat(auto-fit, minmax(280px, 1fr))",
-    gap: 18,
-    marginTop: 8,
-  },
-  card: {
-    display: "flex",
-    flexDirection: "column",
-    gap: 12,
-    padding: 18,
-    borderRadius: 16,
-    border: "1px solid var(--border)",
-    background: "var(--surface)",
-  },
-  cardHead: { display: "flex", alignItems: "flex-start", gap: 10 },
-  cardEmoji: { fontSize: 22, lineHeight: 1.2 },
-  cardTitle: { margin: 0, fontSize: 16, fontWeight: 700 },
-  cardCaption: {
-    margin: "2px 0 0",
-    fontSize: 13,
-    lineHeight: 1.45,
-    color: "var(--muted)",
-  },
-  cardBody: {
-    display: "flex",
-    flexDirection: "column",
-    gap: 8,
-    padding: 12,
-    borderRadius: 12,
-    border: "1px solid var(--border)",
-    background: "var(--bg)",
-    fontSize: 13.5,
-  },
-  bubbleUser: {
-    alignSelf: "flex-end",
-    maxWidth: "85%",
-    padding: "8px 12px",
-    borderRadius: "14px 14px 4px 14px",
-    background: "var(--accent)",
-    color: "#fff",
-    lineHeight: 1.45,
-  },
-  bubbleBot: {
-    alignSelf: "flex-start",
-    maxWidth: "90%",
-    padding: "8px 12px",
-    borderRadius: "14px 14px 14px 4px",
-    background: "var(--accent-soft)",
-    color: "var(--text)",
-    lineHeight: 1.45,
-  },
-  taskRow: {
-    display: "flex",
-    alignItems: "center",
-    gap: 8,
-    cursor: "pointer",
-    userSelect: "none",
-  },
-  barTrack: {
-    height: 8,
-    borderRadius: 999,
-    background: "var(--accent-soft)",
-    overflow: "hidden",
-  },
-  barFill: {
-    height: "100%",
-    borderRadius: 999,
-    background: "var(--accent)",
-  },
-  chipRow: { display: "flex", flexWrap: "wrap", gap: 6 },
-  miniChip: {
-    fontSize: 12,
-    fontWeight: 600,
-    padding: "4px 10px",
-    borderRadius: 999,
-    border: "1px solid var(--border)",
-    background: "var(--surface)",
-  },
-  tryHint: {
-    fontSize: 11.5,
-    color: "var(--muted)",
-    fontStyle: "italic",
-  },
-};
-
-function DemoCard({
-  emoji,
-  title,
-  caption,
-  children,
-}: {
-  emoji: string;
-  title: string;
-  caption: string;
-  children: React.ReactNode;
-}) {
-  return (
-    <div style={demoStyles.card}>
-      <div style={demoStyles.cardHead}>
-        <span style={demoStyles.cardEmoji} aria-hidden>
-          {emoji}
-        </span>
-        <div>
-          <h3 style={demoStyles.cardTitle}>{title}</h3>
-          <p style={demoStyles.cardCaption}>{caption}</p>
-        </div>
-      </div>
-      <div style={demoStyles.cardBody}>{children}</div>
-    </div>
-  );
-}
-
-function DemoChat() {
-  return (
-    <>
-      <span style={demoStyles.bubbleUser}>
-        I have a bio test Friday and I haven&apos;t started 😬
-      </span>
-      <span style={demoStyles.bubbleBot}>
-        No panic — that&apos;s 3 days. Let&apos;s do three 25-minute sessions:
-        cells today, genetics tomorrow, practice quiz Thursday. Want me to add
-        them to your plan?
-      </span>
-      <span style={demoStyles.bubbleUser}>Yes please!</span>
-    </>
-  );
-}
-
-function DemoDailyTasks() {
-  const [done, setDone] = useState([true, false, false]);
-  const tasks = [
-    "Review algebra notes (15 min)",
-    "Quiz yourself: cell organelles",
-    "Plan tomorrow in 2 minutes",
-  ];
-  const count = done.filter(Boolean).length;
-  return (
-    <>
-      {tasks.map((t, i) => (
-        <span
-          key={t}
-          style={demoStyles.taskRow}
-          onClick={() =>
-            setDone((d) => d.map((v, j) => (j === i ? !v : v)))
-          }
-        >
-          <span aria-hidden>{done[i] ? "✅" : "⬜"}</span>
-          <span
-            style={{
-              textDecoration: done[i] ? "line-through" : "none",
-              color: done[i] ? "var(--muted)" : "var(--text)",
-            }}
-          >
-            {t}
-          </span>
-        </span>
-      ))}
-      <div style={demoStyles.barTrack}>
-        <div
-          style={{ ...demoStyles.barFill, width: `${(count / 3) * 100}%` }}
-        />
-      </div>
-      <span style={demoStyles.tryHint}>Try it — tap a task to check it off</span>
-    </>
-  );
-}
-
-function DemoRewards() {
-  return (
-    <>
-      <span style={{ fontSize: 15, fontWeight: 700 }}>🔥 5-day streak</span>
-      <div style={demoStyles.chipRow}>
-        <span style={demoStyles.miniChip}>🥇 First Plan</span>
-        <span style={demoStyles.miniChip}>📚 Bookworm</span>
-        <span style={demoStyles.miniChip}>🌟 Week Streak</span>
-      </div>
-      <div style={demoStyles.barTrack}>
-        <div style={{ ...demoStyles.barFill, width: "70%" }} />
-      </div>
-      <span style={{ color: "var(--muted)", fontSize: 12.5 }}>
-        140 / 200 points to your next reward
-      </span>
-    </>
-  );
-}
-
-function DemoSchedule() {
-  const blocks: { time: string; label: string; bg: string }[] = [
-    { time: "4:00", label: "📖 Study — Bio ch. 4", bg: "var(--accent-soft)" },
-    { time: "4:30", label: "☕ Break", bg: "var(--bg)" },
-    { time: "5:00", label: "✍️ Essay outline", bg: "var(--accent-soft)" },
-  ];
-  return (
-    <>
-      {blocks.map((b) => (
-        <div
-          key={b.time}
-          style={{
-            display: "flex",
-            gap: 10,
-            alignItems: "center",
-            padding: "6px 10px",
-            borderRadius: 8,
-            border: "1px solid var(--border)",
-            background: b.bg,
-          }}
-        >
-          <span style={{ fontWeight: 700, fontSize: 12, minWidth: 34 }}>
-            {b.time}
-          </span>
-          <span>{b.label}</span>
-        </div>
-      ))}
-    </>
-  );
-}
-
-function DemoGoals() {
-  return (
-    <>
-      <span style={{ fontWeight: 700 }}>🎯 Raise chem grade to an A−</span>
-      <span style={{ color: "var(--muted)", fontSize: 12.5 }}>
-        Short-term · 2 of 4 steps done
-      </span>
-      <div style={demoStyles.barTrack}>
-        <div style={{ ...demoStyles.barFill, width: "50%" }} />
-      </div>
-      <div style={demoStyles.chipRow}>
-        <span style={demoStyles.miniChip}>✅ Redo missed problems</span>
-        <span style={demoStyles.miniChip}>⬜ Office hours Tues</span>
-      </div>
-    </>
-  );
-}
-
-function DemoCalendar() {
-  const events = [
-    { label: "🧪 Bio quiz", when: "in 2 days" },
-    { label: "📄 Essay draft", when: "in 5 days" },
-    { label: "📅 Math final", when: "in 3 weeks" },
-  ];
-  return (
-    <>
-      {events.map((e) => (
-        <div
-          key={e.label}
-          style={{
-            display: "flex",
-            justifyContent: "space-between",
-            alignItems: "center",
-            padding: "6px 10px",
-            borderRadius: 8,
-            border: "1px solid var(--border)",
-            background: "var(--surface)",
-          }}
-        >
-          <span>{e.label}</span>
-          <span style={{ color: "var(--accent)", fontWeight: 700, fontSize: 12 }}>
-            {e.when}
-          </span>
-        </div>
-      ))}
-    </>
-  );
-}
-
-function DemoFlashcards() {
-  const [flipped, setFlipped] = useState(false);
-  return (
-    <>
-      <div
-        onClick={() => setFlipped((f) => !f)}
-        style={{
-          cursor: "pointer",
-          userSelect: "none",
-          padding: "18px 14px",
-          borderRadius: 10,
-          border: "1px solid var(--border)",
-          background: flipped ? "var(--accent-soft)" : "var(--surface)",
-          textAlign: "center",
-          fontWeight: 600,
-          minHeight: 44,
-          display: "flex",
-          alignItems: "center",
-          justifyContent: "center",
-        }}
-      >
-        {flipped
-          ? "The mitochondria — it converts glucose into ATP."
-          : "What is the powerhouse of the cell?"}
-      </div>
-      <div style={demoStyles.chipRow}>
-        <span style={demoStyles.miniChip}>📇 12 flashcards</span>
-        <span style={demoStyles.miniChip}>❓ 5-question quiz</span>
-      </div>
-      <span style={demoStyles.tryHint}>Try it — tap the card to flip</span>
-    </>
-  );
-}
-
-function DemoFourYear() {
-  return (
-    <>
-      <div style={demoStyles.chipRow}>
-        {["Gr 9", "Gr 10", "Gr 11", "Gr 12"].map((g, i) => (
-          <span
-            key={g}
-            style={{
-              ...demoStyles.miniChip,
-              background: i < 2 ? "var(--accent-soft)" : "var(--surface)",
-            }}
-          >
-            {g}
-          </span>
-        ))}
-      </div>
-      <span>🎓 Destination: UC Berkeley — Biology</span>
-      <span style={{ color: "var(--muted)", fontSize: 12.5 }}>
-        Projected GPA <b style={{ color: "var(--accent)" }}>3.8</b> · 18 / 24
-        credits planned
-      </span>
-    </>
-  );
-}
-
-function DemoVideos() {
-  return (
-    <>
-      <div
-        style={{
-          display: "flex",
-          gap: 10,
-          alignItems: "center",
-          padding: 8,
-          borderRadius: 10,
-          border: "1px solid var(--border)",
-          background: "var(--surface)",
-        }}
-      >
-        <span
-          aria-hidden
-          style={{
-            width: 64,
-            height: 40,
-            borderRadius: 6,
-            background: "var(--accent-soft)",
-            display: "flex",
-            alignItems: "center",
-            justifyContent: "center",
-            fontSize: 18,
-          }}
-        >
-          ▶️
-        </span>
-        <div style={{ display: "flex", flexDirection: "column" }}>
-          <span style={{ fontWeight: 600 }}>Photosynthesis in 8 minutes</span>
-          <span style={{ color: "var(--muted)", fontSize: 12 }}>
-            Picked for your biology plan
-          </span>
-        </div>
-      </div>
-      <span style={{ color: "var(--muted)", fontSize: 12.5 }}>
-        A study-feed of videos matched to what you&apos;re learning this week.
-      </span>
-    </>
-  );
-}
-
-function LandingDemos() {
-  return (
-    <section id="demos" style={demoStyles.demosSection}>
-      <h2 style={demoStyles.demosHeading}>See what Eliora can do</h2>
-      <p style={demoStyles.demosSub}>
-        A quick peek at each feature — everything below is a live little demo.
-      </p>
-      <div style={demoStyles.grid}>
-        <DemoCard
-          emoji="💬"
-          title="AI study coach"
-          caption="Chat through what's stressing you and get a concrete plan back."
-        >
-          <DemoChat />
-        </DemoCard>
-        <DemoCard
-          emoji="✅"
-          title="Daily tasks"
-          caption="Three small wins a day, tuned to your plan and energy."
-        >
-          <DemoDailyTasks />
-        </DemoCard>
-        <DemoCard
-          emoji="🏆"
-          title="Rewards, badges & streaks"
-          caption="Points for showing up — spend them, earn badges, keep the flame."
-        >
-          <DemoRewards />
-        </DemoCard>
-        <DemoCard
-          emoji="🗓️"
-          title="Weekly schedule"
-          caption="Study blocks, breaks, and classes laid out hour by hour."
-        >
-          <DemoSchedule />
-        </DemoCard>
-        <DemoCard
-          emoji="🎯"
-          title="SMART goals"
-          caption="Big goals broken into steps you can actually check off."
-        >
-          <DemoGoals />
-        </DemoCard>
-        <DemoCard
-          emoji="⏳"
-          title="Exam countdowns"
-          caption="A calendar that keeps deadlines visible before they sneak up."
-        >
-          <DemoCalendar />
-        </DemoCard>
-        <DemoCard
-          emoji="📇"
-          title="Summaries, flashcards & quizzes"
-          caption="Paste notes or a YouTube link — get a summary you can study from."
-        >
-          <DemoFlashcards />
-        </DemoCard>
-        <DemoCard
-          emoji="🎓"
-          title="Four-year plan"
-          caption="Map courses to your dream school with a live GPA projection."
-        >
-          <DemoFourYear />
-        </DemoCard>
-        <DemoCard
-          emoji="📺"
-          title="Video study feed"
-          caption="Curated videos matched to the topics in your plan."
-        >
-          <DemoVideos />
-        </DemoCard>
-      </div>
-    </section>
-  );
-}
-
-function Login() {
-  const [mode, setMode] = useState<"login" | "signup">("login");
-  const [name, setName] = useState("");
-  const [email, setEmail] = useState("");
-  const [password, setPassword] = useState("");
-  const [confirm, setConfirm] = useState("");
-  const [error, setError] = useState("");
-  const [busy, setBusy] = useState(false);
-
-  async function submit() {
-    setError("");
-    if (!email.trim() || !password) {
-      setError("Enter your email and password.");
-      return;
-    }
-    if (mode === "signup" && password.length < 6) {
-      setError("Password must be at least 6 characters.");
-      return;
-    }
-    if (mode === "signup" && password !== confirm) {
-      setError("Passwords don't match — please retype them.");
-      return;
-    }
-    setBusy(true);
-    try {
-      if (mode === "signup") {
-        const res = await fetch("/api/signup", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ name, email, password }),
-        });
-        if (!res.ok) {
-          const d = await res.json().catch(() => ({}));
-          setError(d.error || "Could not create your account.");
-          setBusy(false);
-          return;
-        }
-      }
-      const result = await signIn("credentials", {
-        email,
-        password,
-        redirect: false,
-      });
-      if (result?.error) {
-        setError(
-          mode === "login"
-            ? "Wrong email or password."
-            : "Account created, but sign-in failed — try logging in.",
-        );
-        setBusy(false);
-        return;
-      }
-      window.location.href = "/"; // signed in → load the app
-    } catch {
-      setError("Something went wrong. Please try again.");
-      setBusy(false);
-    }
-  }
-
-  return (
-    <main style={demoStyles.page}>
-      <section style={demoStyles.hero}>
-        <div style={demoStyles.heroCopy}>
-          <h1 style={demoStyles.heroTitle}>Eliora 🌱</h1>
-          <p style={demoStyles.heroTagline}>
-            Your focus &amp; study coach. Chat with an AI coach, build a plan
-            that fits your life, and turn big goals into small daily wins —
-            with streaks, badges, and rewards to keep you going.
-          </p>
-          <div style={demoStyles.heroChips}>
-            <span style={demoStyles.heroChip}>💬 AI coach</span>
-            <span style={demoStyles.heroChip}>✅ Daily tasks</span>
-            <span style={demoStyles.heroChip}>🔥 Streaks</span>
-            <span style={demoStyles.heroChip}>📇 Flashcards</span>
-            <span style={demoStyles.heroChip}>🎓 4-year plan</span>
-          </div>
-          <a href="#demos" style={demoStyles.heroScrollHint}>
-            See every feature in action ↓
-          </a>
-        </div>
-        <div style={styles.loginCard}>
-          <h2 style={{ margin: 0, fontSize: 22 }}>
-            {mode === "login" ? "Welcome back" : "Get started"}
-          </h2>
-          <p style={styles.loginIntro}>
-            {mode === "login"
-              ? "Log in to pick up where you left off."
-              : "Create an account to save your plan, chats, and progress."}
-          </p>
-
-        {mode === "signup" && (
-          <input
-            style={styles.loginInput}
-            placeholder="Your name (optional)"
-            value={name}
-            onChange={(e) => setName(e.target.value)}
-          />
-        )}
-        <input
-          style={styles.loginInput}
-          type="email"
-          placeholder="Email"
-          value={email}
-          autoComplete="email"
-          onChange={(e) => setEmail(e.target.value)}
-          onKeyDown={(e) => {
-            if (e.key === "Enter") submit();
-          }}
-        />
-        <input
-          style={styles.loginInput}
-          type="password"
-          placeholder={mode === "signup" ? "Password (6+ characters)" : "Password"}
-          value={password}
-          autoComplete={mode === "login" ? "current-password" : "new-password"}
-          onChange={(e) => setPassword(e.target.value)}
-          onKeyDown={(e) => {
-            if (e.key === "Enter") submit();
-          }}
-        />
-        {mode === "signup" && (
-          <input
-            style={styles.loginInput}
-            type="password"
-            placeholder="Confirm password"
-            value={confirm}
-            autoComplete="new-password"
-            onChange={(e) => setConfirm(e.target.value)}
-            onKeyDown={(e) => {
-              if (e.key === "Enter") submit();
-            }}
-          />
-        )}
-
-        {error && <p style={styles.loginError}>{error}</p>}
-
-        <button style={styles.loginSubmit} disabled={busy} onClick={submit}>
-          {busy ? "…" : mode === "login" ? "Log in" : "Create account"}
-        </button>
-
-        <p style={styles.loginToggle}>
-          {mode === "login" ? "New here? " : "Already have an account? "}
-          <span
-            style={styles.loginToggleLink}
-            onClick={() => {
-              setMode(mode === "login" ? "signup" : "login");
-              setConfirm("");
-              setError("");
-            }}
-          >
-            {mode === "login" ? "Create an account" : "Log in"}
-          </span>
-        </p>
-
-        <div style={styles.loginDivider}>
-          <span style={styles.loginDividerText}>or</span>
-        </div>
-
-        <button
-          style={styles.googleBtn}
-          onClick={() => signIn("google", { callbackUrl: "/" })}
-        >
-          <span style={styles.googleG} aria-hidden>
-            G
-          </span>
-          Continue with Google
-        </button>
-        </div>
-      </section>
-
-      <LandingDemos />
-    </main>
-  );
-}
-
-// --- Study Together ----------------------------------------------------------
-// Shared study rooms: focus alongside other learners with a synced pomodoro,
-// live presence, and a lightweight room chat. Eliora has no realtime backend,
-// so the client polls /api/rooms/[code] a few times a second and derives the
-// countdown locally from the server clock (mirrors @eliora/shared TogetherRoom).
-type TogetherTimerMode = "focus" | "break" | "idle";
-type TogetherTimer = {
-  mode: TogetherTimerMode;
-  running: boolean;
-  startedAt?: number;
-  durationSec: number;
-  remainingSec?: number;
-  updatedBy?: string;
-};
-type TogetherMember = { id: string; name: string; lastSeen: number };
-type TogetherMessage = {
-  id: string;
-  memberId: string;
-  name: string;
-  text: string;
-  at: number;
-};
-type TogetherRoom = {
-  code: string;
-  name: string;
-  topic?: string;
-  createdAt: number;
-  timer: TogetherTimer;
-  members: TogetherMember[];
-  messages: TogetherMessage[];
-};
-
-const TOGETHER_FOCUS_SEC = 25 * 60;
-const TOGETHER_BREAK_SEC = 5 * 60;
-const TOGETHER_PRESENCE_MS = 20_000;
+// Stable per-device id for Eliora's social features (doubts board, shared
+// folders): one id per browser, minted on first use. The key predates the
+// removal of study rooms, so existing identities carry over.
 const TOGETHER_ID_KEY = "eliora-together-id";
-const TOGETHER_LAST_KEY = "eliora-together-last";
 
-function togetherRemaining(timer: TogetherTimer, now: number): number {
-  if (timer.mode === "idle") return 0;
-  if (!timer.running) return timer.remainingSec ?? timer.durationSec;
-  if (!timer.startedAt) return timer.durationSec;
-  return Math.max(0, timer.durationSec - Math.floor((now - timer.startedAt) / 1000));
-}
-function togetherClock(sec: number): string {
-  const s = Math.max(0, Math.floor(sec));
-  return `${Math.floor(s / 60)}:${(s % 60).toString().padStart(2, "0")}`;
-}
-
-function StudyTogether({ name }: { name: string }) {
-  // Two halves: live rooms (focus alongside someone right now) and the doubts
-  // board (ask a question, get answered later). Rooms keep polling in the
-  // background while you're reading doubts, so switching tabs doesn't drop you
-  // out of a session.
-  const [view, setView] = useState<"rooms" | "doubts">("rooms");
-  const [room, setRoom] = useState<TogetherRoom | null>(null);
-  const [now, setNow] = useState(() => Date.now());
-  const [busy, setBusy] = useState(false);
-  const [err, setErr] = useState("");
-  const [createTopic, setCreateTopic] = useState("");
-  const [joinCode, setJoinCode] = useState("");
-  const [draft, setDraft] = useState("");
-  const [copied, setCopied] = useState(false);
-  const memberIdRef = useRef<string>("");
-  const chatEndRef = useRef<HTMLDivElement | null>(null);
-
-  // Stable per-device member id + auto-rejoin the last room.
-  useEffect(() => {
-    let id = localStorage.getItem(TOGETHER_ID_KEY);
-    if (!id) {
-      id =
-        typeof crypto !== "undefined" && crypto.randomUUID
-          ? crypto.randomUUID()
-          : `m-${Date.now()}-${Math.floor(Math.random() * 1e9)}`;
-      localStorage.setItem(TOGETHER_ID_KEY, id);
-    }
-    memberIdRef.current = id;
-    const last = localStorage.getItem(TOGETHER_LAST_KEY);
-    if (last) void enter("join", { code: last }, true);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
-
-  // Local 1s tick so the countdown moves smoothly between polls.
-  useEffect(() => {
-    const t = setInterval(() => setNow(Date.now()), 1000);
-    return () => clearInterval(t);
-  }, []);
-
-  // Poll while in a room: refresh presence + pull the latest state.
-  const code = room?.code;
-  useEffect(() => {
-    if (!code) return;
-    let alive = true;
-    async function poll() {
-      try {
-        const res = await fetch(
-          `/api/rooms/${code}?memberId=${encodeURIComponent(
-            memberIdRef.current,
-          )}&name=${encodeURIComponent(name)}`,
-          { cache: "no-store" },
-        );
-        if (!alive) return;
-        if (res.status === 404) {
-          localStorage.removeItem(TOGETHER_LAST_KEY);
-          setRoom(null);
-          setErr("That room has ended.");
-          return;
-        }
-        const data = (await res.json()) as { room?: TogetherRoom };
-        if (data.room) {
-          setRoom(data.room);
-          setNow(Date.now());
-        }
-      } catch {
-        /* transient — next tick retries */
-      }
-    }
-    void poll();
-    const t = setInterval(poll, 2500);
-    return () => {
-      alive = false;
-      clearInterval(t);
-    };
-  }, [code, name]);
-
-  // Keep the chat pinned to the newest message.
-  useEffect(() => {
-    chatEndRef.current?.scrollIntoView({ block: "end" });
-  }, [room?.messages.length]);
-
-  async function enter(
-    action: "create" | "join",
-    extra: { name?: string; topic?: string; code?: string },
-    silent = false,
-  ) {
-    if (!silent) {
-      setBusy(true);
-      setErr("");
-    }
-    try {
-      const res = await fetch("/api/rooms", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          action,
-          memberId: memberIdRef.current,
-          memberName: name,
-          ...extra,
-        }),
-      });
-      const data = (await res.json()) as { room?: TogetherRoom; error?: string };
-      if (data.room) {
-        setRoom(data.room);
-        setNow(Date.now());
-        localStorage.setItem(TOGETHER_LAST_KEY, data.room.code);
-        setJoinCode("");
-        setCreateTopic("");
-      } else if (!silent) {
-        setErr(data.error || "Couldn't reach that room — try again.");
-      } else {
-        // A silent auto-rejoin that failed just means the old room is gone.
-        localStorage.removeItem(TOGETHER_LAST_KEY);
-      }
-    } catch {
-      if (!silent) setErr("Couldn't reach the server. Please try again.");
-    } finally {
-      if (!silent) setBusy(false);
-    }
-  }
-
-  // Fire a room action and adopt the returned state for a snappy response.
-  async function act(body: Record<string, unknown>) {
-    if (!room) return;
-    try {
-      const res = await fetch(`/api/rooms/${room.code}`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          memberId: memberIdRef.current,
-          name,
-          ...body,
-        }),
-      });
-      const data = (await res.json()) as { room?: TogetherRoom };
-      if (data.room) {
-        setRoom(data.room);
-        setNow(Date.now());
-      }
-    } catch {
-      /* the poll loop will reconcile */
-    }
-  }
-
-  function sendChat() {
-    const text = draft.trim();
-    if (!text) return;
-    setDraft("");
-    void act({ action: "message", text });
-  }
-
-  async function leave() {
-    const current = room;
-    localStorage.removeItem(TOGETHER_LAST_KEY);
-    setRoom(null);
-    setDraft("");
-    if (current) {
-      try {
-        await fetch(`/api/rooms/${current.code}`, {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ action: "leave", memberId: memberIdRef.current }),
-        });
-      } catch {
-        /* presence timeout will drop us anyway */
-      }
-    }
-  }
-
-  const tabs = (
-    <div style={styles.tabBar}>
-      {(
-        [
-          ["rooms", "⏱️ Rooms"],
-          ["doubts", "🙋 Doubts"],
-        ] as const
-      ).map(([key, label]) => (
-        <button
-          key={key}
-          style={{
-            ...styles.viewTab,
-            ...(view === key ? styles.viewTabActive : {}),
-          }}
-          onClick={() => setView(key)}
-        >
-          {label}
-        </button>
-      ))}
-    </div>
-  );
-
-  if (view === "doubts") {
-    return (
-      <div style={styles.studyScroll}>
-        {tabs}
-        <DoubtsBoard name={name} />
-      </div>
-    );
-  }
-
-  // ---- Landing: create or join --------------------------------------------
-  if (!room) {
-    return (
-      <div style={styles.studyScroll}>
-        {tabs}
-        <div style={styles.card}>
-          <div style={styles.cardHead}>
-            <span style={styles.cardClass}>👥 Study Together</span>
-          </div>
-          <p style={{ color: "var(--muted)", fontSize: 14.5, margin: "0 0 14px" }}>
-            Focus alongside other learners. Start a room and share the code, or
-            join one — you&apos;ll share a pomodoro timer and a room chat.
-          </p>
-          {err && <div style={tstyles.err}>{err}</div>}
-          <div style={tstyles.landingGrid}>
-            <div style={tstyles.landingCol}>
-              <div style={tstyles.colTitle}>Start a room</div>
-              <input
-                style={styles.input}
-                placeholder="What are you working on? (optional)"
-                value={createTopic}
-                maxLength={120}
-                onChange={(e) => setCreateTopic(e.target.value)}
-                onKeyDown={(e) => {
-                  if (e.key === "Enter")
-                    void enter("create", {
-                      name: `${name.split(" ")[0]}'s room`,
-                      topic: createTopic.trim() || undefined,
-                    });
-                }}
-              />
-              <button
-                style={styles.primaryBtn}
-                disabled={busy}
-                onClick={() =>
-                  void enter("create", {
-                    name: `${name.split(" ")[0]}'s room`,
-                    topic: createTopic.trim() || undefined,
-                  })
-                }
-              >
-                {busy ? "Creating…" : "Create room"}
-              </button>
-            </div>
-            <div style={tstyles.landingCol}>
-              <div style={tstyles.colTitle}>Join a room</div>
-              <input
-                style={{
-                  ...styles.input,
-                  textTransform: "uppercase",
-                  letterSpacing: 2,
-                  fontWeight: 700,
-                }}
-                placeholder="Enter code"
-                value={joinCode}
-                maxLength={6}
-                onChange={(e) =>
-                  setJoinCode(e.target.value.toUpperCase().replace(/[^A-Z0-9]/g, ""))
-                }
-                onKeyDown={(e) => {
-                  if (e.key === "Enter" && joinCode.length === 6)
-                    void enter("join", { code: joinCode });
-                }}
-              />
-              <button
-                style={styles.secondaryBtn}
-                disabled={busy || joinCode.length !== 6}
-                onClick={() => void enter("join", { code: joinCode })}
-              >
-                Join room
-              </button>
-            </div>
-          </div>
-        </div>
-      </div>
-    );
-  }
-
-  // ---- In a room -----------------------------------------------------------
-  const present = room.members
-    .filter((m) => now - m.lastSeen < TOGETHER_PRESENCE_MS)
-    .sort((a, b) => b.lastSeen - a.lastSeen);
-  const remaining = togetherRemaining(room.timer, now);
-  const running = room.timer.running && room.timer.mode !== "idle";
-  const paused = !room.timer.running && room.timer.mode !== "idle";
-  const isFocus = room.timer.mode === "focus";
-  const timeUp = running && remaining <= 0;
-
-  return (
-    <div style={styles.studyScroll}>
-      {tabs}
-      {/* Header */}
-      <div style={styles.card}>
-        <div style={{ ...styles.cardHead, marginBottom: 2 }}>
-          <span style={styles.cardClass}>👥 {room.name}</span>
-          <button style={styles.linkBtn} onClick={() => void leave()}>
-            Leave
-          </button>
-        </div>
-        {room.topic && (
-          <div style={{ color: "var(--muted)", fontSize: 14, marginBottom: 8 }}>
-            {room.topic}
-          </div>
-        )}
-        <div style={tstyles.codeRow}>
-          <span style={{ color: "var(--muted)", fontSize: 13 }}>Room code</span>
-          <button
-            style={tstyles.codeChip}
-            title="Copy code"
-            onClick={async () => {
-              try {
-                await navigator.clipboard.writeText(room.code);
-                setCopied(true);
-                window.setTimeout(() => setCopied(false), 1500);
-              } catch {
-                /* ignore */
-              }
-            }}
-          >
-            {room.code} {copied ? "✓" : "⧉"}
-          </button>
-        </div>
-      </div>
-
-      {/* Shared timer */}
-      <div style={styles.card}>
-        <div style={styles.cardHead}>
-          <span style={styles.cardClass}>⏱️ Shared timer</span>
-          {room.timer.mode !== "idle" && (
-            <span style={tstyles.phasePill(isFocus)}>
-              {isFocus ? "Focus" : "Break"}
-            </span>
-          )}
-        </div>
-        <div style={tstyles.clock(timeUp)}>
-          {timeUp ? "Time's up!" : togetherClock(remaining)}
-        </div>
-        <div style={tstyles.timerBtns}>
-          {room.timer.mode === "idle" || timeUp ? (
-            <>
-              <button
-                style={styles.primaryBtn}
-                onClick={() => void act({ action: "timer", timer: "focus" })}
-              >
-                Start focus · 25m
-              </button>
-              <button
-                style={styles.secondaryBtn}
-                onClick={() => void act({ action: "timer", timer: "break" })}
-              >
-                Break · 5m
-              </button>
-            </>
-          ) : (
-            <>
-              {running ? (
-                <button
-                  style={styles.secondaryBtn}
-                  onClick={() => void act({ action: "timer", timer: "pause" })}
-                >
-                  Pause
-                </button>
-              ) : (
-                <button
-                  style={styles.primaryBtn}
-                  onClick={() => void act({ action: "timer", timer: "resume" })}
-                >
-                  Resume
-                </button>
-              )}
-              <button
-                style={styles.secondaryBtn}
-                onClick={() => void act({ action: "timer", timer: "reset" })}
-              >
-                Reset
-              </button>
-            </>
-          )}
-        </div>
-        {room.timer.updatedBy && (
-          <div style={{ color: "var(--muted)", fontSize: 12, marginTop: 8 }}>
-            {paused ? "Paused" : "Set"} by {room.timer.updatedBy}
-          </div>
-        )}
-      </div>
-
-      {/* Presence */}
-      <div style={styles.card}>
-        <div style={styles.cardHead}>
-          <span style={styles.cardClass}>
-            🟢 Studying now · {present.length}
-          </span>
-        </div>
-        <div style={tstyles.avatars}>
-          {present.map((m) => (
-            <span key={m.id} style={tstyles.avatar} title={m.name}>
-              <span style={tstyles.avatarDot} />
-              {m.name}
-            </span>
-          ))}
-        </div>
-      </div>
-
-      {/* Chat */}
-      <div style={styles.card}>
-        <div style={styles.cardHead}>
-          <span style={styles.cardClass}>💬 Room chat</span>
-        </div>
-        <div style={tstyles.chatLog}>
-          {room.messages.length === 0 ? (
-            <div style={{ color: "var(--muted)", fontSize: 13.5, padding: "8px 2px" }}>
-              Say hi 👋 — messages are visible to everyone in the room.
-            </div>
-          ) : (
-            room.messages.map((m) => {
-              const mine = m.memberId === memberIdRef.current;
-              return (
-                <div
-                  key={m.id}
-                  style={{ ...tstyles.msg, alignItems: mine ? "flex-end" : "flex-start" }}
-                >
-                  <div style={tstyles.msgMeta}>{mine ? "You" : m.name}</div>
-                  <div style={tstyles.msgBubble(mine)}>{m.text}</div>
-                </div>
-              );
-            })
-          )}
-          <div ref={chatEndRef} />
-        </div>
-        <div style={tstyles.chatRow}>
-          <input
-            style={styles.input}
-            placeholder="Message the room…"
-            value={draft}
-            maxLength={500}
-            onChange={(e) => setDraft(e.target.value)}
-            onKeyDown={(e) => {
-              if (e.key === "Enter") sendChat();
-            }}
-          />
-          <button
-            style={styles.primaryBtn}
-            disabled={!draft.trim()}
-            onClick={sendChat}
-          >
-            Send
-          </button>
-        </div>
-      </div>
-    </div>
-  );
-}
-
-// Local styles for Study Together (kept next to the component; reuse the shared
-// CSS variables so it themes with the rest of the app).
+// Local styles shared by the doubts board and shared-folder panels (reuse the
+// shared CSS variables so they theme with the rest of the app).
 const tstyles = {
   err: {
     background: "var(--assistant-bubble)",
@@ -16747,98 +20686,35 @@ const tstyles = {
     padding: "6px 14px",
     cursor: "pointer",
   } as React.CSSProperties,
-  clock: (up: boolean): React.CSSProperties => ({
-    fontSize: up ? 34 : 52,
-    fontWeight: 800,
-    textAlign: "center",
-    fontVariantNumeric: "tabular-nums",
-    color: up ? "var(--accent)" : "var(--assistant-text)",
-    padding: "10px 0 14px",
-    letterSpacing: 1,
-  }),
-  phasePill: (focus: boolean): React.CSSProperties => ({
-    fontSize: 12,
-    fontWeight: 700,
-    padding: "3px 10px",
-    borderRadius: 999,
-    color: "#fff",
-    background: focus ? "var(--accent)" : "#3b9e6f",
-  }),
-  timerBtns: {
-    display: "flex",
-    gap: 10,
-    justifyContent: "center",
-    flexWrap: "wrap",
-  } as React.CSSProperties,
-  avatars: { display: "flex", flexWrap: "wrap", gap: 8 } as React.CSSProperties,
-  avatar: {
-    display: "inline-flex",
-    alignItems: "center",
-    gap: 6,
-    background: "var(--assistant-bubble)",
-    border: "1px solid var(--border)",
-    borderRadius: 999,
-    padding: "5px 12px 5px 10px",
-    fontSize: 13.5,
-    fontWeight: 600,
-    color: "var(--assistant-text)",
-  } as React.CSSProperties,
-  avatarDot: {
-    width: 8,
-    height: 8,
-    borderRadius: 999,
-    background: "#37b26b",
-    display: "inline-block",
-  } as React.CSSProperties,
-  chatLog: {
-    display: "flex",
-    flexDirection: "column",
-    gap: 10,
-    maxHeight: 300,
-    overflowY: "auto",
-    padding: "4px 2px 10px",
-  } as React.CSSProperties,
-  msg: { display: "flex", flexDirection: "column", gap: 2 } as React.CSSProperties,
-  msgMeta: { fontSize: 11, color: "var(--muted)", padding: "0 6px" } as React.CSSProperties,
-  msgBubble: (mine: boolean): React.CSSProperties => ({
-    maxWidth: "80%",
-    padding: "8px 12px",
-    borderRadius: 14,
-    fontSize: 14.5,
-    lineHeight: 1.4,
-    whiteSpace: "pre-wrap",
-    wordBreak: "break-word",
-    color: mine ? "#fff" : "var(--assistant-text)",
-    background: mine ? "var(--accent)" : "var(--assistant-bubble)",
-  }),
-  chatRow: { display: "flex", gap: 8, marginTop: 10 } as React.CSSProperties,
 };
 
 // --- Doubts board -------------------------------------------------------------
-// The asynchronous half of Study Together: post what you're stuck on with your
-// working shown, and other learners answer in a Reddit-style thread — nested
-// replies, up/down votes, and the asker marks the answer that unstuck them.
+// Post what you're stuck on with your working shown, and other learners answer
+// in a Reddit-style thread — nested replies, up/down votes, and the asker
+// marks the answer that unstuck them.
 //
 // Two scopes: the global feed (everyone on Eliora) or a private group you join
 // with a code. Group codes live in localStorage, so "my groups" is per-device
-// exactly like the room id — knowing the code is membership.
+// exactly like the member id — knowing the code is membership.
 //
-// Types and the pure ranking/threading helpers come from @eliora/shared; unlike
-// StudyTogether above (which predates them) this imports them directly rather
-// than keeping client-side copies.
+// Types and the pure ranking/threading helpers come from @eliora/shared,
+// imported directly rather than kept as client-side copies.
 type DoubtGroupRef = { code: string; name: string };
 
 const DOUBT_GROUPS_KEY = "eliora-doubt-groups";
 const DOUBT_SCOPE_KEY = "eliora-doubt-scope";
 
 function DoubtsBoard({ name }: { name: string }) {
-  // Per-device id, shared with Study Together so your posts and your room
-  // presence are the same "you".
+  // Per-device id, shared with the other social features so your posts and
+  // your folder presence are the same "you".
   const [memberId, setMemberId] = useState("");
   const [groups, setGroups] = useState<DoubtGroupRef[]>([]);
   const [scope, setScope] = useState<string>(DOUBT_GLOBAL_SCOPE);
   const [doubts, setDoubts] = useState<Doubt[]>([]);
   const [sort, setSort] = useState<DoubtSort>("top");
+  // Whether the feed is showing everything, only open questions, or only the
+  // fixes people have written up.
+  const [view, setView] = useState<DoubtView>("all");
   const [loaded, setLoaded] = useState(false);
   const [err, setErr] = useState("");
   const [now, setNow] = useState(() => Date.now());
@@ -16852,8 +20728,10 @@ function DoubtsBoard({ name }: { name: string }) {
   const [replyWork, setReplyWork] = useState("");
   const [replyShowWork, setReplyShowWork] = useState(false);
 
-  // The "ask a doubt" composer.
+  // The composer, in one of two modes: asking a question, or writing up a
+  // problem you already cracked so the next person hitting it finds the fix.
   const [asking, setAsking] = useState(false);
+  const [composerKind, setComposerKind] = useState<DoubtKind>("question");
   const [title, setTitle] = useState("");
   const [subject, setSubject] = useState("");
   const [body, setBody] = useState("");
@@ -16907,8 +20785,8 @@ function DoubtsBoard({ name }: { name: string }) {
     localStorage.setItem(DOUBT_SCOPE_KEY, next);
   }, []);
 
-  // Poll the feed. Slower than a study room (2.5s) — a doubts board is
-  // asynchronous by nature, so every few seconds is plenty. Reading is
+  // Poll the feed. A doubts board is asynchronous by nature, so every few
+  // seconds is plenty. Reading is
   // anonymous; memberId only decides which posts render as "You".
   useEffect(() => {
     let alive = true;
@@ -16970,10 +20848,15 @@ function DoubtsBoard({ name }: { name: string }) {
 
   async function submitAsk() {
     if (!title.trim() || busy) return;
+    if (composerKind === "solved" && !work.trim()) {
+      setErr("Add the steps you took — that's the part people need.");
+      return;
+    }
     setBusy(true);
     setErr("");
     const ok = await act({
       action: "ask",
+      kind: composerKind,
       title,
       subject: subject.trim() || undefined,
       text: body,
@@ -16981,14 +20864,41 @@ function DoubtsBoard({ name }: { name: string }) {
     });
     setBusy(false);
     if (ok) {
-      setAsking(false);
-      setTitle("");
-      setSubject("");
-      setBody("");
-      setWork("");
-      // A brand-new doubt has no votes, so it only shows up under "New".
+      closeComposer();
+      // A brand-new post has no votes, so it only shows up under "New" — and
+      // make sure the filter it landed in is the one being shown.
       setSort("new");
+      setView("all");
     }
+  }
+
+  function openComposer(kind: DoubtKind) {
+    setComposerKind(kind);
+    setAsking(true);
+    setErr("");
+  }
+
+  function closeComposer() {
+    setAsking(false);
+    setTitle("");
+    setSubject("");
+    setBody("");
+    setWork("");
+  }
+
+  // "You solved it — share how." Turns your own answered question into a draft
+  // fix, seeded with the reply you marked as the one that unstuck you, so
+  // writing it up is an edit rather than a blank page.
+  function draftFixFrom(d: Doubt) {
+    const accepted = d.replies.find((r) => r.id === d.solvedReplyId);
+    const steps = [accepted?.text, accepted?.work].filter(Boolean).join("\n\n");
+    setComposerKind("solved");
+    setTitle(d.title);
+    setSubject(d.subject ?? "");
+    setBody(d.body);
+    setWork(steps || d.work || "");
+    setAsking(true);
+    setErr("");
   }
 
   async function submitReply() {
@@ -17090,9 +21000,56 @@ function DoubtsBoard({ name }: { name: string }) {
   }
 
   const activeGroup = groups.find((g) => g.code === scope) ?? null;
-  const visible = sortDoubts(doubts, sort);
+  const visible = sortDoubts(filterDoubts(doubts, view), sort);
   const helps = countDoubtHelps(doubts, memberId);
-  const unanswered = doubts.filter((d) => d.replies.length === 0).length;
+  const fixesShared = countDoubtFixes(doubts, memberId);
+  const questionCount = doubts.filter((d) => doubtKind(d) === "question").length;
+  const fixCount = doubts.length - questionCount;
+  const unanswered = doubts.filter(
+    (d) => d.replies.length === 0 && doubtKind(d) === "question",
+  ).length;
+
+  // While you're typing, look for posts about the same thing — the point of a
+  // shared board is that you find the person who already got past this instead
+  // of waiting for a fresh answer. Matches on the title alone are too thin, so
+  // wait until there's a real line to match against.
+  const draftMatches = useMemo(
+    () =>
+      asking && title.trim().length >= 8
+        ? findSimilarDoubts(doubts, `${title} ${subject} ${body}`, { limit: 3 })
+        : [],
+    [asking, title, subject, body, doubts],
+  );
+
+  // Under the open question, what other people did about the same thing — the
+  // shortcut past waiting for a fresh answer. Computed once per open thread,
+  // not on every keystroke elsewhere in the panel.
+  const openDoubt = openId ? doubts.find((d) => d.id === openId) ?? null : null;
+  const openRelated = useMemo(
+    () =>
+      openDoubt && doubtKind(openDoubt) !== "solved"
+        ? findSimilarDoubts(
+            doubts,
+            `${openDoubt.title} ${openDoubt.subject ?? ""} ${openDoubt.body}`,
+            { kind: "solved", excludeId: openDoubt.id, limit: 3 },
+          )
+        : [],
+    [doubts, openDoubt],
+  );
+
+  // Jump from a match straight into that thread.
+  function openMatch(id: string) {
+    setOpenId(id);
+    setAsking(false);
+  }
+
+  function pickView(next: DoubtView) {
+    setView(next);
+    setOpenId(null);
+    // "Unanswered" only ever holds questions, so it would render an empty feed
+    // under the fixes filter.
+    if (next === "solved" && sort === "unanswered") setSort("top");
+  }
 
   function cancelReply() {
     setReplyTo(null);
@@ -17128,11 +21085,15 @@ function DoubtsBoard({ name }: { name: string }) {
               ⭐ Helped {helps}
             </span>
           )}
+          {fixesShared > 0 && (
+            <span style={dstyles.karma} title="Problems you've written up for others">
+              💡 Shared {fixesShared}
+            </span>
+          )}
         </div>
-        <p style={{ color: "var(--muted)", fontSize: 14.5, margin: "0 0 12px" }}>
-          Stuck on something? Post it with what you&apos;ve already tried, and
-          other learners answer in a thread. Help someone else and they can mark
-          your answer as the one that unstuck them.
+        <p style={{ color: "var(--muted)", fontSize: 13.5, margin: "0 0 10px" }}>
+          Ask what you&apos;re stuck on, or share a fix so the next person finds
+          it.
         </p>
         <div style={dstyles.scopeRow}>
           <button
@@ -17244,19 +21205,40 @@ function DoubtsBoard({ name }: { name: string }) {
         {err && <div style={{ ...tstyles.err, marginTop: 12, marginBottom: 0 }}>{err}</div>}
       </div>
 
-      {/* Ask */}
+      {/* Compose: a question, or a problem you already solved */}
       <div style={styles.card}>
         {asking ? (
           <>
             <div style={styles.cardHead}>
               <span style={styles.cardClass}>
-                Ask {activeGroup ? activeGroup.name : "everyone"}
+                {composerKind === "solved" ? "Share a fix with" : "Ask"}{" "}
+                {activeGroup ? activeGroup.name : "everyone"}
               </span>
+            </div>
+            <div style={dstyles.scopeRow}>
+              {(
+                [
+                  ["question", "🙋 I'm stuck"],
+                  ["solved", "💡 I solved this"],
+                ] as const
+              ).map(([key, label]) => (
+                <button
+                  key={key}
+                  style={dstyles.scopeChip(composerKind === key)}
+                  onClick={() => setComposerKind(key)}
+                >
+                  {label}
+                </button>
+              ))}
             </div>
             <div style={dstyles.composer}>
               <input
                 style={styles.input}
-                placeholder="What are you stuck on? (one line)"
+                placeholder={
+                  composerKind === "solved"
+                    ? "What was the problem? (one line, the way someone stuck would search it)"
+                    : "What are you stuck on? (one line)"
+                }
                 value={title}
                 maxLength={DOUBT_TITLE_MAX}
                 autoFocus
@@ -17271,7 +21253,11 @@ function DoubtsBoard({ name }: { name: string }) {
               />
               <textarea
                 style={{ ...styles.input, minHeight: 90 }}
-                placeholder="Give the full question and where exactly it stops making sense…"
+                placeholder={
+                  composerKind === "solved"
+                    ? "What made it hard, and what threw you off at first…"
+                    : "Give the full question and where exactly it stops making sense…"
+                }
                 value={body}
                 maxLength={DOUBT_BODY_MAX}
                 onChange={(e) => setBody(e.target.value)}
@@ -17282,42 +21268,117 @@ function DoubtsBoard({ name }: { name: string }) {
                   minHeight: 90,
                   fontFamily: "ui-monospace, Menlo, monospace",
                 }}
-                placeholder={"What you've tried so far (optional but you'll get better answers)…\n1) …\n2) …"}
+                placeholder={
+                  composerKind === "solved"
+                    ? "How you solved it — the actual steps…\n1) …\n2) …"
+                    : "What you've tried so far (optional but you'll get better answers)…\n1) …\n2) …"
+                }
                 value={work}
                 maxLength={DOUBT_WORK_MAX}
                 onChange={(e) => setWork(e.target.value)}
               />
+
+              {/* Someone may already have been here */}
+              {draftMatches.length > 0 && (
+                <div style={dstyles.relatedBox}>
+                  <div style={dstyles.workLabel}>
+                    {composerKind === "solved"
+                      ? "People asking about this — your write-up will show up for them"
+                      : "Someone may have hit this already"}
+                  </div>
+                  {draftMatches.map((m) => (
+                    <button
+                      key={m.doubt.id}
+                      style={dstyles.relatedItem}
+                      onClick={() => openMatch(m.doubt.id)}
+                    >
+                      {doubtKind(m.doubt) === "solved" ? "💡" : "🙋"} {m.doubt.title}
+                      <span style={dstyles.relatedMeta}>
+                        {doubtKind(m.doubt) === "solved"
+                          ? "a shared fix"
+                          : m.doubt.solvedReplyId
+                            ? "answered"
+                            : `${m.doubt.replies.length} ${
+                                m.doubt.replies.length === 1 ? "answer" : "answers"
+                              }`}
+                      </span>
+                    </button>
+                  ))}
+                </div>
+              )}
+
               <div style={dstyles.composerBtns}>
                 <button
                   style={styles.primaryBtn}
-                  disabled={busy || !title.trim()}
+                  disabled={
+                    busy ||
+                    !title.trim() ||
+                    (composerKind === "solved" && !work.trim())
+                  }
                   onClick={() => void submitAsk()}
                 >
-                  {busy ? "Posting…" : "Post doubt"}
+                  {busy
+                    ? "Posting…"
+                    : composerKind === "solved"
+                      ? "Share the fix"
+                      : "Post doubt"}
                 </button>
-                <button style={styles.secondaryBtn} onClick={() => setAsking(false)}>
+                <button style={styles.secondaryBtn} onClick={closeComposer}>
                   Cancel
                 </button>
               </div>
             </div>
           </>
         ) : (
-          <button style={dstyles.askBtn} onClick={() => setAsking(true)}>
-            🙋 Ask a doubt{activeGroup ? ` in ${activeGroup.name}` : ""}…
-          </button>
+          <div style={dstyles.composerBtns}>
+            <button
+              style={{ ...dstyles.askBtn, flex: 1 }}
+              onClick={() => openComposer("question")}
+            >
+              🙋 Ask a doubt{activeGroup ? ` in ${activeGroup.name}` : ""}…
+            </button>
+            <button
+              style={{ ...dstyles.askBtn, flex: 1 }}
+              onClick={() => openComposer("solved")}
+              title="Post a problem you cracked, and how"
+            >
+              💡 Share something you solved…
+            </button>
+          </div>
         )}
       </div>
 
       {/* Feed */}
       <div style={styles.card}>
+        <div style={{ ...dstyles.scopeRow, marginBottom: 10 }}>
+          {(
+            [
+              ["all", `🗂 Everything · ${doubts.length}`],
+              ["question", `🙋 Questions · ${questionCount}`],
+              ["solved", `💡 Shared fixes · ${fixCount}`],
+            ] as const
+          ).map(([key, label]) => (
+            <button
+              key={key}
+              style={dstyles.scopeChip(view === key)}
+              onClick={() => pickView(key)}
+            >
+              {label}
+            </button>
+          ))}
+        </div>
         <div style={styles.tabBar}>
           {(
             [
               ["top", "🔥 Top"],
               ["new", "🕒 New"],
+              // Nothing is ever waiting for an answer under the fixes filter,
+              // so that tab only makes sense on the other two.
               ["unanswered", `🫥 Unanswered${unanswered ? ` · ${unanswered}` : ""}`],
-            ] as const
-          ).map(([key, label]) => (
+            ] as [DoubtSort, string][]
+          )
+            .filter(([key]) => key !== "unanswered" || view !== "solved")
+            .map(([key, label]) => (
             <button
               key={key}
               style={{
@@ -17337,9 +21398,11 @@ function DoubtsBoard({ name }: { name: string }) {
           <p style={{ color: "var(--muted)", fontSize: 14 }}>
             {sort === "unanswered"
               ? "Nothing unanswered right now — everyone's been helped 🎉"
-              : activeGroup
-                ? `No doubts in ${activeGroup.name} yet. Be the first to ask.`
-                : "No doubts yet. Ask the first one — someone will pick it up."}
+              : view === "solved"
+                ? "No write-ups yet. Cracked something hard lately? Share it and save someone the same struggle."
+                : activeGroup
+                  ? `No doubts in ${activeGroup.name} yet. Be the first to ask.`
+                  : "No doubts yet. Ask the first one — someone will pick it up."}
           </p>
         ) : (
           <div style={dstyles.feed}>
@@ -17348,13 +21411,18 @@ function DoubtsBoard({ name }: { name: string }) {
               const mine = d.authorId === memberId;
               const vote = myVote(d.votes, memberId);
               const solved = Boolean(d.solvedReplyId);
+              // A shared fix reads differently from a question: replies are
+              // comments, the working-out is the solution, and nobody is
+              // waiting on an answer.
+              const isFix = doubtKind(d) === "solved";
+              const related = open && !isFix ? openRelated : [];
               return (
                 <div key={d.id} style={dstyles.post(open)}>
                   <div style={dstyles.replyRow}>
                     <div style={dstyles.voteCol}>
                       <button
                         style={dstyles.arrow(vote === 1)}
-                        title="Good question"
+                        title={isFix ? "This helped" : "Good question"}
                         disabled={mine}
                         onClick={() =>
                           void act({ action: "vote", doubtId: d.id, value: 1 })
@@ -17383,13 +21451,22 @@ function DoubtsBoard({ name }: { name: string }) {
                       </button>
                       <div style={dstyles.byline}>
                         {d.subject && <span style={dstyles.subjectPill}>{d.subject}</span>}
+                        {isFix && <span style={dstyles.fixPill}>💡 Solved & shared</span>}
                         {solved && <span style={dstyles.solvedPill}>✓ Solved</span>}
                         <span>
                           {mine ? "You" : d.authorName} · {doubtAgo(d.createdAt, now)} ·{" "}
                           {d.replies.length === 0
-                            ? "no answers yet"
+                            ? isFix
+                              ? "no comments yet"
+                              : "no answers yet"
                             : `${d.replies.length} ${
-                                d.replies.length === 1 ? "answer" : "answers"
+                                isFix
+                                  ? d.replies.length === 1
+                                    ? "comment"
+                                    : "comments"
+                                  : d.replies.length === 1
+                                    ? "answer"
+                                    : "answers"
                               }`}
                         </span>
                       </div>
@@ -17399,10 +21476,37 @@ function DoubtsBoard({ name }: { name: string }) {
                           {d.body && <div style={dstyles.bodyText}>{d.body}</div>}
                           {d.work && (
                             <div style={dstyles.workBlock}>
-                              <div style={dstyles.workLabel}>What they&apos;ve tried</div>
+                              <div style={dstyles.workLabel}>
+                                {isFix
+                                  ? "How they solved it"
+                                  : "What they've tried"}
+                              </div>
                               {d.work}
                             </div>
                           )}
+
+                          {related.length > 0 && (
+                            <div style={dstyles.relatedBox}>
+                              <div style={dstyles.workLabel}>
+                                Someone else got past this
+                              </div>
+                              {related.map((m) => (
+                                <button
+                                  key={m.doubt.id}
+                                  style={dstyles.relatedItem}
+                                  onClick={() => setOpenId(m.doubt.id)}
+                                >
+                                  💡 {m.doubt.title}
+                                  <span style={dstyles.relatedMeta}>
+                                    by {m.doubt.authorId === memberId
+                                      ? "you"
+                                      : m.doubt.authorName}
+                                  </span>
+                                </button>
+                              ))}
+                            </div>
+                          )}
+
                           <div style={dstyles.actionRow}>
                             <button
                               style={styles.linkBtn}
@@ -17416,8 +21520,21 @@ function DoubtsBoard({ name }: { name: string }) {
                             >
                               {replyTo?.doubtId === d.id && !replyTo.parentId
                                 ? "Cancel"
-                                : "Answer this"}
+                                : isFix
+                                  ? "Add a comment"
+                                  : "Answer this"}
                             </button>
+                            {/* Your own question, now answered — pass the fix
+                                on so the next person doesn't have to ask. */}
+                            {mine && !isFix && (solved || d.replies.length > 0) && (
+                              <button
+                                style={styles.linkBtn}
+                                onClick={() => draftFixFrom(d)}
+                                title="Write this up as a shared fix"
+                              >
+                                💡 Share how you solved it
+                              </button>
+                            )}
                             {mine && (
                               <button
                                 style={styles.linkBtn}
@@ -17552,6 +21669,7 @@ function DoubtBranch({
 }) {
   const r = node.reply;
   const mine = r.authorId === memberId;
+  const fromEliora = r.authorId === ELIORA_BOT_ID;
   const accepted = doubt.solvedReplyId === r.id;
   const vote = myVote(r.votes, memberId);
   const composing = replyTo?.doubtId === doubt.id && replyTo.parentId === r.id;
@@ -17587,6 +21705,7 @@ function DoubtBranch({
             <strong style={{ color: mine ? "var(--accent)" : "var(--text)" }}>
               {mine ? "You" : r.authorName}
             </strong>
+            {fromEliora && <span style={dstyles.aiPill}>✦ AI</span>}
             {r.authorId === doubt.authorId && <span style={dstyles.opPill}>asker</span>}
             {accepted && <span style={dstyles.solvedPill}>✓ This helped</span>}
             <span>· {doubtAgo(r.at, now)}</span>
@@ -17594,7 +21713,9 @@ function DoubtBranch({
           {r.text && <div style={dstyles.replyText}>{r.text}</div>}
           {r.work && (
             <div style={dstyles.workBlock}>
-              <div style={dstyles.workLabel}>Their working</div>
+              <div style={dstyles.workLabel}>
+                {fromEliora ? "A parallel example, worked through" : "Their working"}
+              </div>
               {r.work}
             </div>
           )}
@@ -17788,11 +21909,29 @@ const dstyles = {
     borderRadius: 999,
     padding: "2px 8px",
   } as React.CSSProperties,
-  opPill: {
+  // A shared write-up, as opposed to a question someone answered.
+  fixPill: {
     fontSize: 11,
     fontWeight: 700,
     color: "#fff",
+    background: "#c88a2e",
+    borderRadius: 999,
+    padding: "2px 8px",
+  } as React.CSSProperties,
+  opPill: {
+    fontSize: 11,
+    fontWeight: 700,
+    color: "var(--primary-foreground)",
     background: "var(--accent)",
+    borderRadius: 999,
+    padding: "2px 8px",
+  } as React.CSSProperties,
+  // Eliora's replies — she answers the board too.
+  aiPill: {
+    fontSize: 11,
+    fontWeight: 700,
+    color: "#fff",
+    background: "#7c5cd6",
     borderRadius: 999,
     padding: "2px 8px",
   } as React.CSSProperties,
@@ -17839,6 +21978,38 @@ const dstyles = {
     flexWrap: "wrap",
     marginTop: 8,
   } as React.CSSProperties,
+  // "Someone else got past this" — posts about the same thing, shown while you
+  // type a doubt and under an open question.
+  relatedBox: {
+    display: "flex",
+    flexDirection: "column",
+    gap: 4,
+    background: "var(--assistant-bubble)",
+    border: "1px dashed var(--border-strong)",
+    borderRadius: 10,
+    padding: "10px 12px",
+    marginTop: 10,
+  } as React.CSSProperties,
+  relatedItem: {
+    display: "flex",
+    alignItems: "baseline",
+    gap: 8,
+    background: "transparent",
+    border: "none",
+    padding: "3px 0",
+    textAlign: "left",
+    fontSize: 13.5,
+    fontWeight: 600,
+    lineHeight: 1.4,
+    color: "var(--accent)",
+    cursor: "pointer",
+  } as React.CSSProperties,
+  relatedMeta: {
+    fontSize: 11.5,
+    fontWeight: 500,
+    color: "var(--muted)",
+    whiteSpace: "nowrap",
+  } as React.CSSProperties,
   thread: {
     marginTop: 12,
     paddingTop: 10,
@@ -17860,8 +22031,8 @@ const dstyles = {
 };
 
 // ---------------------------------------------------------------------------
-// Shared folder — a study space two friends keep in sync (client-side copies of
-// the @eliora/shared types, matching how StudyTogether above keeps its own).
+// Shared folder — a study space two friends keep in sync (keeps client-side
+// copies of the @eliora/shared types rather than importing them).
 // Friends share the join code and stock the folder with upcoming tests,
 // projects, assignments, and notes; everyone can add, tick off, and remove.
 // ---------------------------------------------------------------------------
@@ -17960,7 +22131,7 @@ function SharedFolder({ name }: { name: string }) {
   const [draftDetails, setDraftDetails] = useState("");
   const memberIdRef = useRef<string>("");
 
-  // Stable per-device member id (shared with Study Together) + auto-rejoin.
+  // Stable per-device member id (shared with the doubts board) + auto-rejoin.
   useEffect(() => {
     let id = localStorage.getItem(TOGETHER_ID_KEY);
     if (!id) {
@@ -18533,16 +22704,13 @@ function ElioraApp() {
   const MONTHLY_REPORTS_KEY = `eliora-monthly-reports::${ns}`; // AI monthly recaps, keyed YYYY-MM
   const WEEKLY_REPORTS_KEY = `eliora-weekly-reports::${ns}`; // AI weekly recaps, keyed by Monday's YYYY-MM-DD
   const TIME_MGMT_KEY = `eliora-timemgmt::${ns}`;
-  const PROGRESS_KEY = `eliora-progress::${ns}`;
   const STUDY_KEY = `eliora-study-minutes::${ns}`; // minutes studied per day
-  const ROOM_KEY = `eliora-room::${ns}`;
-  const CUSTOM_REWARDS_KEY = `eliora-custom-rewards::${ns}`; // learner's own rewards
-  const SPENT_KEY = `eliora-spent-xp::${ns}`; // XP spent redeeming custom rewards
   const A11Y_KEY = `eliora-a11y::${ns}`;
   const CHAT_FOLDERS_KEY = `eliora-chat-folders::${ns}`;
   const DAILY_KEY = `eliora-daily::${ns}`; // today's auto-generated tasks
-  const BADGES_KEY = `eliora-badges::${ns}`; // badge ids already rewarded
   const SCHEDULE_KEY = `eliora-schedule::${ns}`; // today's 9am–9pm schedule
+  const REMIND_KEY = `eliora-block-reminders::${ns}`; // nudge me when a block starts
+  const NUDGED_KEY = `eliora-nudged-blocks::${ns}`; // blocks already called out today
   const HOMETIME_KEY = `eliora-hometime::${ns}`; // hour the learner gets home
   const MUSIC_KEY = `eliora-music::${ns}`; // connected focus-music playlists
   const TUTOR_KEY = `eliora-tutor::${ns}`; // the AI tutor persona they picked
@@ -18575,6 +22743,12 @@ function ElioraApp() {
       }),
     );
   };
+  // The "first session": the oldest conversation where they actually worked on
+  // something. Chats are appended in order, so the first with two real turns is
+  // it — a one-line "hi" chat isn't a session anyone could plan from.
+  const firstSession =
+    chats.find((c) => c.messages.filter((m) => m.role === "user").length >= 2) ??
+    null;
   const [editingChatId, setEditingChatId] = useState<string | null>(null);
   const [editTitle, setEditTitle] = useState("");
   function renameChat(id: string, raw: string) {
@@ -18595,6 +22769,12 @@ function ElioraApp() {
   const [mistakes, setMistakes] = useState<Mistake[]>([]);
   const [subjects, setSubjects] = useState<string[]>([]);
   const [assignments, setAssignments] = useState<Assignment[]>([]);
+  // The list as it was before the last change, so any edit — including one
+  // Eliora made — can be taken back. See mutateAssignments/undoAssignments.
+  const [assignUndo, setAssignUndo] = useState<{
+    label: string;
+    list: Assignment[];
+  } | null>(null);
   const [goals, setGoals] = useState<SmartGoal[]>([]);
   const [breakingGoalId, setBreakingGoalId] = useState<string | null>(null);
   const [breakingEventId, setBreakingEventId] = useState<string | null>(null);
@@ -18602,8 +22782,6 @@ function ElioraApp() {
   const [timeMgmt, setTimeMgmt] = useState(false);
   const [reviewFor, setReviewFor] = useState<{ title: string } | null>(null);
   const [feedbackSeed, setFeedbackSeed] = useState("");
-  // Duolingo-style progress: XP earned per day (drives streak + total XP).
-  const [progress, setProgress] = useState<Record<string, number>>({});
   // Real time on task: minutes studied per day (YYYY-MM-DD → minutes), logged
   // when a focus timer runs down. Drives the "hours studied each week" chart.
   const [studyLog, setStudyLog] = useState<Record<string, number>>({});
@@ -18612,21 +22790,31 @@ function ElioraApp() {
     const t = localISO();
     setStudyLog((s) => ({ ...s, [t]: (s[t] || 0) + mins }));
   };
-  const [xpToast, setXpToast] = useState<string | null>(null);
-  const [equippedRoom, setEquippedRoom] = useState("meadow"); // reward background
   const [tutorId, setTutorId] = useState(ELIORA_DEFAULT_TUTOR); // AI tutor persona
+  // The chat is the tutor talking, so it should sound like them — same voice
+  // and manner as their AI Tutor sessions, whether it's read-aloud or a
+  // hands-free conversation.
+  const tutorVoice: SpeechVoice = useMemo(() => {
+    const t = tutorById(tutorId);
+    return {
+      voice: t.voice,
+      pace: t.pace,
+      browser: t.browserVoice,
+      instructions: tutorVoiceDirection(t.id),
+    };
+  }, [tutorId]);
   // The learner's own textbook/handout digests, and the state of a pending read.
   const [materials, setMaterials] = useState<StudyMaterial[]>([]);
   const [materialBusy, setMaterialBusy] = useState<string | null>(null);
   const [materialError, setMaterialError] = useState("");
-  // Learner-created rewards + how much XP they've spent redeeming them.
-  const [customRewards, setCustomRewards] = useState<CustomReward[]>([]);
-  const [spentXp, setSpentXp] = useState(0);
   // Today's tasks: a fresh short list regenerated once per day (keyed on date).
   const [dailyTasks, setDailyTasks] = useState<DailyTasksState | null>(null);
   const [dailyLoading, setDailyLoading] = useState(false);
   // Today's 9am–9pm time-block schedule (resets each new day, like daily tasks).
   const [schedule, setSchedule] = useState<DaySchedule | null>(null);
+  // The repeating week from the Schedule studio. It lives up here because the
+  // Calendar lays the same blocks onto real dates.
+  const [weekSchedule, setWeekSchedule] = useState<WeekSchedule | null>(null);
   const [homeHour, setHomeHour] = useState(16); // when they get home (24h)
   const [generatingSchedule, setGeneratingSchedule] = useState(false);
   // Latest schedule-survey answers: today's study-minute cap and what to focus on.
@@ -18634,6 +22822,23 @@ function ElioraApp() {
     number | undefined
   >(undefined);
   const [scheduleFocusNote, setScheduleFocusNote] = useState("");
+  // Block reminders: when a scheduled block comes around, Eliora nudges the
+  // learner to actually start it. `blockNudge` is the banner showing now,
+  // `nudgedHours` are the blocks already called out today (so a nudge fires
+  // once, not every tick), and `timerRequest` is how the banner's "Start it"
+  // reaches into the schedule's countdown.
+  const [remindOn, setRemindOn] = useState(true);
+  const [blockNudge, setBlockNudge] = useState<{
+    hour: number;
+    text: string;
+    kind: ScheduleKind;
+    min: number;
+  } | null>(null);
+  const [nudgedHours, setNudgedHours] = useState<string[]>([]); // "YYYY-MM-DD:14"
+  const [snoozeUntil, setSnoozeUntil] = useState(0); // epoch ms; 0 = not snoozed
+  const [timerRequest, setTimerRequest] = useState<{ hour: number } | null>(
+    null,
+  );
   // Badge ids the learner has already been rewarded for (so we grant the bonus
   // XP only once, and never retroactively for badges earned before this shipped).
   const [claimedBadges, setClaimedBadges] = useState<string[]>([]);
@@ -18727,13 +22932,21 @@ function ElioraApp() {
     | "plan"
     | "progress"
     | "study"
-    | "together"
+    | "tutor"
     | "folder"
     | "school"
   >("home");
   // Smart Notes holds two tools: the notebook itself and the summarizer, which
   // used to be its own sidebar tab. Sub-tab picks which one is showing.
   const [notesView, setNotesView] = useState<"notes" | "summarize">("notes");
+  // Calendar and the week studio used to be two nav items, which made no sense:
+  // the week the studio draws is what the calendar fills its days with. One tab,
+  // two views — the dates themselves, and the week that repeats behind them.
+  const [calendarView, setCalendarView] = useState<"dates" | "week">("dates");
+  // The AI Tutor tab holds two ways of getting unstuck: the tutor herself, and
+  // the doubts board — the same question, asked of a person instead. They sit
+  // behind one nav item because that's the same moment in a learner's day.
+  const [tutorView, setTutorView] = useState<"session" | "doubts">("session");
   // Sub-sections within the Plan tab, so it's not one overwhelming scroll.
   // "overview" is the main landing page that summarizes everything.
   const [planSection, setPlanSection] = useState<
@@ -18753,11 +22966,46 @@ function ElioraApp() {
     window.addEventListener("resize", onResize);
     return () => window.removeEventListener("resize", onResize);
   }, []);
+  // The tutor is a session you sit down to, not a panel you glance at, so its
+  // tab takes the whole window: the rail folds back into a drawer, the page
+  // drops its reading width, and the browser is asked for real full screen —
+  // the nav click is the gesture that permits it. Leaving puts all three back,
+  // but only undoes the full screen we asked for ourselves, so a video the
+  // learner full-screened somewhere else is left alone.
+  // Only the session takes the whole window. The doubts board is something you
+  // browse and come back to, so it keeps the rail.
+  const immersive = tab === "tutor" && tutorView === "session";
+  const wentFullscreen = useRef(false);
+  useEffect(() => {
+    const onChange = () => {
+      // Esc (or the browser's own exit) — we're no longer the ones holding it.
+      if (!document.fullscreenElement) wentFullscreen.current = false;
+    };
+    document.addEventListener("fullscreenchange", onChange);
+    return () => document.removeEventListener("fullscreenchange", onChange);
+  }, []);
+  useEffect(() => {
+    if (immersive) {
+      if (!document.fullscreenElement) {
+        document.documentElement
+          .requestFullscreen?.()
+          .then(() => {
+            wentFullscreen.current = true;
+          })
+          .catch(() => {
+            // Blocked (no gesture, or the browser said no) — the in-app
+            // full-bleed layout still stands on its own.
+          });
+      }
+      return;
+    }
+    if (wentFullscreen.current && document.fullscreenElement) {
+      wentFullscreen.current = false;
+      document.exitFullscreen?.().catch(() => {});
+    }
+  }, [immersive]);
   const [a11y, setA11y] = useState<A11y>(DEFAULT_A11Y);
   const [showA11y, setShowA11y] = useState(false);
-  const [showNotifs, setShowNotifs] = useState(false);
-  // Top-right notification bell has its own open state so it doesn't fight the
-  // sidebar-footer bell (both drive the same reminder list, different anchors).
   const [showTopNotifs, setShowTopNotifs] = useState(false);
   const [input, setInput] = useState("");
   const [busy, setBusy] = useState(false);
@@ -19043,10 +23291,14 @@ function ElioraApp() {
 
   // Restore saved profile + plan + conversation.
   useEffect(() => {
+    let localProfile: LearnerProfile | null = null;
     try {
       const rawP = localStorage.getItem(PROFILE_KEY);
       const savedProfile = rawP ? (JSON.parse(rawP) as LearnerProfile) : null;
-      if (savedProfile) setProfile(savedProfile);
+      if (savedProfile) {
+        setProfile(savedProfile);
+        localProfile = savedProfile;
+      }
 
       const rawPlan = localStorage.getItem(PLAN_KEY);
       const savedPlan = rawPlan ? (JSON.parse(rawPlan) as Milestone[]) : null;
@@ -19125,6 +23377,19 @@ function ElioraApp() {
         typeof savedSched.blocks === "object"
       )
         setSchedule(savedSched as DaySchedule);
+
+      const rawWeek = localStorage.getItem(WEEK_SCHEDULE_KEY);
+      const savedWeek = rawWeek ? JSON.parse(rawWeek) : null;
+      if (savedWeek && Array.isArray(savedWeek.blocks))
+        setWeekSchedule(savedWeek as WeekSchedule);
+
+      // Block reminders are on unless they've been switched off before, and a
+      // block that already nudged today doesn't nudge again on a page refresh.
+      if (localStorage.getItem(REMIND_KEY) === "0") setRemindOn(false);
+      const rawNudged = localStorage.getItem(NUDGED_KEY);
+      const savedNudged = rawNudged ? JSON.parse(rawNudged) : null;
+      if (Array.isArray(savedNudged))
+        setNudgedHours(savedNudged.filter((k) => typeof k === "string"));
 
       const rawHome = localStorage.getItem(HOMETIME_KEY);
       const savedHome = rawHome ? parseInt(rawHome, 10) : NaN;
@@ -19215,7 +23480,55 @@ function ElioraApp() {
     } catch {
       /* ignore corrupt storage */
     }
-    setLoaded(true);
+    if (localProfile || ns === "guest") {
+      // Accounts that did the survey before server sync existed only have
+      // their answers in this browser. If the server has no copy yet, mirror
+      // this one up so a login on any other device skips the questionnaire.
+      if (localProfile && ns !== "guest") {
+        const p = localProfile;
+        fetch("/api/profile")
+          .then((r) => (r.ok ? r.json() : null))
+          .then((data) => {
+            if (data && !data.profile) syncProfileToServer(p);
+          })
+          .catch(() => {
+            /* offline — try again next load */
+          });
+      }
+      setLoaded(true);
+      return;
+    }
+    // Nothing in this browser but the account may have done the survey before
+    // (another device, cleared storage). Ask the server for the saved copy so a
+    // returning learner isn't sent back through the questionnaire; only if the
+    // server has nothing either does the sign-up survey show.
+    fetch("/api/profile")
+      .then((r) => (r.ok ? r.json() : null))
+      .then((data) => {
+        const p = data?.profile as LearnerProfile | null | undefined;
+        if (!p || typeof p.klass !== "string") return;
+        setProfile(p);
+        try {
+          localStorage.setItem(PROFILE_KEY, JSON.stringify(p));
+        } catch {
+          /* ignore */
+        }
+        // Fresh device, so the restored chat is empty — greet them by name
+        // instead of opening on a blank conversation.
+        const msgs = [greetingFor(p)];
+        setChats((prev) =>
+          prev.map((c, i) =>
+            i === 0 && c.messages.length === 0
+              ? { ...c, messages: msgs, title: c.named ? c.title : chatTitle(msgs) }
+              : c,
+          ),
+        );
+      })
+      .catch(() => {
+        /* offline — fall back to the survey */
+      })
+      .finally(() => setLoaded(true));
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   // If the app was opened from a share link (?share=…), pick up the shared deck
@@ -19301,6 +23614,7 @@ function ElioraApp() {
     return (
       <div
         key={c.id}
+        className="eliora-side-chat"
         style={{
           ...styles.sideChat,
           position: "relative",
@@ -19535,28 +23849,70 @@ function ElioraApp() {
     }
   }, [assignments, loaded]);
 
+  // One-step undo for anything that touches the assignment list — Eliora's own
+  // suggestions included. Every mutation stashes the list exactly as it was, so
+  // "Undo" puts it back. Deliberately one level deep: the student wants "no,
+  // put that back", not a history browser.
+  const assignmentsRef = useRef<Assignment[]>([]);
+  useEffect(() => {
+    assignmentsRef.current = assignments;
+  }, [assignments]);
+  function mutateAssignments(
+    label: string,
+    fn: (prev: Assignment[]) => Assignment[],
+  ) {
+    setAssignUndo({ label, list: assignmentsRef.current });
+    setAssignments(fn);
+  }
+  function undoAssignments() {
+    const u = assignUndo;
+    if (!u) return;
+    setAssignments(u.list);
+    setAssignUndo(null);
+  }
+
   function addAssignment(a: {
     title: string;
     subject?: string;
     due?: string;
+    dueTime?: string;
     estMin?: number;
     planDate?: string;
+    priority?: AssignmentPriority;
+    type?: AssignmentType;
+    notes?: string;
   }) {
     const title = a.title.trim();
     if (!title) return;
-    setAssignments((prev) => [
+    mutateAssignments(`added “${title}”`, (prev) => [
       ...prev,
       {
-        id: `a${Date.now().toString(36)}`,
+        id: `a${Date.now().toString(36)}${Math.random().toString(36).slice(2, 6)}`,
         title,
         subject: a.subject?.trim() || undefined,
         due: a.due || undefined,
+        dueTime: /^\d{2}:\d{2}$/.test(a.dueTime ?? "") ? a.dueTime : undefined,
         estMin:
           typeof a.estMin === "number" && a.estMin > 0 ? a.estMin : undefined,
         planDate: a.planDate || undefined,
+        priority: a.priority,
+        type: a.type,
+        notes: a.notes?.trim() || undefined,
         done: false,
       },
     ]);
+  }
+  // Patch any field on one assignment. This is what dragging to another day,
+  // editing a deadline, and changing priority all go through, so every one of
+  // them is undoable.
+  function updateAssignment(
+    id: string,
+    patch: Partial<Omit<Assignment, "id">>,
+    label = "changed an assignment",
+  ) {
+    mutateAssignments(label, (prev) =>
+      prev.map((a) => (a.id === id ? { ...a, ...patch } : a)),
+    );
   }
   function toggleAssignment(id: string) {
     const a = assignments.find((x) => x.id === id);
@@ -19594,6 +23950,26 @@ function ElioraApp() {
           : a,
       ),
     );
+  }
+  // Writes a priority plan back onto the assignments it ranked: the estimate and
+  // the day to work on it. Exam items in the plan have no assignment to land on
+  // — they stay advice in the schedule view. This is what makes the plan real:
+  // the calendar builds its day-by-day view from estMin + planDate.
+  function applyPriorityPlan(plan: PriorityPlan) {
+    const byId = new Map(plan.items.map((i) => [i.id, i]));
+    setAssignments((prev) =>
+      prev.map((a) => {
+        const it = byId.get(a.id);
+        if (!it) return a;
+        return {
+          ...a,
+          estMin: it.estMin > 0 ? it.estMin : a.estMin,
+          planDate: it.planDate ?? a.planDate,
+        };
+      }),
+    );
+    // Nothing to see if the time fields stay hidden.
+    setTimeMgmt(true);
   }
   function setAssignmentConcern(id: string, concern: string) {
     setAssignments((prev) =>
@@ -19850,6 +24226,18 @@ function ElioraApp() {
     }
   }, [schedule, loaded]);
 
+  // Persist the repeating week.
+  useEffect(() => {
+    if (!loaded) return;
+    try {
+      if (weekSchedule)
+        localStorage.setItem(WEEK_SCHEDULE_KEY, JSON.stringify(weekSchedule));
+      else localStorage.removeItem(WEEK_SCHEDULE_KEY);
+    } catch {
+      /* ignore */
+    }
+  }, [weekSchedule, loaded]);
+
   // Persist the learner's home / free-to-study hour.
   useEffect(() => {
     if (!loaded) return;
@@ -19859,6 +24247,59 @@ function ElioraApp() {
       /* ignore */
     }
   }, [homeHour, loaded]);
+
+  // Persist whether block reminders are on, and which blocks already nudged.
+  useEffect(() => {
+    if (!loaded) return;
+    try {
+      localStorage.setItem(REMIND_KEY, remindOn ? "1" : "0");
+      localStorage.setItem(NUDGED_KEY, JSON.stringify(nudgedHours));
+    } catch {
+      /* ignore */
+    }
+  }, [remindOn, nudgedHours, loaded]);
+
+  // The reminder clock. Every half-minute, check whether the hour the learner is
+  // in has a block waiting on them — and if it hasn't been called out yet today,
+  // raise the banner (plus a browser notification, so it lands even when the tab
+  // is in the background). Each block nudges once; "Later" snoozes them all for
+  // ten minutes.
+  useEffect(() => {
+    if (!loaded || !remindOn) return;
+    const check = () => {
+      const now = new Date();
+      if (now.getTime() < snoozeUntil) return;
+      const today = localISO();
+      if (!schedule || schedule.date !== today) return;
+      const hour = now.getHours();
+      const block = schedule.blocks[hour];
+      const text = (block?.text ?? "").trim();
+      if (!block || !text) return;
+      const key = `${today}:${hour}`;
+      if (nudgedHours.includes(key)) return;
+      const kind: ScheduleKind = block.kind ?? "study";
+      const min = block.min ?? TIMER_DEFAULT_MIN;
+      setNudgedHours((prev) => [...prev, key]);
+      setBlockNudge({ hour, text, kind, min });
+      sendNudgeNotification(
+        `${hourLabel(hour)} · ${text}`,
+        `${min} min — ${nudgeLine(kind, hour)}`,
+      );
+    };
+    check();
+    const id = setInterval(check, 30_000);
+    return () => clearInterval(id);
+  }, [loaded, remindOn, schedule, snoozeUntil, nudgedHours]);
+
+  // A new day wipes the "already nudged" log so today's blocks can call out.
+  useEffect(() => {
+    const today = localISO();
+    setNudgedHours((prev) =>
+      prev.length && prev.some((k) => !k.startsWith(`${today}:`))
+        ? prev.filter((k) => k.startsWith(`${today}:`))
+        : prev,
+    );
+  }, [schedule?.date]);
 
   // Build today's after-school study schedule from when they get home + how they
   // study (profile) + their real work (plan steps, tasks, assignments).
@@ -19874,16 +24315,21 @@ function ElioraApp() {
       const planSteps = plan.filter((m) => !m.done).map((m) => m.title);
       const budgetMin = opts?.budgetMin ?? scheduleBudgetMin;
       const focusNote = (opts?.focusNote ?? scheduleFocusNote).trim();
-      // Pass each open task with its time estimate so the schedule can budget
-      // the evening by minutes (e.g. "Review Bio notes (~20 min)").
-      const taskTitles =
+      // Pass each open task with the minutes it needs and how important it is, so
+      // the schedule can size every block by the work in it rather than by the
+      // clock (e.g. "Review Bio notes (~20 min, high)").
+      const openTasks =
         dailyTasks?.date === today
-          ? dailyTasks.tasks
-              .filter((t) => !t.done)
-              .map((t) =>
-                t.estMin ? `${t.title} (~${t.estMin} min)` : t.title,
-              )
+          ? dailyTasks.tasks.filter((t) => !t.done && t.title.trim())
           : [];
+      const taskTitles = openTasks.map(
+        (t) =>
+          `${t.title} (~${taskNeedMin(t)} min, ${PRIORITY_LABEL[
+            taskPriority(t)
+          ].toLowerCase()} priority)`,
+      );
+      // Total work on the plate today — the schedule has to cover this much.
+      const needMin = openTasks.reduce((n, t) => n + taskNeedMin(t), 0);
       const res = await fetch("/api/suggest", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -19891,6 +24337,7 @@ function ElioraApp() {
           kind: "schedule",
           homeHour: opts?.homeHour ?? homeHour,
           budgetMin: budgetMin || undefined,
+          needMin: needMin || undefined,
           focusNote: focusNote || undefined,
           profile: profile ?? undefined,
           plan: planSteps,
@@ -19902,7 +24349,7 @@ function ElioraApp() {
         }),
       });
       const data = (await res.json()) as {
-        blocks?: { hour?: number; kind?: string; text?: string }[];
+        blocks?: { hour?: number; kind?: string; text?: string; min?: number }[];
       };
       const blocks = Array.isArray(data.blocks) ? data.blocks : [];
       if (blocks.length) {
@@ -19919,7 +24366,12 @@ function ElioraApp() {
             ).includes(b.kind as ScheduleKind)
               ? (b.kind as ScheduleKind)
               : "study";
-            map[b.hour] = { text: String(b.text).trim(), kind };
+            // How much work the hour holds — a block never runs past its hour.
+            const min =
+              typeof b.min === "number" && b.min >= 5
+                ? Math.min(60, Math.round(b.min / 5) * 5)
+                : undefined;
+            map[b.hour] = { text: String(b.text).trim(), kind, min };
           }
         }
         if (Object.keys(map).length) setSchedule({ date: today, blocks: map });
@@ -19931,21 +24383,15 @@ function ElioraApp() {
     }
   };
 
-  // Take the schedule-setup survey answers, remember the learner's study prefs
-  // on their profile, then build today's schedule from the fresh answers.
-  const handleScheduleSurvey = (a: {
-    homeTime: string;
-    budget: string;
-    focusTime: string;
-    sessionLength: string;
-    focusHelp: string;
-    focusNote: string;
-  }) => {
-    const nextHomeHour = HOME_TIME_HOUR[a.homeTime] ?? homeHour;
-    const budgetMin = a.budget ? STUDY_BUDGET_MIN[a.budget] : undefined;
-    setHomeHour(nextHomeHour);
-    setScheduleBudgetMin(budgetMin);
-    setScheduleFocusNote(a.focusNote);
+  // Take what the setup conversation found out, remember the learner's study
+  // prefs on their profile, then build today's schedule from the fresh answers.
+  const handleScheduleSetup = (a: DayIntakeAnswers) => {
+    const focusNote = a.focusNote ?? "";
+    setHomeHour(a.freeHour);
+    setScheduleBudgetMin(a.budgetMin);
+    setScheduleFocusNote(focusNote);
+    // Only what she actually heard today — the intake leaves a field out rather
+    // than guessing, and an absent one must not wipe what's on the profile.
     if (profile && (a.focusTime || a.sessionLength || a.focusHelp)) {
       const next: LearnerProfile = {
         ...profile,
@@ -19959,11 +24405,12 @@ function ElioraApp() {
       } catch {
         /* ignore */
       }
+      syncProfileToServer(next);
     }
     generateStudySchedule({
-      homeHour: nextHomeHour,
-      budgetMin,
-      focusNote: a.focusNote,
+      homeHour: a.freeHour,
+      budgetMin: a.budgetMin,
+      focusNote,
     });
   };
 
@@ -19986,12 +24433,14 @@ function ElioraApp() {
   // Wipe today's schedule clean.
   const clearSchedule = () => setSchedule({ date: localISO(), blocks: {} });
 
-  // The day's task time budget, taken from today's schedule: each hour block
-  // marked "study" contributes 60 minutes. 0 when there's no schedule yet.
+  // The day's task time budget, taken from today's schedule: each "study" block
+  // contributes the work it holds (a full hour when it isn't sized). 0 when
+  // there's no schedule yet.
   const scheduledStudyMin =
     schedule && schedule.date === localISO()
-      ? Object.values(schedule.blocks).filter((b) => b.kind === "study")
-          .length * 60
+      ? Object.values(schedule.blocks)
+          .filter((b) => b.kind === "study")
+          .reduce((n, b) => n + (b.min ?? 60), 0)
       : 0;
 
   // Generate a fresh set of tasks for today, grounded in the learner's plan,
@@ -20023,23 +24472,32 @@ function ElioraApp() {
       };
       const items = Array.isArray(data.items) ? data.items : [];
       if (items.length) {
-        setDailyTasks({
-          date: localISO(),
-          tasks: items
-            .filter((it) => it.title)
-            .map((it) => {
-              const m = Number(it.estMin);
-              const p = it.priority;
-              return {
-                title: String(it.title).trim(),
-                why: it.why || undefined,
-                subject: it.subject || undefined,
-                priority:
-                  p === "high" || p === "med" || p === "low" ? p : "med",
-                estMin: Number.isFinite(m) && m > 0 ? Math.round(m) : undefined,
-                done: false,
-              };
-            }),
+        const today = localISO();
+        // Generated tasks arrive ranked High → Low, since the list is no longer
+        // re-sorted on display — its order is the learner's to set.
+        const fresh: DailyTask[] = items
+          .filter((it) => it.title)
+          .map((it): DailyTask => {
+            const m = Number(it.estMin);
+            const p = it.priority;
+            return {
+              title: String(it.title).trim(),
+              why: it.why || undefined,
+              subject: it.subject || undefined,
+              priority: p === "high" || p === "med" || p === "low" ? p : "med",
+              estMin: Number.isFinite(m) && m > 0 ? Math.round(m) : undefined,
+              done: false,
+            };
+          })
+          .sort(
+            (a, b) => PRIORITY_RANK[taskPriority(a)] - PRIORITY_RANK[taskPriority(b)],
+          );
+        // A task the learner wrote is theirs to keep — a refresh replaces only
+        // what Eliora generated, and their own list stays on top.
+        setDailyTasks((prev) => {
+          const mine =
+            prev?.date === today ? prev.tasks.filter((t) => t.mine) : [];
+          return { date: today, tasks: [...mine, ...fresh] };
         });
       }
     } catch {
@@ -20100,17 +24558,155 @@ function ElioraApp() {
     });
   };
 
-  // Divide a fixed block of study minutes across today's open tasks, weighted by
-  // priority (High tasks get the biggest slice), writing each task's estMin.
-  const budgetDailyTime = (blockMin: number) => {
+  // Add a task the learner wrote themselves. `mine` marks it so a regeneration
+  // keeps it. Starting a list from scratch (no AI tasks yet) seeds today's date.
+  // The new task goes straight onto today's schedule too — placement is by
+  // priority, so a High task added late still claims the earliest free hour.
+  const addDailyTask = (title: string, priority: Priority) => {
+    const clean = title.trim();
+    if (!clean) return;
+    const today = localISO();
+    const task: DailyTask = { title: clean, priority, done: false, mine: true };
+    const next: DailyTasksState =
+      !dailyTasks || dailyTasks.date !== today
+        ? { date: today, tasks: [task] }
+        : { ...dailyTasks, tasks: [...dailyTasks.tasks, task] };
+    setDailyTasks(next);
+    placeTasksOnSchedule(next.tasks);
+  };
+
+  // Drop a task off today's list entirely.
+  const deleteDailyTask = (i: number) => {
+    setDailyTasks((prev) =>
+      prev ? { ...prev, tasks: prev.tasks.filter((_, x) => x !== i) } : prev,
+    );
+  };
+
+  // Move a task up (-1) or down (+1). The array order IS the learner's ranking.
+  const moveDailyTask = (i: number, dir: -1 | 1) => {
     setDailyTasks((prev) => {
       if (!prev) return prev;
-      const slices = budgetByPriority(prev.tasks, blockMin);
-      const tasks = prev.tasks.map((t, x) =>
-        slices[x] != null ? { ...t, estMin: slices[x] } : t,
-      );
+      const j = i + dir;
+      if (i < 0 || j < 0 || i >= prev.tasks.length || j >= prev.tasks.length)
+        return prev;
+      const tasks = prev.tasks.slice();
+      [tasks[i], tasks[j]] = [tasks[j], tasks[i]];
       return { ...prev, tasks };
     });
+  };
+
+  // Rename a task in place.
+  const renameDailyTask = (i: number, title: string) => {
+    const clean = title.trim();
+    if (!clean) return;
+    setDailyTasks((prev) =>
+      prev
+        ? {
+            ...prev,
+            tasks: prev.tasks.map((t, x) => (x === i ? { ...t, title: clean } : t)),
+          }
+        : prev,
+    );
+  };
+
+  // Re-apply the automatic High → Low sort. Stable, so the learner's own order
+  // is kept for tasks that share a priority.
+  const sortDailyTasksByPriority = () => {
+    setDailyTasks((prev) =>
+      prev
+        ? {
+            ...prev,
+            tasks: prev.tasks
+              .map((t, i) => ({ t, i }))
+              .sort(
+                (a, b) =>
+                  PRIORITY_RANK[taskPriority(a.t)] -
+                    PRIORITY_RANK[taskPriority(b.t)] || a.i - b.i,
+              )
+              .map(({ t }) => t),
+          }
+        : prev,
+    );
+  };
+
+  // Lay budgeted tasks onto today's schedule so the minutes land on real hours
+  // instead of staying a number next to a task. Walks the day from the hour the
+  // learner is free, packing tasks into hour blocks High → Low (list order
+  // breaks ties within a priority) so the most important work claims the
+  // earliest hours — a task longer than the room left in an hour spills
+  // into the next one as "(cont.)". Hours the learner has already filled in
+  // (class, a break, their own note) are stepped over; only blocks a previous
+  // budget placed are replaced. Anything that doesn't fit before 9pm is left
+  // off the schedule — the card already flags time that runs over.
+  const placeTasksOnSchedule = (tasks: DailyTask[]) => {
+    const today = localISO();
+    const open = tasks
+      .map((t, i) => ({ t, i }))
+      .filter(({ t }) => !t.done && t.title.trim())
+      .sort(
+        (a, b) =>
+          PRIORITY_RANK[taskPriority(a.t)] - PRIORITY_RANK[taskPriority(b.t)] ||
+          a.i - b.i,
+      )
+      .map(({ t }) => t);
+    setSchedule((prev) => {
+      const base = prev && prev.date === today ? prev.blocks : {};
+      const blocks: Record<number, ScheduleBlock> = {};
+      for (const [h, b] of Object.entries(base)) if (!b.auto) blocks[+h] = b;
+
+      const start = Math.min(
+        Math.max(homeHour, SCHEDULE_HOURS[0]),
+        SCHEDULE_HOURS[SCHEDULE_HOURS.length - 1],
+      );
+      const free = SCHEDULE_HOURS.filter((h) => h >= start && !blocks[h]);
+
+      let hi = 0;
+      let cur: { titles: string[]; min: number } | null = null;
+      const flush = () => {
+        if (cur && hi < free.length) {
+          blocks[free[hi]] = {
+            text: cur.titles.join(" · "),
+            kind: "study",
+            min: cur.min,
+            auto: true,
+          };
+          hi++;
+        }
+        cur = null;
+      };
+
+      for (const t of open) {
+        let left = taskNeedMin(t);
+        let first = true;
+        while (left > 0 && hi < free.length) {
+          if (!cur) cur = { titles: [], min: 0 };
+          const take = Math.min(left, 60 - cur.min);
+          cur.titles.push(first ? t.title : `${t.title} (cont.)`);
+          cur.min += take;
+          left -= take;
+          first = false;
+          if (cur.min >= 60) flush();
+        }
+        if (hi >= free.length && !cur) break;
+      }
+      flush();
+
+      return { date: today, blocks };
+    });
+  };
+
+  // Divide a fixed block of study minutes across today's open tasks by how much
+  // each one needs (trimmed proportionally when the block is too short), writing
+  // each task's estMin — then put those minutes on today's schedule.
+  const budgetDailyTime = (blockMin: number) => {
+    if (!dailyTasks) return;
+    const slices = budgetByNeed(dailyTasks.tasks, blockMin);
+    const tasks = dailyTasks.tasks.map((t, x) =>
+      slices[x] != null ? { ...t, estMin: slices[x] } : t,
+    );
+    setDailyTasks({ ...dailyTasks, tasks });
+    // Only today's list belongs on today's calendar.
+    if (dailyTasks.date === localISO()) placeTasksOnSchedule(tasks);
   };
 
   // Persist progress XP log.
@@ -20909,12 +25505,27 @@ function ElioraApp() {
     scrollRef.current?.scrollTo({ top: scrollRef.current.scrollHeight });
   }, [messages]);
 
+  // Mirror profile saves to the server (keyed by the signed-in email) so a
+  // login on any other device skips the sign-up survey. Fire-and-forget: the
+  // localStorage copy is still the source of truth on this device.
+  function syncProfileToServer(p: LearnerProfile) {
+    if (ns === "guest") return;
+    fetch("/api/profile", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ profile: p }),
+    }).catch(() => {
+      /* offline — the local copy still works */
+    });
+  }
+
   function handleProfile(p: LearnerProfile) {
     try {
       localStorage.setItem(PROFILE_KEY, JSON.stringify(p));
     } catch {
       /* ignore */
     }
+    syncProfileToServer(p);
     const firstTime = !profile;
     setProfile(p);
     setEditing(false);
@@ -20926,7 +25537,7 @@ function ElioraApp() {
         {
           role: "assistant",
           content:
-            `Hi${name} 🌱 Thanks for sharing all that — give me a sec to look ` +
+            `Hi${name} 💡 Thanks for sharing all that — give me a sec to look ` +
             `over your answers.`,
         },
       ]);
@@ -21440,7 +26051,14 @@ function ElioraApp() {
   // answer (voice mode reads it aloud) don't have to watch `messages`.
   async function send(
     override?: string,
-    opts?: { hidden?: boolean },
+    opts?: {
+      hidden?: boolean;
+      // Hands-free turn: asks the server for a short, spoken-shaped reply.
+      voice?: boolean;
+      // Fires on every piece of reply text as it arrives. Voice mode uses this
+      // to start talking on the first sentence instead of waiting for the last.
+      onDelta?: (chunk: string) => void;
+    },
   ): Promise<string> {
     const text = (typeof override === "string" ? override : input).trim();
     // A typed override (quick chip, auto-build) is text-only; a real learner
@@ -21492,6 +26110,7 @@ function ElioraApp() {
           fourYearPlan: fourYearPlan ?? undefined,
           tutor: tutorId !== ELIORA_DEFAULT_TUTOR ? tutorId : undefined,
           material: materials.length ? materials : undefined,
+          voice: opts?.voice || undefined,
         }),
       });
 
@@ -21508,6 +26127,7 @@ function ElioraApp() {
       const examples: StudentExample[] = [];
       let flashcards: Flashcard[] | undefined;
       let quiz: QuizQuestion[] | undefined;
+      let visual: LessonVisual | undefined;
 
       const applyEvent = (line: string) => {
         if (!line.trim()) return;
@@ -21588,6 +26208,7 @@ function ElioraApp() {
         }
         if (evt.type === "text" && evt.value) {
           acc += evt.value;
+          opts?.onDelta?.(evt.value);
           setChatStatus(null);
         }
         else if (evt.type === "videos" && evt.items)
@@ -21599,6 +26220,8 @@ function ElioraApp() {
         else if (evt.type === "flashcards")
           flashcards = (evt.items as Flashcard[]) ?? [];
         else if (evt.type === "quiz") quiz = (evt.items as QuizQuestion[]) ?? [];
+        else if (evt.type === "visual" && evt.item)
+          visual = evt.item as unknown as LessonVisual;
         setMessages((prev) => {
           const copy = [...prev];
           copy[copy.length - 1] = {
@@ -21609,6 +26232,7 @@ function ElioraApp() {
             examples: examples.length ? [...examples] : undefined,
             flashcards,
             quiz,
+            visual,
           };
           return copy;
         });
@@ -21634,7 +26258,7 @@ function ElioraApp() {
           if (!last?.content) {
             copy[copy.length - 1] = {
               role: "assistant",
-              content: "Okay, stopped. Ask me anything when you're ready. 🌱",
+              content: "Okay, stopped. Ask me anything when you're ready. 💡",
             };
           }
         } else {
@@ -21672,7 +26296,10 @@ function ElioraApp() {
 
   const heroName = profile?.name?.trim() ? `, ${profile.name.trim()}` : "";
   return (
-    <div style={styles.shell}>
+    <div
+      className={"eliora-shell" + (immersive ? " immersive" : "")}
+      style={styles.shell}
+    >
       <button
         className="eliora-side-toggle"
         style={styles.sideToggle}
@@ -21687,36 +26314,100 @@ function ElioraApp() {
           onClick={() => setSidebarOpen(false)}
         />
       )}
+      {/* "It's time for this block" — follows the learner across every tab, so
+          the reminder finds them wherever they are in the app. */}
+      {blockNudge && (
+        <div style={styles.nudge} role="status">
+          <div style={styles.nudgeHead}>
+            <span style={styles.nudgeWhen}>
+              🔔 {hourLabel(blockNudge.hour)} · {blockNudge.min} min
+            </span>
+            <button
+              style={styles.nudgeClose}
+              onClick={() => setBlockNudge(null)}
+              aria-label="Dismiss reminder"
+              title="Dismiss"
+            >
+              ✕
+            </button>
+          </div>
+          <div style={styles.nudgeText}>
+            {scheduleKind(blockNudge.kind).emoji} {blockNudge.text}
+          </div>
+          <div style={styles.nudgeLine}>
+            {nudgeLine(blockNudge.kind, blockNudge.hour)}
+          </div>
+          <div style={styles.nudgeActions}>
+            <button
+              style={styles.nudgeStart}
+              onClick={() => {
+                setTab("calendar");
+                setTimerRequest({ hour: blockNudge.hour });
+                setBlockNudge(null);
+              }}
+            >
+              ▶ Start it ({blockNudge.min} min)
+            </button>
+            <button
+              style={styles.nudgeLater}
+              onClick={() => {
+                // Un-mark the block so it can call out again once the snooze
+                // runs out — as long as the learner is still inside its hour.
+                const key = `${localISO()}:${blockNudge.hour}`;
+                setNudgedHours((prev) => prev.filter((k) => k !== key));
+                setSnoozeUntil(Date.now() + 10 * 60_000);
+                setBlockNudge(null);
+              }}
+              title="Remind me again in 10 minutes"
+            >
+              Later
+            </button>
+          </div>
+        </div>
+      )}
       <aside
         className={"eliora-sidebar" + (sidebarOpen ? " open" : "")}
         style={styles.sidebar}
       >
-        <div style={styles.sideBrand}>Eliora 🌱</div>
+        <div className="eliora-lockup" style={styles.sideBrand}>
+          <ElioraMark size={30} />
+          <span>
+            <ElioraWordmark size={27} />
+            <span className="eliora-tagline" style={styles.sideTagline}>
+              A light of learning
+            </span>
+          </span>
+        </div>
         <button
           style={styles.sideNewChat}
           onClick={() => newChat()}
           disabled={busy}
         >
-          ✏️ New chat
+          <span className="eliora-nav-ico" aria-hidden="true">
+            ✏️
+          </span>
+          New chat
         </button>
         <nav style={styles.sideNav}>
           {(
             [
-              ["home", "🏠 Home"],
-              ["chat", "💬 Chat"],
-              ["notebook", "📓 Smart Notes"],
-              ["practice", "🧠 Practice"],
-              ["calendar", "📅 Calendar"],
-              ["plan", "🎯 Plan"],
-              ["progress", "📊 Progress"],
-              ["study", "📋 Study"],
-              ["together", "👥 Study Together"],
-              ["folder", "🗂️ Shared Folder"],
-              ["school", "🏫 School"],
+              ["home", "🏠", "Home"],
+              ["chat", "💬", "Chat"],
+              ["notebook", "📓", "Smart Notes"],
+              ["practice", "🧠", "Practice"],
+              ["calendar", "📅", "Calendar"],
+              ["plan", "🎯", "Plan"],
+              ["progress", "📊", "Progress"],
+              ["tutor", "🧑‍🏫", "AI Tutor"],
+              ["study", "📋", "Study"],
+              ["folder", "🗂️", "Shared Folder"],
+              ["school", "🏫", "School"],
             ] as const
-          ).map(([key, label]) => (
+          ).map(([key, icon, label]) => (
             <button
               key={key}
+              className="eliora-nav-item"
+              aria-current={tab === key ? "page" : undefined}
               style={{
                 ...styles.sideNavItem,
                 ...(tab === key ? styles.sideNavItemActive : {}),
@@ -21726,6 +26417,9 @@ function ElioraApp() {
                 setSidebarOpen(false);
               }}
             >
+              <span className="eliora-nav-ico" aria-hidden="true">
+                {icon}
+              </span>
               {label}
             </button>
           ))}
@@ -21780,71 +26474,6 @@ function ElioraApp() {
             .map(renderChat)}
         </div>
         <div style={styles.sideFooter}>
-          <div style={{ position: "relative" }}>
-            <button
-              style={{ ...styles.sideFootBtn, position: "relative" }}
-              onClick={() => setShowNotifs((v) => !v)}
-              aria-label={
-                shownReminders.length
-                  ? `Notifications (${shownReminders.length} new)`
-                  : "Notifications"
-              }
-              title="Notifications"
-            >
-              🔔
-              {shownReminders.length > 0 && (
-                <span style={styles.notifBadge}>
-                  {shownReminders.length > 9 ? "9+" : shownReminders.length}
-                </span>
-              )}
-            </button>
-            {showNotifs && (
-              <div style={styles.notifPanel} role="dialog" aria-label="Notifications">
-                <div style={styles.notifHead}>
-                  <span style={{ fontWeight: 700 }}>🔔 Notifications</span>
-                  {notifSupported && !remindersOn && (
-                    <button style={styles.linkBtn} onClick={enableNotifications}>
-                      Turn on
-                    </button>
-                  )}
-                  <button
-                    style={styles.notifClose}
-                    onClick={() => setShowNotifs(false)}
-                    aria-label="Close notifications"
-                  >
-                    ×
-                  </button>
-                </div>
-                {shownReminders.length === 0 ? (
-                  <p style={styles.notifEmpty}>You&apos;re all caught up 🎉</p>
-                ) : (
-                  shownReminders.map((r) => (
-                    <div key={r.id} style={styles.reminderRow}>
-                      <button
-                        style={styles.reminderCheck}
-                        onClick={() => checkReminder(r)}
-                        aria-label="Mark done"
-                        title="Mark done"
-                      />
-                      <button
-                        style={styles.reminderText}
-                        onClick={() => {
-                          setShowNotifs(false);
-                          handleReminder(r);
-                        }}
-                      >
-                        <span style={{ flexShrink: 0 }}>{r.icon}</span>
-                        <span style={{ flex: 1, textAlign: "left" }}>
-                          {r.text}
-                        </span>
-                        <span style={{ color: "var(--muted)" }}>›</span>
-                      </button>
-                    </div>
-                  ))
-                )}
-              </div>
-            )}
-          </div>
           <button
             style={styles.sideFootBtn}
             onClick={() =>
@@ -21889,7 +26518,16 @@ function ElioraApp() {
         </div>
       </aside>
 
-      <main style={styles.mainCol}>
+      <main
+        style={{
+          ...styles.mainCol,
+          ...(immersive
+            ? styles.mainColFull
+            : tab === "notebook"
+              ? styles.mainColWide
+              : {}),
+        }}
+      >
         <div style={styles.topNotifWrap}>
           <button
             style={styles.topNotifBtn}
@@ -22090,21 +26728,8 @@ function ElioraApp() {
 
         {tab === "home" && (
           <div style={styles.studyScroll}>
-            <div
-              style={{
-                ...styles.heroRoomBanner,
-                background: roomById(equippedRoom).bg,
-              }}
-            >
-              <span style={styles.heroRoomEmoji}>
-                {roomById(equippedRoom).emoji}
-              </span>
-              <span style={styles.heroRoomName}>
-                {roomById(equippedRoom).name} study room
-              </span>
-            </div>
             <div style={styles.homeHero}>
-              <h1 style={styles.homeHi}>Hi{heroName} 🌱</h1>
+              <h1 style={styles.homeHi}>Hi{heroName} 💡</h1>
               <p style={styles.homeSub}>What do you want to work on today?</p>
             </div>
             <TutorPicker
@@ -22140,6 +26765,11 @@ function ElioraApp() {
               onSetMin={setDailyTaskMin}
               onSetPriority={setDailyTaskPriority}
               onBudget={budgetDailyTime}
+              onAdd={addDailyTask}
+              onDelete={deleteDailyTask}
+              onMove={moveDailyTask}
+              onRename={renameDailyTask}
+              onSortByPriority={sortDailyTasksByPriority}
             />
             <DeadlineCountdownCard
               events={events}
@@ -22304,7 +26934,7 @@ function ElioraApp() {
           <p style={{ color: "var(--muted)", fontSize: 14, margin: "0 0 10px" }}>
             {notesView === "notes"
               ? "Your notes — free-form or Cornell, color-code key concepts, link notes with [[title]], and pin sticky notes."
-              : "Paste notes, a link, or a doc and turn it into a summary, study guide, flashcards, or a quiz."}
+              : "Paste notes, a link, or a doc and turn it into a summary, study guide, topic modules, video notes, flashcards, or a quiz."}
           </p>
           {/* Sub-tabs: the notebook and the summarizer live side by side here. */}
           <div style={{ ...styles.outputRow, marginBottom: 12 }}>
@@ -22363,34 +26993,74 @@ function ElioraApp() {
 
       {tab === "calendar" && (
         <div style={styles.studyScroll}>
-          <ScheduleGrid
-            schedule={schedule}
-            onSet={setScheduleBlock}
-            onClear={clearSchedule}
-            homeHour={homeHour}
-            onSetHomeHour={setHomeHour}
-            onGenerate={() => generateStudySchedule()}
-            onSetupSubmit={handleScheduleSurvey}
-            setupInitial={{
-              focusTime: profile?.focusTime,
-              sessionLength: profile?.sessionLength,
-              focusHelp: profile?.focusHelp,
-            }}
-            generating={generatingSchedule}
-            onStudyMinutes={logStudyMinutes}
-          />
-          <CalendarPanel
-            events={events}
-            assignments={assignments}
-            dailyTasks={dailyTasks}
-            profile={profile}
-            career={fourYearPlan?.destination}
-            onAdd={addEvent}
-            onRemove={removeEvent}
-            onBreakDown={breakDownEvent}
-            onToggleTask={toggleEventTask}
-            breakingEventId={breakingEventId}
-          />
+          {/* Sub-tabs: the dates themselves, and the week that repeats behind
+              them. Blocks drawn in "My week" show up on every matching day. */}
+          <div style={{ ...styles.outputRow, marginBottom: 12 }}>
+            {(
+              [
+                ["dates", "📅 Dates & today"],
+                ["week", "🗓️ My week"],
+              ] as const
+            ).map(([k, label]) => (
+              <button
+                key={k}
+                onClick={() => setCalendarView(k)}
+                style={{
+                  ...styles.outChip,
+                  ...(calendarView === k ? styles.outChipActive : {}),
+                }}
+              >
+                {label}
+              </button>
+            ))}
+          </div>
+          {calendarView === "week" && (
+            <ScheduleStudio
+              profile={profile}
+              schedule={weekSchedule}
+              onSchedule={setWeekSchedule}
+            />
+          )}
+          {/* Hidden rather than unmounted: a study timer may be running in
+              today's grid, and switching views shouldn't end someone's session. */}
+          <div
+            style={calendarView === "dates" ? undefined : { display: "none" }}
+          >
+            <ScheduleGrid
+              schedule={schedule}
+              onSet={setScheduleBlock}
+              onClear={clearSchedule}
+              homeHour={homeHour}
+              onSetHomeHour={setHomeHour}
+              onGenerate={() => generateStudySchedule()}
+              onSetupReady={handleScheduleSetup}
+              profile={profile}
+              generating={generatingSchedule}
+              onStudyMinutes={logStudyMinutes}
+              remindOn={remindOn}
+              onSetRemindOn={setRemindOn}
+              timerRequest={timerRequest}
+              onTimerRequestConsumed={() => setTimerRequest(null)}
+            />
+            <CalendarPanel
+              events={events}
+              assignments={assignments}
+              dailyTasks={dailyTasks}
+              goals={goals}
+              week={weekSchedule}
+              profile={profile}
+              career={fourYearPlan?.destination}
+              onAdd={addEvent}
+              onRemove={removeEvent}
+              onBreakDown={breakDownEvent}
+              onToggleTask={toggleEventTask}
+              onOpenGoals={() => {
+                setPlanSection("goals");
+                setTab("plan");
+              }}
+              breakingEventId={breakingEventId}
+            />
+          </div>
         </div>
       )}
 
@@ -22639,6 +27309,12 @@ function ElioraApp() {
                 onAdd={addAssignment}
                 onToggle={toggleAssignment}
                 onRemove={removeAssignment}
+              />
+              <PriorityPlanner
+                assignments={assignments}
+                events={events}
+                profile={profile}
+                onApply={applyPriorityPlan}
               />
               <div style={styles.card}>
                 <div style={styles.cardHead}>
@@ -22943,9 +27619,98 @@ function ElioraApp() {
         />
       )}
 
+      {/* The tutor gets its own tab: a session you sit down to, not a tool you
+          reach for mid-study. The persona picked on Home teaches it. */}
+      {tab === "tutor" && (
+        <div style={styles.tutorScroll}>
+          {/* The way out. With the rail folded away, the session has to say how
+              to leave it — ☰ reopens the menu, this closes the room. */}
+          <div style={styles.fullBleedBar}>
+            {/* Two ways of getting unstuck: ask her, or ask the room. */}
+            <div style={styles.outputRow}>
+              {(
+                [
+                  ["session", "🧑‍🏫 Tutor session"],
+                  ["doubts", "🙋 Doubts"],
+                ] as const
+              ).map(([k, label]) => (
+                <button
+                  key={k}
+                  onClick={() => setTutorView(k)}
+                  style={{
+                    ...styles.outChip,
+                    ...(tutorView === k ? styles.outChipActive : {}),
+                  }}
+                >
+                  {label}
+                </button>
+              ))}
+            </div>
+            {tutorView === "session" && (
+              <button
+                style={styles.fullBleedExit}
+                onClick={() => setTab("home")}
+                title="Leave the session"
+              >
+                ✕ Exit full screen
+              </button>
+            )}
+          </div>
+          {tutorView === "session" ? (
+            <AiTutor
+              profile={profile}
+              tutorId={tutorId}
+              onMissed={addMissed}
+              onMistake={(m) => logMistake({ ...m, source: "quiz" })}
+              onAsk={(msg) => {
+                setTab("chat");
+                send(msg);
+              }}
+            />
+          ) : (
+            <DoubtsBoard
+              name={
+                session?.user?.name?.trim() ||
+                profile?.name?.trim() ||
+                session?.user?.email?.split("@")[0] ||
+                "Guest"
+              }
+            />
+          )}
+        </div>
+      )}
+
       {tab === "study" && (
         <div style={styles.studyScroll}>
           <ProfileCard profile={profile} onEdit={() => setEditing(true)} />
+          <HelpDesk
+            subjects={subjects}
+            profile={profile}
+            onMissed={addMissed}
+            onMistake={(m) => logMistake({ ...m, source: "quiz" })}
+            onAsk={(msg) => {
+              setTab("chat");
+              send(msg);
+            }}
+          />
+          <DraftReviewer
+            subjects={subjects}
+            profile={profile}
+            onAsk={(msg) => {
+              setTab("chat");
+              send(msg);
+            }}
+          />
+          <LessonPlanCard
+            session={firstSession}
+            subjects={subjects}
+            profile={profile}
+            onAdopt={(steps) => setPlan((prev) => appendPlan(prev, steps))}
+            onAsk={(msg) => {
+              setTab("chat");
+              send(msg);
+            }}
+          />
           <SubjectsPanel
             subjects={subjects}
             onAdd={addSubject}
@@ -23019,6 +27784,16 @@ function ElioraApp() {
               />
             </div>
           </div>
+          <CourseStudio
+            materials={materials}
+            profile={profile}
+            ns={ns}
+            busyName={materialBusy}
+            error={materialError}
+            onAddMaterial={addMaterial}
+            onMissed={addMissed}
+          />
+          <LessonStudio profile={profile} onMissed={addMissed} />
           <SmartNotes profile={profile} />
           <PresentationPractice />
           <ProjectGrader profile={profile} />
@@ -23029,17 +27804,6 @@ function ElioraApp() {
             onTrack={(m) => logMistake({ ...m, source: "feedback" })}
           />
         </div>
-      )}
-
-      {tab === "together" && (
-        <StudyTogether
-          name={
-            session?.user?.name?.trim() ||
-            profile?.name?.trim() ||
-            session?.user?.email?.split("@")[0] ||
-            "Guest"
-          }
-        />
       )}
 
       {tab === "folder" && (
@@ -23071,18 +27835,31 @@ function ElioraApp() {
               alignItems: m.role === "user" ? "flex-end" : "flex-start",
             }}
           >
+            {/* Above the bubble on purpose: the diagram tool call resolves
+                before the explanation streams, so the picture is already up
+                while Eliora is still talking her way through it. */}
+            {m.visual && (
+              <div style={styles.chatDiagram} className="fade-in">
+                <LessonDiagram visual={m.visual} />
+              </div>
+            )}
             <div
+              className="eliora-bubble"
               style={{
                 ...styles.bubble,
+                // Eliora speaks on a clean card; the learner's own words get
+                // the solid brand fill. Tinting both left them muddled against
+                // the paper background.
                 background:
-                  m.role === "user"
-                    ? "var(--user-bubble)"
-                    : "var(--assistant-bubble)",
+                  m.role === "user" ? "var(--user-bubble)" : "var(--surface)",
                 color:
                   m.role === "user" ? "var(--user-text)" : "var(--assistant-text)",
                 ...(m.role === "user"
                   ? { borderTopRightRadius: 6 }
-                  : { borderTopLeftRadius: 6 }),
+                  : {
+                      borderTopLeftRadius: 6,
+                      border: "1px solid var(--border)",
+                    }),
               }}
             >
               {m.content
@@ -23135,8 +27912,32 @@ function ElioraApp() {
                 </div>
               )}
             </div>
-            {m.role === "assistant" && a11y.readAloud && m.content && (
-              <SpeakButton text={m.content} />
+            {m.role === "assistant" && m.content && (
+              <div style={styles.msgActions}>
+                {a11y.readAloud && (
+                  <SpeakButton text={m.content} voice={tutorVoice} />
+                )}
+                {looksPrintable(m.content) &&
+                  !(busy && i === messages.length - 1) && (
+                    <button
+                      style={styles.speakBtn}
+                      onClick={() =>
+                        printAsPdf(
+                          chatDocTitle(
+                            m.content,
+                            messages
+                              .slice(0, i)
+                              .reverse()
+                              .find((p) => p.role === "user")?.content,
+                          ),
+                          m.content,
+                        )
+                      }
+                    >
+                      📄 Save as PDF
+                    </button>
+                  )}
+              </div>
             )}
             {m.videos && m.videos.length > 0 && <VideoCards videos={m.videos} />}
             {m.socials && m.socials.length > 0 && (
@@ -23313,7 +28114,7 @@ function ElioraApp() {
         </div>
       )}
 
-      <div style={styles.composer}>
+      <div className="eliora-composer" style={styles.composer}>
         <input
           ref={fileInputRef}
           type="file"
@@ -23403,8 +28204,15 @@ function ElioraApp() {
       </div>
       {voiceMode && (
         <VoiceChat
-          onSend={(text) => send(text)}
+          voice={tutorVoice}
+          onSend={(text, opts) => send(text, opts)}
+          onInterrupt={stopReply}
           onClose={() => setVoiceMode(false)}
+          visual={
+            messages[messages.length - 1]?.role === "assistant"
+              ? messages[messages.length - 1]?.visual
+              : undefined
+          }
         />
       )}
         </>
@@ -23426,6 +28234,68 @@ const styles: Record<string, React.CSSProperties> = {
     padding: "0 16px",
   },
   shell: { display: "flex", height: "100vh", width: "100%" },
+  // The "your block is starting" reminder — floats above every tab.
+  nudge: {
+    position: "fixed",
+    right: 16,
+    // Clears the focus-music player, which sits in the same bottom-right corner.
+    bottom: 84,
+    zIndex: 61,
+    width: "min(320px, calc(100vw - 32px))",
+    display: "flex",
+    flexDirection: "column",
+    gap: 6,
+    padding: "12px 14px",
+    borderRadius: 14,
+    border: "1px solid var(--accent)",
+    background: "var(--surface)",
+    boxShadow: "0 10px 30px rgba(0,0,0,0.18)",
+  },
+  nudgeHead: {
+    display: "flex",
+    alignItems: "center",
+    justifyContent: "space-between",
+    gap: 8,
+  },
+  nudgeWhen: {
+    fontSize: 12,
+    fontWeight: 800,
+    color: "var(--accent)",
+    letterSpacing: 0.2,
+  },
+  nudgeClose: {
+    background: "transparent",
+    border: "none",
+    color: "var(--muted)",
+    fontSize: 14,
+    lineHeight: 1,
+    cursor: "pointer",
+    padding: 2,
+  },
+  nudgeText: { fontSize: 15, fontWeight: 700, color: "var(--text)" },
+  nudgeLine: { fontSize: 13, color: "var(--muted)", lineHeight: 1.35 },
+  nudgeActions: { display: "flex", alignItems: "center", gap: 8, marginTop: 4 },
+  nudgeStart: {
+    flex: 1,
+    background: "var(--accent)",
+    color: "var(--primary-foreground)",
+    border: "none",
+    borderRadius: 10,
+    padding: "8px 12px",
+    fontSize: 13.5,
+    fontWeight: 700,
+    cursor: "pointer",
+  },
+  nudgeLater: {
+    background: "transparent",
+    color: "var(--muted)",
+    border: "1px solid var(--border)",
+    borderRadius: 10,
+    padding: "8px 12px",
+    fontSize: 13.5,
+    fontWeight: 700,
+    cursor: "pointer",
+  },
   sideToggle: {
     position: "fixed",
     top: 10,
@@ -23448,10 +28318,12 @@ const styles: Record<string, React.CSSProperties> = {
     borderRightWidth: 1,
     borderRightStyle: "solid",
     borderRightColor: "var(--border)",
-    background: "var(--surface)",
+    // A hair off pure surface so the rail reads as chrome, not content.
+    background:
+      "color-mix(in srgb, var(--surface) 82%, var(--bg))",
     display: "flex",
     flexDirection: "column",
-    padding: "56px 12px 14px",
+    padding: "56px 10px 12px",
     gap: 6,
     boxSizing: "border-box",
   },
@@ -23462,36 +28334,48 @@ const styles: Record<string, React.CSSProperties> = {
     zIndex: 20,
   },
   sideBrand: {
-    fontSize: 22,
-    fontWeight: 700,
-    color: "var(--accent)",
-    padding: "2px 6px 6px",
+    padding: "2px 8px 12px",
+  },
+  sideTagline: {
+    display: "block",
+    marginTop: -2,
   },
   sideNewChat: {
+    display: "flex",
+    alignItems: "center",
+    gap: 8,
     textAlign: "left",
     padding: "10px 12px",
-    borderRadius: 10,
+    borderRadius: "var(--radius-md)",
     borderWidth: 1,
     borderStyle: "solid",
-    borderColor: "var(--border)",
-    background: "var(--bg)",
+    borderColor: "color-mix(in srgb, var(--accent) 22%, var(--border))",
+    background: "var(--accent-soft)",
     fontSize: 14,
     fontWeight: 600,
-    color: "var(--assistant-text)",
+    color: "var(--accent)",
     cursor: "pointer",
   },
-  sideNav: { display: "flex", flexDirection: "column", gap: 2, marginTop: 6 },
+  sideNav: { display: "flex", flexDirection: "column", gap: 1, marginTop: 10 },
   sideNavItem: {
+    display: "flex",
+    alignItems: "center",
+    gap: 9,
     textAlign: "left",
-    padding: "9px 12px",
-    borderRadius: 8,
+    padding: "8px 12px",
+    borderRadius: "var(--radius-sm)",
     border: "none",
     background: "transparent",
     fontSize: 14,
-    color: "var(--assistant-text)",
+    fontWeight: 500,
+    color: "var(--muted)",
     cursor: "pointer",
   },
-  sideNavItemActive: { background: "var(--assistant-bubble)", fontWeight: 700 },
+  sideNavItemActive: {
+    background: "var(--accent-soft)",
+    color: "var(--accent)",
+    fontWeight: 700,
+  },
   sideChatsLabel: {
     display: "flex",
     alignItems: "center",
@@ -23569,7 +28453,7 @@ const styles: Record<string, React.CSSProperties> = {
     gap: 2,
   },
   sideChat: { display: "flex", alignItems: "center", borderRadius: 8 },
-  sideChatActive: { background: "var(--assistant-bubble)" },
+  sideChatActive: { background: "var(--accent-soft)" },
   sideChatBtn: {
     flex: 1,
     textAlign: "left",
@@ -23653,29 +28537,17 @@ const styles: Record<string, React.CSSProperties> = {
     margin: "0 auto",
     width: "100%",
   },
+  // Full-screen mode: the page gives up its reading width and hugs the window.
+  mainColFull: {
+    maxWidth: "none",
+    padding: "58px clamp(16px, 3vw, 40px) 16px",
+  },
+  // Notebook mode: notes plus their chat sit side by side, so the column gets
+  // room for both without giving up a readable line length in the document.
+  mainColWide: {
+    maxWidth: 1340,
+  },
   homeHero: { padding: "4px 2px 8px" },
-  heroRoomBanner: {
-    position: "relative",
-    height: 84,
-    minHeight: 84,
-    flexShrink: 0,
-    borderRadius: 16,
-    marginBottom: 12,
-    overflow: "hidden",
-    display: "flex",
-    alignItems: "center",
-    gap: 12,
-    padding: "0 18px",
-    boxShadow: "var(--shadow-e1)",
-  },
-  heroRoomEmoji: { fontSize: 40 },
-  heroRoomName: {
-    fontSize: 14,
-    fontWeight: 800,
-    color: "rgba(255,255,255,0.95)",
-    textShadow: "0 1px 3px rgba(0,0,0,0.35)",
-    textTransform: "capitalize",
-  },
   roomGrid: {
     display: "grid",
     gridTemplateColumns: "repeat(4, 1fr)",
@@ -23715,7 +28587,7 @@ const styles: Record<string, React.CSSProperties> = {
     borderRadius: 9,
     border: "none",
     background: "var(--accent)",
-    color: "#fff",
+    color: "var(--primary-foreground)",
     fontSize: 13,
     fontWeight: 700,
     cursor: "pointer",
@@ -23768,7 +28640,7 @@ const styles: Record<string, React.CSSProperties> = {
     borderRadius: 9,
     border: "none",
     background: "var(--accent)",
-    color: "#fff",
+    color: "var(--primary-foreground)",
     fontSize: 13,
     fontWeight: 700,
     cursor: "pointer",
@@ -24041,7 +28913,7 @@ const styles: Record<string, React.CSSProperties> = {
     padding: "8px 16px",
     borderRadius: 999,
     background: "var(--accent)",
-    color: "#fff",
+    color: "var(--primary-foreground)",
     fontSize: 14,
     fontWeight: 800,
     boxShadow: "var(--shadow-e1)",
@@ -24301,7 +29173,7 @@ const styles: Record<string, React.CSSProperties> = {
     borderRadius: 10,
     border: "none",
     background: "var(--accent)",
-    color: "#fff",
+    color: "var(--primary-foreground)",
     fontSize: 14,
     fontWeight: 600,
     cursor: "pointer",
@@ -24339,8 +29211,21 @@ const styles: Record<string, React.CSSProperties> = {
   mcChipOn: {
     background: "var(--accent)",
     border: "1px solid var(--accent)",
-    color: "#fff",
+    color: "var(--primary-foreground)",
     fontWeight: 600,
+  },
+  // Text box that opens under a chip row when they pick "Other…".
+  mcOtherInput: {
+    marginTop: 7,
+    width: "100%",
+    boxSizing: "border-box",
+    fontSize: 14,
+    padding: "8px 12px",
+    borderRadius: 10,
+    border: "1px solid var(--accent)",
+    background: "var(--bg)",
+    color: "var(--text)",
+    fontFamily: "inherit",
   },
   careerIdeaList: {
     display: "flex",
@@ -24505,9 +29390,11 @@ const styles: Record<string, React.CSSProperties> = {
   homeHi: {
     margin: 0,
     fontSize: "var(--text-h1)",
-    fontWeight: 800,
-    letterSpacing: "-0.015em",
+    // Lobster ships a single 400 weight, and its letterforms already sit tight
+    // — so no synthetic bolding and no negative tracking here.
+    fontWeight: 400,
     color: "var(--accent)",
+    fontFamily: DISPLAY_FONT,
   },
   homeSub: {
     margin: "8px 0 0",
@@ -24603,14 +29490,16 @@ const styles: Record<string, React.CSSProperties> = {
     marginTop: 14,
   },
   tutorStartBtn: {
-    background: "var(--accent)",
-    color: "#fff",
+    background:
+      "linear-gradient(180deg, var(--accent-2) 0%, var(--accent) 100%)",
+    color: "var(--primary-foreground)",
     border: "none",
-    borderRadius: 12,
-    padding: "10px 16px",
+    borderRadius: "var(--radius-md)",
+    padding: "11px 18px",
     fontSize: 15,
     fontWeight: 700,
     cursor: "pointer",
+    boxShadow: "var(--shadow-e2)",
   },
   tutorVoiceBtn: {
     background: "var(--surface)",
@@ -24728,22 +29617,6 @@ const styles: Record<string, React.CSSProperties> = {
     justifyContent: "center",
     padding: 24,
   },
-  loginCard: {
-    maxWidth: 380,
-    width: "100%",
-    display: "flex",
-    flexDirection: "column",
-    alignItems: "center",
-    textAlign: "center",
-    gap: 16,
-    padding: "36px 28px",
-    borderRadius: 18,
-    borderWidth: 1,
-    borderStyle: "solid",
-    borderColor: "var(--border)",
-    background: "var(--surface)",
-  },
-  loginIntro: { margin: 0, color: "var(--muted)", fontSize: 15, lineHeight: 1.5 },
   loginInput: {
     width: "100%",
     boxSizing: "border-box",
@@ -24768,59 +29641,10 @@ const styles: Record<string, React.CSSProperties> = {
     borderRadius: 12,
     border: "none",
     background: "var(--accent)",
-    color: "#fff",
+    color: "var(--primary-foreground)",
     fontSize: 15,
     fontWeight: 600,
     cursor: "pointer",
-  },
-  loginToggle: { margin: 0, fontSize: 13.5, color: "var(--muted)" },
-  loginToggleLink: {
-    color: "var(--accent)",
-    fontWeight: 600,
-    cursor: "pointer",
-    textDecoration: "underline",
-  },
-  loginDivider: {
-    width: "100%",
-    borderTop: "1px solid var(--border)",
-    textAlign: "center",
-    lineHeight: "0.1em",
-    margin: "4px 0",
-  },
-  loginDividerText: {
-    background: "var(--surface)",
-    color: "var(--muted)",
-    fontSize: 12.5,
-    padding: "0 10px",
-  },
-  googleBtn: {
-    display: "flex",
-    alignItems: "center",
-    justifyContent: "center",
-    gap: 10,
-    width: "100%",
-    padding: "12px 16px",
-    borderRadius: 12,
-    borderWidth: 1,
-    borderStyle: "solid",
-    borderColor: "var(--border)",
-    background: "#fff",
-    color: "#1c2421",
-    fontSize: 15,
-    fontWeight: 600,
-    cursor: "pointer",
-  },
-  googleG: {
-    display: "inline-flex",
-    alignItems: "center",
-    justifyContent: "center",
-    width: 22,
-    height: 22,
-    borderRadius: 11,
-    background: "#4285F4",
-    color: "#fff",
-    fontWeight: 700,
-    fontSize: 14,
   },
   avatar: { width: 18, height: 18, borderRadius: 9, marginRight: 2 },
   label: {
@@ -24886,12 +29710,25 @@ const styles: Record<string, React.CSSProperties> = {
     borderStyle: "solid",
     borderColor: "var(--accent)",
     background: "var(--surface)",
-    color: "#fff",
+    color: "var(--primary-foreground)",
     fontSize: 12,
     lineHeight: "15px",
     textAlign: "center",
   },
   choiceCheckboxSelected: { background: "var(--accent)" },
+  // The text box behind an "Other…" pick — indented under the option it belongs
+  // to, and lighter than the form's own inputs so it reads as part of the list.
+  otherInput: {
+    marginLeft: 28,
+    fontSize: 16,
+    padding: "10px 12px",
+    borderRadius: 10,
+    border: "1px solid var(--accent)",
+    background: "var(--surface)",
+    color: "var(--text)",
+    fontFamily: "inherit",
+    fontWeight: 400,
+  },
   formTextarea: {
     fontSize: 17,
     padding: "12px 14px",
@@ -24908,24 +29745,59 @@ const styles: Record<string, React.CSSProperties> = {
     justifyContent: "flex-end",
     marginTop: 8,
   },
+  // Sign-up wizard: one question per slide.
+  wizardTop: {
+    display: "flex",
+    alignItems: "center",
+    justifyContent: "space-between",
+    gap: 12,
+    marginTop: 4,
+  },
+  wizardCount: { fontSize: 13, fontWeight: 600, color: "var(--muted)" },
+  // A fixed floor keeps the buttons from jumping around between a one-line
+  // question and a long list of choices.
+  wizardSlide: {
+    display: "flex",
+    flexDirection: "column",
+    justifyContent: "center",
+    minHeight: 260,
+  },
+  wizardHint: { margin: 0, fontSize: 13.5, color: "var(--accent)" },
+  wizardActions: {
+    display: "flex",
+    alignItems: "center",
+    justifyContent: "space-between",
+    gap: 10,
+    marginTop: 4,
+  },
+  wizardNextGroup: { display: "flex", alignItems: "center", gap: 14 },
+  wizardAuthSwitch: {
+    margin: "10px 0 0",
+    fontSize: 13.5,
+    color: "var(--muted)",
+    textAlign: "center",
+  },
   primaryBtn: {
-    background: "var(--accent)",
-    color: "#fff",
+    background:
+      "linear-gradient(180deg, var(--accent-2) 0%, var(--accent) 100%)",
+    color: "var(--primary-foreground)",
     border: "none",
-    borderRadius: 14,
+    borderRadius: "var(--radius-lg)",
     padding: "14px 22px",
     fontSize: 17,
     fontWeight: 600,
     cursor: "pointer",
+    boxShadow: "var(--shadow-e2)",
   },
   secondaryBtn: {
-    background: "transparent",
+    background: "var(--surface)",
     color: "var(--muted)",
     border: "1px solid var(--border)",
-    borderRadius: 14,
+    borderRadius: "var(--radius-lg)",
     padding: "14px 22px",
     fontSize: 17,
     cursor: "pointer",
+    boxShadow: "var(--shadow-e1)",
   },
   header: {
     padding: "20px 4px 12px",
@@ -24944,7 +29816,12 @@ const styles: Record<string, React.CSSProperties> = {
     cursor: "pointer",
     whiteSpace: "nowrap",
   },
-  title: { margin: 0, fontSize: 28, color: "var(--accent)" },
+  title: {
+    margin: 0,
+    fontSize: 28,
+    color: "var(--text)",
+    fontFamily: DISPLAY_FONT,
+  },
   subtitle: { margin: "4px 0 0", color: "var(--muted)", fontSize: 16 },
   // Profile card
   card: {
@@ -25004,7 +29881,7 @@ const styles: Record<string, React.CSSProperties> = {
   },
   schedBuildBtn: {
     background: "var(--accent)",
-    color: "#fff",
+    color: "var(--primary-foreground)",
     border: "none",
     borderRadius: 10,
     padding: "8px 14px",
@@ -25012,9 +29889,45 @@ const styles: Record<string, React.CSSProperties> = {
     fontWeight: 700,
     cursor: "pointer",
   },
+  schedRemindBtn: {
+    background: "var(--surface)",
+    color: "var(--muted)",
+    border: "1px solid var(--border)",
+    borderRadius: 10,
+    padding: "8px 12px",
+    fontSize: 13.5,
+    fontWeight: 700,
+    cursor: "pointer",
+  },
+  schedRemindBtnOn: {
+    background: "var(--accent-soft)",
+    color: "var(--accent)",
+    borderColor: "var(--accent)",
+  },
+  schedMin: {
+    flexShrink: 0,
+    display: "flex",
+    alignItems: "center",
+    gap: 3,
+    fontSize: 11.5,
+    fontWeight: 700,
+    color: "var(--muted)",
+  },
+  schedMinInput: {
+    width: 34,
+    fontSize: 12.5,
+    fontWeight: 700,
+    textAlign: "right",
+    padding: "3px 2px",
+    borderRadius: 6,
+    border: "1px solid transparent",
+    background: "transparent",
+    color: "var(--muted)",
+    fontFamily: "inherit",
+  },
   schedSetupBtn: {
     background: "var(--accent)",
-    color: "#fff",
+    color: "var(--primary-foreground)",
     border: "none",
     borderRadius: 10,
     padding: "9px 14px",
@@ -25152,7 +30065,7 @@ const styles: Record<string, React.CSSProperties> = {
   topicBtn: {
     flexShrink: 0,
     background: "var(--accent)",
-    color: "#fff",
+    color: "var(--primary-foreground)",
     border: "none",
     borderRadius: 12,
     padding: "0 16px",
@@ -25284,7 +30197,7 @@ const styles: Record<string, React.CSSProperties> = {
   planEditSave: {
     background: "var(--accent)",
     border: "none",
-    color: "#fff",
+    color: "var(--primary-foreground)",
     borderRadius: 8,
     padding: "6px 16px",
     fontSize: 14,
@@ -25372,7 +30285,7 @@ const styles: Record<string, React.CSSProperties> = {
   },
   tabActive: {
     background: "var(--accent)",
-    color: "#fff",
+    color: "var(--primary-foreground)",
     borderColor: "var(--accent)",
   },
   modalTextarea: {
@@ -25400,6 +30313,113 @@ const styles: Record<string, React.CSSProperties> = {
     color: "var(--assistant-text)",
   },
   resultMd: { fontSize: 16, lineHeight: 1.6, color: "var(--assistant-text)" },
+  // --- Notes workspace: the document pane ---
+  noteDoc: {
+    background: "var(--surface)",
+    border: "1px solid var(--border)",
+    borderRadius: 16,
+    display: "flex",
+    flexDirection: "column",
+    gap: 12,
+    padding: 0,
+    overflow: "hidden",
+  },
+  noteDocHead: {
+    display: "flex",
+    flexWrap: "wrap",
+    alignItems: "center",
+    justifyContent: "space-between",
+    gap: 8,
+    padding: "12px 16px",
+    borderBottom: "1px solid var(--border)",
+    background: "color-mix(in srgb, var(--accent) 6%, transparent)",
+  },
+  noteDocTitle: {
+    fontSize: 15,
+    fontWeight: 800,
+    color: "var(--text)",
+    flex: "1 1 200px",
+    minWidth: 0,
+  },
+  noteDocActions: { display: "flex", flexWrap: "wrap", gap: 6 },
+  noteDocBody: {
+    padding: "6px 22px 22px",
+    fontSize: 16.5,
+    lineHeight: 1.75,
+    color: "var(--assistant-text)",
+  },
+  docH2: {
+    fontSize: 23,
+    fontWeight: 800,
+    color: "var(--accent)",
+    letterSpacing: -0.2,
+    margin: "26px 0 8px",
+  },
+  docH3: {
+    fontSize: 18,
+    fontWeight: 800,
+    color: "var(--accent)",
+    margin: "18px 0 6px",
+  },
+  docP: { margin: "8px 0" },
+  docBullet: {
+    display: "flex",
+    gap: 12,
+    margin: "6px 0",
+    alignItems: "baseline",
+  },
+  docBulletMark: {
+    flexShrink: 0,
+    color: "var(--accent)",
+    fontWeight: 700,
+    minWidth: 12,
+  },
+  // --- Notes workspace: the chat pane ---
+  noteChat: {
+    background: "var(--surface)",
+    border: "1px solid var(--border)",
+    borderRadius: 16,
+    display: "flex",
+    flexDirection: "column",
+    overflow: "hidden",
+  },
+  noteChatHead: {
+    display: "flex",
+    alignItems: "center",
+    gap: 10,
+    padding: "12px 14px",
+    borderBottom: "1px solid var(--border)",
+  },
+  noteChatAvatar: {
+    width: 30,
+    height: 30,
+    borderRadius: 999,
+    display: "grid",
+    placeItems: "center",
+    background: "color-mix(in srgb, var(--accent) 14%, transparent)",
+    fontSize: 15,
+  },
+  noteChatTitle: { fontSize: 15.5, fontWeight: 800, color: "var(--text)" },
+  noteChatBody: {
+    display: "flex",
+    flexDirection: "column",
+    gap: 10,
+    padding: 14,
+    maxHeight: "min(60vh, 560px)",
+    overflowY: "auto",
+  },
+  noteGreet: {
+    fontSize: 14.5,
+    lineHeight: 1.55,
+    color: "var(--muted)",
+  },
+  noteChatFoot: {
+    display: "flex",
+    flexDirection: "column",
+    gap: 8,
+    padding: 12,
+    borderTop: "1px solid var(--border)",
+  },
   qaBox: {
     borderTop: "1px solid var(--border)",
     paddingTop: 12,
@@ -25478,7 +30498,7 @@ const styles: Record<string, React.CSSProperties> = {
   },
   outChipActive: {
     background: "var(--accent)",
-    color: "#fff",
+    color: "var(--primary-foreground)",
     borderColor: "var(--accent)",
   },
   // Focus timer
@@ -25525,7 +30545,7 @@ const styles: Record<string, React.CSSProperties> = {
   },
   sceneNote: {
     fontSize: 14,
-    color: "#1c2421",
+    color: "#2a2350",
     textAlign: "center",
     background: "rgba(255,255,255,0.78)",
     borderRadius: 12,
@@ -25569,7 +30589,7 @@ const styles: Record<string, React.CSSProperties> = {
   },
   levelChip: {
     background: "var(--accent)",
-    color: "#fff",
+    color: "var(--primary-foreground)",
     borderRadius: 999,
     padding: "2px 10px",
     fontSize: 13,
@@ -25594,7 +30614,7 @@ const styles: Record<string, React.CSSProperties> = {
   },
   achToast: {
     background: "var(--accent)",
-    color: "#fff",
+    color: "var(--primary-foreground)",
     borderRadius: 12,
     padding: "10px 14px",
     fontSize: 15,
@@ -25809,6 +30829,12 @@ const styles: Record<string, React.CSSProperties> = {
     background: "var(--accent-soft)",
     color: "var(--accent)",
   },
+  msgActions: {
+    display: "flex",
+    flexWrap: "wrap",
+    gap: 6,
+    alignItems: "center",
+  },
   speakBtn: {
     background: "transparent",
     border: "1px solid var(--border)",
@@ -25838,7 +30864,7 @@ const styles: Record<string, React.CSSProperties> = {
   },
   calAddBtn: {
     background: "var(--accent)",
-    color: "#fff",
+    color: "var(--primary-foreground)",
     border: "none",
     borderRadius: 10,
     padding: "10px 14px",
@@ -26146,7 +31172,7 @@ const styles: Record<string, React.CSSProperties> = {
   },
   practiceTakeChipActive: {
     background: "var(--accent)",
-    color: "#fff",
+    color: "var(--primary-foreground)",
     border: "1px solid var(--accent)",
   },
   planStrip: {
@@ -26281,7 +31307,7 @@ const styles: Record<string, React.CSSProperties> = {
     borderRadius: 8,
     border: "none",
     background: "var(--accent)",
-    color: "#fff",
+    color: "var(--primary-foreground)",
     fontSize: 13,
     fontWeight: 600,
     cursor: "pointer",
@@ -26334,7 +31360,7 @@ const styles: Record<string, React.CSSProperties> = {
     borderRadius: 8,
     border: "none",
     background: "var(--accent)",
-    color: "#fff",
+    color: "var(--primary-foreground)",
     fontSize: 13.5,
     fontWeight: 600,
     cursor: "pointer",
@@ -26399,7 +31425,7 @@ const styles: Record<string, React.CSSProperties> = {
   chatTabNew: {
     flexShrink: 0,
     background: "var(--accent)",
-    color: "#fff",
+    color: "var(--primary-foreground)",
     border: "none",
     borderRadius: 999,
     width: 30,
@@ -26409,7 +31435,7 @@ const styles: Record<string, React.CSSProperties> = {
   },
   viewTabActive: {
     background: "var(--accent)",
-    color: "#fff",
+    color: "var(--primary-foreground)",
     borderColor: "var(--accent)",
   },
   studyScroll: {
@@ -26418,6 +31444,44 @@ const styles: Record<string, React.CSSProperties> = {
     display: "flex",
     flexDirection: "column",
     paddingBottom: 16,
+  },
+  // The tutor's own scroll: wider than a page of prose, since a live session
+  // puts the board, the clock and the thread side by side — but still capped,
+  // because a line of her explaining shouldn't run the width of a monitor.
+  tutorScroll: {
+    flex: 1,
+    overflowY: "auto",
+    display: "flex",
+    flexDirection: "column",
+    paddingBottom: 16,
+    width: "100%",
+    maxWidth: 1180,
+    margin: "0 auto",
+  },
+  fullBleedBar: {
+    display: "flex",
+    alignItems: "center",
+    justifyContent: "space-between",
+    gap: 10,
+    padding: "0 2px 10px",
+  },
+  fullBleedHint: {
+    fontSize: 12.5,
+    fontWeight: 700,
+    color: "var(--muted)",
+    letterSpacing: "0.01em",
+  },
+  fullBleedExit: {
+    borderWidth: 1,
+    borderStyle: "solid",
+    borderColor: "var(--border)",
+    background: "var(--surface)",
+    color: "var(--muted)",
+    borderRadius: 999,
+    padding: "5px 12px",
+    fontSize: 12.5,
+    fontWeight: 700,
+    cursor: "pointer",
   },
   scroll: {
     flex: 1,
@@ -26495,7 +31559,7 @@ const styles: Record<string, React.CSSProperties> = {
     color: "var(--assistant-text)",
   },
   socialNote: { fontSize: 12, color: "var(--muted)", lineHeight: 1.35 },
-  socialOpen: { fontSize: 12, fontWeight: 600, color: "var(--accent, #2f6f4f)" },
+  socialOpen: { fontSize: 12, fontWeight: 600, color: "var(--accent, #7b4bd0)" },
   // Anonymized peer-example cards ("how other students tackled this")
   exampleWrap: {
     display: "flex",
@@ -26515,7 +31579,7 @@ const styles: Record<string, React.CSSProperties> = {
     gap: 5,
     background: "var(--surface)",
     border: "1px solid var(--border)",
-    borderLeft: "3px solid var(--accent, #2f6f4f)",
+    borderLeft: "3px solid var(--accent, #7b4bd0)",
     borderRadius: 12,
     padding: "10px 12px",
   } as React.CSSProperties,
@@ -26529,7 +31593,7 @@ const styles: Record<string, React.CSSProperties> = {
     fontSize: 11,
     fontWeight: 700,
     color: "#fff",
-    background: "var(--accent, #2f6f4f)",
+    background: "var(--accent, #7b4bd0)",
     padding: "2px 8px",
     borderRadius: 999,
   } as React.CSSProperties,
@@ -26587,12 +31651,6 @@ const styles: Record<string, React.CSSProperties> = {
     fontSize: 34,
     color: "#fff",
     textShadow: "0 2px 10px rgba(0,0,0,0.6)",
-  },
-  feedPlayer: {
-    width: "100%",
-    aspectRatio: "16 / 9",
-    border: "none",
-    display: "block",
   },
   feedCardFoot: {
     display: "flex",
@@ -26833,7 +31891,7 @@ const styles: Record<string, React.CSSProperties> = {
     borderRadius: 10,
     padding: "8px 12px",
     background: "var(--accent)",
-    color: "#fff",
+    color: "var(--primary-foreground)",
     fontWeight: 700,
     fontSize: 13,
     cursor: "pointer",
@@ -26935,7 +31993,7 @@ const styles: Record<string, React.CSSProperties> = {
   },
   assignAddBtn: {
     background: "var(--accent)",
-    color: "#fff",
+    color: "var(--primary-foreground)",
     border: "none",
     borderRadius: 10,
     padding: "0 16px",
@@ -27077,7 +32135,7 @@ const styles: Record<string, React.CSSProperties> = {
     height: 20,
     borderRadius: 6,
     background: "var(--accent)",
-    color: "#fff",
+    color: "var(--primary-foreground)",
     fontSize: 12,
     fontWeight: 700,
     display: "inline-flex",
@@ -27282,7 +32340,7 @@ const styles: Record<string, React.CSSProperties> = {
     minWidth: 22,
     textAlign: "center",
   },
-  goalGroupCountOn: { color: "#fff", background: "var(--accent)" },
+  goalGroupCountOn: { color: "var(--primary-foreground)", background: "var(--accent)" },
   goalAchievedToggle: {
     width: "100%",
     textAlign: "left",
@@ -27326,7 +32384,7 @@ const styles: Record<string, React.CSSProperties> = {
     fontWeight: 800,
     letterSpacing: 0.3,
     textTransform: "uppercase",
-    color: "#fff",
+    color: "var(--primary-foreground)",
     background: "var(--accent)",
     padding: "4px 11px",
     borderRadius: 999,
@@ -27457,6 +32515,320 @@ const styles: Record<string, React.CSSProperties> = {
     fontWeight: 600,
     cursor: "pointer",
   },
+  // Lesson diagrams
+  diagramWrap: {
+    margin: "12px 0 4px",
+    padding: 0,
+  },
+  diagramSvg: {
+    width: "100%",
+    height: "auto",
+    display: "block",
+    overflow: "visible",
+  },
+  // A diagram sitting in the chat thread — same card treatment as the bubble
+  // it belongs to, so the two read as one answer.
+  chatDiagram: {
+    maxWidth: "min(86%, 680px)",
+    width: "100%",
+    padding: "6px 18px 10px",
+    borderRadius: "var(--radius-xl)",
+    background: "var(--assistant-bubble)",
+    boxShadow: "var(--shadow-e1)",
+    marginBottom: 8,
+  },
+  diagramCaption: {
+    marginTop: 6,
+    fontSize: 12.5,
+    color: "var(--muted)",
+    textAlign: "center",
+    fontStyle: "italic",
+  },
+
+  // Lessons — read mode
+  lessonHint: { fontSize: 13.5, color: "var(--muted)", marginTop: 4 },
+  lessonModeRow: { display: "flex", gap: 8, marginTop: 10, flexWrap: "wrap" },
+  lessonModeBtn: {
+    flex: 1,
+    minWidth: 120,
+    padding: "9px 12px",
+    borderRadius: 10,
+    border: "1px solid var(--border)",
+    background: "var(--surface)",
+    color: "var(--muted)",
+    fontSize: 14,
+    fontWeight: 600,
+    cursor: "pointer",
+  },
+  lessonModeBtnActive: {
+    borderColor: "var(--accent)",
+    background: "var(--accent-soft)",
+    color: "var(--accent)",
+  },
+  lessonInput: {
+    width: "100%",
+    marginTop: 10,
+    padding: "10px 12px",
+    borderRadius: 10,
+    border: "1px solid var(--border)",
+    background: "var(--surface)",
+    color: "var(--text)",
+    fontSize: 14,
+    fontFamily: "inherit",
+    resize: "vertical",
+  },
+  lessonFile: { marginTop: 8, fontSize: 13, color: "var(--muted)" },
+  lessonErr: { marginTop: 8, fontSize: 13, color: "var(--destructive)" },
+  // Course from your textbook — the module map.
+  courseMatRow: {
+    display: "flex",
+    alignItems: "center",
+    gap: 10,
+    padding: "10px 12px",
+    border: "1px solid var(--border)",
+    borderRadius: 12,
+    background: "var(--surface)",
+    marginTop: 10,
+  },
+  courseBox: {
+    marginTop: 12,
+    padding: 12,
+    border: "1px solid var(--border)",
+    borderRadius: 14,
+    background: "var(--surface)",
+  },
+  courseHead: {
+    display: "flex",
+    alignItems: "baseline",
+    justifyContent: "space-between",
+    gap: 10,
+  },
+  courseTitle: { fontSize: 15.5, fontWeight: 700, color: "var(--text)" },
+  courseIntro: { margin: "4px 0 0", fontSize: 13, color: "var(--muted)" },
+  courseModuleRow: {
+    display: "flex",
+    alignItems: "center",
+    gap: 10,
+    padding: "10px 10px",
+    borderWidth: 1,
+    borderStyle: "solid",
+    borderColor: "var(--border)",
+    borderRadius: 12,
+    background: "var(--elevated)",
+    marginTop: 8,
+  },
+  courseModuleRowNext: { borderColor: "var(--accent)" },
+  courseNum: {
+    flexShrink: 0,
+    width: 28,
+    height: 28,
+    borderRadius: "50%",
+    borderWidth: 1.5,
+    borderStyle: "solid",
+    borderColor: "var(--border)",
+    display: "inline-flex",
+    alignItems: "center",
+    justifyContent: "center",
+    fontSize: 13,
+    fontWeight: 700,
+    color: "var(--muted)",
+  },
+  courseNumDone: {
+    background: "#d8efe0",
+    borderColor: "transparent",
+    color: "#1f6b43",
+  },
+  courseModTitle: {
+    display: "block",
+    fontSize: 14,
+    fontWeight: 600,
+    color: "var(--text)",
+  },
+  courseModGoal: { display: "block", fontSize: 12.5, color: "var(--muted)" },
+  courseModMeta: { display: "block", fontSize: 12, color: "var(--muted)" },
+  lessonBody: { fontSize: 14.5, lineHeight: 1.55, color: "var(--text)", marginTop: 6 },
+  lessonMeta: { fontSize: 12.5, color: "var(--muted)", marginTop: 4 },
+  lessonScore: { fontSize: 15, fontWeight: 700, marginTop: 4, color: "var(--text)" },
+  lessonTerm: { fontSize: 13.5, color: "var(--text)", marginTop: 3 },
+  lessonNote: { fontSize: 13.5, color: "var(--muted)", marginTop: 8, fontStyle: "italic" },
+  lessonProgressTrack: {
+    height: 6,
+    borderRadius: 3,
+    background: "var(--border)",
+    marginTop: 10,
+    overflow: "hidden",
+  },
+  lessonProgressFill: { height: "100%", background: "var(--accent)" },
+  lessonCheckBox: {
+    marginTop: 12,
+    padding: 12,
+    borderRadius: 12,
+    border: "1px solid var(--border)",
+    background: "var(--elevated)",
+  },
+  lessonCheckQ: { fontSize: 14.5, fontWeight: 700, color: "var(--text)" },
+  lessonOpt: {
+    display: "block",
+    width: "100%",
+    textAlign: "left",
+    marginTop: 8,
+    padding: "10px 12px",
+    borderRadius: 10,
+    border: "1px solid var(--border)",
+    background: "var(--surface)",
+    color: "var(--text)",
+    fontSize: 14,
+    cursor: "pointer",
+  },
+  lessonOptCorrect: {
+    borderColor: "var(--accent)",
+    background: "var(--accent-soft)",
+    fontWeight: 700,
+  },
+  lessonOptWrong: { borderColor: "var(--destructive)", background: "#fbeae8" },
+  lessonCheckFb: { marginTop: 10, fontSize: 13.5, color: "var(--muted)" },
+
+  // Lessons — slide (presentation) mode
+  slideStage: { marginTop: 12 },
+  slideBar: { display: "flex", alignItems: "center", gap: 10 },
+  slideCount: {
+    fontSize: 12,
+    fontWeight: 700,
+    color: "var(--muted)",
+    minWidth: 46,
+  },
+  slideProgressTrack: {
+    flex: 1,
+    height: 6,
+    borderRadius: 3,
+    background: "var(--border)",
+    overflow: "hidden",
+  },
+  slideProgressFill: {
+    height: "100%",
+    background: "var(--accent)",
+    transition: "width 220ms ease",
+  },
+  slideExit: {
+    border: "none",
+    background: "none",
+    color: "var(--muted)",
+    fontSize: 13,
+    cursor: "pointer",
+  },
+  slideCard: {
+    marginTop: 10,
+    padding: "26px 24px",
+    minHeight: 320,
+    borderRadius: 18,
+    border: "1px solid var(--border)",
+    background: "var(--elevated)",
+    boxShadow: "0 6px 20px rgba(0,0,0,0.06)",
+    display: "flex",
+    flexDirection: "column",
+    justifyContent: "center",
+    animation: "none",
+  },
+  slideCenter: { textAlign: "center" },
+  slideKicker: {
+    fontSize: 12.5,
+    fontWeight: 700,
+    letterSpacing: 0.6,
+    textTransform: "uppercase",
+    color: "var(--accent)",
+  },
+  slideBigTitle: {
+    fontSize: 30,
+    lineHeight: 1.2,
+    fontWeight: 800,
+    color: "var(--text)",
+    margin: "10px 0 0",
+  },
+  slideTitle: {
+    fontSize: 21,
+    fontWeight: 800,
+    color: "var(--text)",
+    margin: 0,
+  },
+  slideLead: {
+    fontSize: 16,
+    lineHeight: 1.6,
+    color: "var(--muted)",
+    marginTop: 10,
+  },
+  slideBody: { fontSize: 17, lineHeight: 1.65, color: "var(--text)", marginTop: 14 },
+  slideBodySmall: {
+    fontSize: 14,
+    lineHeight: 1.6,
+    color: "var(--muted)",
+    marginTop: 10,
+  },
+  slideNote: { fontSize: 14, color: "var(--accent)", marginTop: 12 },
+  slideTerms: { marginTop: 14 },
+  slideTerm: {
+    display: "flex",
+    gap: 10,
+    padding: "8px 0",
+    borderBottom: "1px solid var(--border)",
+  },
+  slideTermWord: {
+    fontWeight: 700,
+    color: "var(--text)",
+    fontSize: 15,
+    minWidth: 130,
+  },
+  slideTermDef: { color: "var(--muted)", fontSize: 14, lineHeight: 1.5 },
+  slideCheckBox: { marginTop: 14 },
+  slideCheckQ: { fontSize: 17, fontWeight: 700, color: "var(--text)" },
+  slideOpt: {
+    display: "block",
+    width: "100%",
+    textAlign: "left",
+    marginTop: 10,
+    padding: "13px 16px",
+    borderRadius: 12,
+    border: "1px solid var(--border)",
+    background: "var(--surface)",
+    color: "var(--text)",
+    fontSize: 15,
+    cursor: "pointer",
+  },
+  slideCheckFb: { marginTop: 12, fontSize: 14.5, color: "var(--muted)" },
+  slideControls: {
+    display: "flex",
+    alignItems: "center",
+    gap: 8,
+    marginTop: 12,
+  },
+  slideNav: {
+    flex: 1,
+    padding: "11px 14px",
+    borderRadius: 12,
+    border: "1px solid var(--border)",
+    background: "var(--surface)",
+    color: "var(--text)",
+    fontSize: 14,
+    fontWeight: 600,
+    cursor: "pointer",
+  },
+  slidePlay: {
+    flex: 1.2,
+    padding: "11px 14px",
+    borderRadius: 12,
+    border: "1px solid var(--accent)",
+    background: "var(--accent)",
+    color: "var(--primary-foreground)",
+    fontSize: 14,
+    fontWeight: 700,
+    cursor: "pointer",
+  },
+  slideHint: {
+    marginTop: 8,
+    fontSize: 12,
+    color: "var(--muted)",
+    textAlign: "center",
+  },
+
   // Study tools (in the Study tab)
   studyToolsGrid: {
     display: "grid",
@@ -27525,22 +32897,6 @@ const styles: Record<string, React.CSSProperties> = {
     background: "var(--bg)",
     boxShadow: "0 8px 24px rgba(0,0,0,0.18)",
     zIndex: 46,
-  },
-  notifPanel: {
-    position: "absolute",
-    bottom: 44,
-    left: 0,
-    width: 300,
-    maxHeight: 360,
-    overflowY: "auto",
-    padding: "10px 12px",
-    borderRadius: 12,
-    borderWidth: 1,
-    borderStyle: "solid",
-    borderColor: "var(--border)",
-    background: "var(--bg)",
-    boxShadow: "0 8px 24px rgba(0,0,0,0.18)",
-    zIndex: 40,
   },
   notifHead: {
     display: "flex",
@@ -27621,7 +32977,7 @@ const styles: Record<string, React.CSSProperties> = {
     height: 34,
     borderRadius: 17,
     background: "var(--accent)",
-    color: "#fff",
+    color: "var(--primary-foreground)",
     border: "none",
     fontSize: 22,
     lineHeight: 1,
@@ -27730,7 +33086,7 @@ const styles: Record<string, React.CSSProperties> = {
   },
   teachLevelBtnActive: {
     background: "var(--accent)",
-    color: "#fff",
+    color: "var(--primary-foreground)",
   },
   composer: {
     display: "flex",
@@ -27739,6 +33095,7 @@ const styles: Record<string, React.CSSProperties> = {
     marginTop: 4,
     borderTop: "1px solid var(--border)",
     alignItems: "flex-end",
+    transition: "border-color 0.15s ease",
   },
   input: {
     flex: 1,
@@ -27746,35 +33103,40 @@ const styles: Record<string, React.CSSProperties> = {
     resize: "none",
     fontSize: "var(--text-body-lg)",
     lineHeight: 1.5,
-    padding: "12px 16px",
-    borderRadius: "var(--radius-md)",
+    padding: "13px 18px",
+    borderRadius: "var(--radius-lg)",
     border: "1px solid var(--border-strong)",
     background: "var(--surface)",
     color: "var(--text)",
     fontFamily: "inherit",
+    boxShadow: "var(--shadow-e1)",
   },
   sendBtn: {
-    background: "var(--accent)",
+    // A slight vertical gradient keeps the primary action from looking like
+    // a flat block of paint next to the white composer.
+    background:
+      "linear-gradient(180deg, var(--accent-2) 0%, var(--accent) 100%)",
     color: "var(--primary-foreground)",
     border: "none",
-    borderRadius: "var(--radius-md)",
+    borderRadius: "var(--radius-lg)",
     padding: "13px 22px",
     fontSize: "1rem",
     fontWeight: 600,
     cursor: "pointer",
     minWidth: 72,
-    boxShadow: "var(--shadow-e1)",
+    boxShadow: "var(--shadow-e2)",
   },
   micBtn: {
     background: "var(--surface)",
     borderWidth: 1,
     borderStyle: "solid",
     borderColor: "var(--border-strong)",
-    borderRadius: "var(--radius-md)",
+    borderRadius: "var(--radius-lg)",
     padding: "12px 16px",
     fontSize: 18,
     cursor: "pointer",
     lineHeight: 1,
+    boxShadow: "var(--shadow-e1)",
   },
   micBtnActive: {
     background: "#fdecea",
@@ -27827,6 +33189,19 @@ const styles: Record<string, React.CSSProperties> = {
     borderStyle: "solid",
     borderColor: "var(--accent)",
     marginTop: 6,
+  },
+  // With a diagram on the stage the card needs more room, and the orb yields
+  // most of it — the picture is what the learner should be looking at.
+  voiceCardWide: { maxWidth: 620 },
+  voiceOrbSmall: { width: 68, height: 68, fontSize: 28 },
+  voiceDiagram: {
+    width: "100%",
+    padding: "4px 14px 10px",
+    borderRadius: 16,
+    background: "var(--surface)",
+    borderWidth: 1,
+    borderStyle: "solid",
+    borderColor: "var(--border)",
   },
   voiceStatus: { fontSize: 17, fontWeight: 600, color: "var(--text)" },
   voiceHeard: {
@@ -28128,7 +33503,7 @@ const styles: Record<string, React.CSSProperties> = {
   fypViewBtnOn: {
     background: "var(--accent)",
     border: "1px solid var(--accent)",
-    color: "#fff",
+    color: "var(--primary-foreground)",
   },
   fypGridScroll: {
     overflowX: "auto",
@@ -28189,7 +33564,7 @@ const styles: Record<string, React.CSSProperties> = {
     borderRadius: 10,
     border: "none",
     background: "var(--accent)",
-    color: "#fff",
+    color: "var(--primary-foreground)",
     fontSize: 14,
     fontWeight: 600,
     cursor: "pointer",
@@ -28401,7 +33776,7 @@ const styles: Record<string, React.CSSProperties> = {
     borderRadius: 10,
     border: "none",
     background: "var(--accent)",
-    color: "#fff",
+    color: "var(--primary-foreground)",
     fontSize: 14,
     fontWeight: 600,
     cursor: "pointer",
@@ -28441,7 +33816,7 @@ const styles: Record<string, React.CSSProperties> = {
   planSectionBtnActive: {
     background: "var(--accent)",
     borderColor: "var(--accent)",
-    color: "#fff",
+    color: "var(--primary-foreground)",
   },
   // Time management
   timeWorkload: {
@@ -28502,6 +33877,468 @@ const styles: Record<string, React.CSSProperties> = {
     color: "var(--assistant-text)",
   },
   timeLabel: { fontSize: 12, color: "var(--muted)" },
+  // Schedule studio — intake chat on the left, the draggable week on the right.
+  weekWrap: { display: "flex", flexDirection: "column", gap: 12 },
+  // Stacked, not side by side: the main column is capped at 960px, and seven
+  // day-columns squeezed into half of that scroll off the edge unread.
+  weekSplit: { display: "flex", flexDirection: "column", gap: 12 },
+  weekChat: {
+    display: "flex",
+    flexDirection: "column",
+    gap: 8,
+    padding: 14,
+    borderRadius: 16,
+    border: "1px solid var(--border)",
+    background: "var(--surface)",
+  },
+  weekLog: {
+    display: "flex",
+    flexDirection: "column",
+    gap: 8,
+    maxHeight: 340,
+    overflowY: "auto",
+  },
+  weekHers: {
+    alignSelf: "flex-start",
+    maxWidth: "92%",
+    padding: "9px 12px",
+    borderRadius: "14px 14px 14px 4px",
+    background: "var(--assistant-bubble)",
+    color: "var(--assistant-text)",
+    fontSize: 14,
+    lineHeight: 1.45,
+    whiteSpace: "pre-wrap",
+  },
+  weekMine: {
+    alignSelf: "flex-end",
+    maxWidth: "92%",
+    padding: "9px 12px",
+    borderRadius: "14px 14px 4px 14px",
+    background: "var(--user-bubble)",
+    color: "var(--user-text)",
+    fontSize: 14,
+    lineHeight: 1.45,
+    whiteSpace: "pre-wrap",
+  },
+  weekChips: { display: "flex", flexWrap: "wrap", gap: 6 },
+  weekChip: {
+    borderRadius: 999,
+    border: "1px solid var(--border-strong)",
+    background: "var(--surface)",
+    color: "var(--accent)",
+    padding: "6px 12px",
+    fontSize: 12.5,
+    fontWeight: 600,
+    cursor: "pointer",
+  },
+  weekAsk: { display: "flex", gap: 8, alignItems: "center" },
+  weekInput: {
+    flex: 1,
+    minWidth: 0,
+    borderRadius: 999,
+    border: "1px solid var(--border-strong)",
+    background: "var(--surface)",
+    color: "var(--text)",
+    padding: "9px 14px",
+    fontSize: 14,
+  },
+  weekReset: {
+    alignSelf: "flex-start",
+    background: "transparent",
+    border: "none",
+    color: "var(--muted)",
+    fontSize: 12.5,
+    cursor: "pointer",
+    padding: 0,
+  },
+  weekWeek: {
+    padding: 14,
+    borderRadius: 16,
+    border: "1px solid var(--border)",
+    background: "var(--surface)",
+  },
+  weekSummary: {
+    fontSize: 14,
+    color: "var(--assistant-text)",
+    lineHeight: 1.45,
+    margin: "0 0 8px",
+  },
+  weekWarn: {
+    fontSize: 13,
+    color: "var(--warning)",
+    background: "var(--warning-soft)",
+    borderRadius: 10,
+    padding: "8px 10px",
+    margin: "0 0 8px",
+    lineHeight: 1.4,
+  },
+  weekNote: { fontSize: 13, color: "var(--muted)", margin: "10px 0 0" },
+  // Seven columns that collapse to a scrollable strip when the pane is narrow.
+  weekGrid: {
+    display: "grid",
+    gridTemplateColumns: "repeat(7, minmax(104px, 1fr))",
+    gap: 6,
+    overflowX: "auto",
+    paddingBottom: 4,
+  },
+  weekDay: {
+    display: "flex",
+    flexDirection: "column",
+    gap: 5,
+    padding: 6,
+    borderRadius: 12,
+    border: "1px dashed transparent",
+    background: "var(--bg)",
+    minHeight: 90,
+  },
+  weekDayOver: { borderColor: "var(--accent)", background: "var(--accent-soft)" },
+  weekDayHead: {
+    display: "flex",
+    justifyContent: "space-between",
+    alignItems: "baseline",
+    fontSize: 12,
+    fontWeight: 800,
+    color: "var(--text)",
+    letterSpacing: 0.2,
+  },
+  weekDayMin: { fontSize: 11, fontWeight: 600, color: "var(--muted)" },
+  weekFree: { fontSize: 11.5, color: "var(--muted)", padding: "4px 2px" },
+  weekBlock: {
+    borderRadius: 10,
+    borderStyle: "solid",
+    borderWidth: 1,
+    padding: "6px 8px",
+    cursor: "grab",
+    display: "flex",
+    flexDirection: "column",
+    gap: 2,
+  },
+  weekBlockTime: { fontSize: 10.5, fontWeight: 800, letterSpacing: 0.2 },
+  weekBlockTitle: {
+    fontSize: 12.5,
+    fontWeight: 700,
+    color: "var(--text)",
+    lineHeight: 1.25,
+  },
+  weekBlockDetail: { fontSize: 11, color: "var(--muted)", lineHeight: 1.3 },
+  weekEdit: {
+    display: "flex",
+    flexDirection: "column",
+    gap: 4,
+    marginTop: 4,
+    padding: 6,
+    borderRadius: 10,
+    background: "var(--elevated)",
+  },
+  weekEditText: {
+    borderRadius: 8,
+    border: "1px solid var(--border-strong)",
+    background: "var(--surface)",
+    color: "var(--text)",
+    padding: "4px 6px",
+    fontSize: 12,
+    width: "100%",
+    boxSizing: "border-box",
+  },
+  // Stacked, not side by side — a day column is ~100px wide and a time picker
+  // squeezed into half of that shows nothing but its own clock icon.
+  weekEditRow: { display: "flex", flexDirection: "column", gap: 4 },
+  weekEditField: {
+    flex: 1,
+    minWidth: 0,
+    borderRadius: 8,
+    border: "1px solid var(--border-strong)",
+    background: "var(--surface)",
+    color: "var(--text)",
+    padding: "4px 6px",
+    fontSize: 12,
+    boxSizing: "border-box",
+  },
+  weekDrop: {
+    background: "transparent",
+    border: "none",
+    color: "var(--muted)",
+    fontSize: 11.5,
+    cursor: "pointer",
+    padding: 2,
+    textAlign: "left",
+  },
+  // Priority list → schedule
+  prioBlurb: {
+    color: "var(--muted)",
+    margin: "2px 0 10px",
+    fontSize: 13,
+    lineHeight: 1.4,
+  },
+  prioControls: {
+    display: "flex",
+    alignItems: "center",
+    gap: 6,
+    flexWrap: "wrap",
+    marginBottom: 8,
+  },
+  prioBtn: {
+    marginLeft: "auto",
+    borderWidth: 0,
+    borderRadius: 999,
+    padding: "8px 16px",
+    fontSize: 13.5,
+    fontWeight: 700,
+    cursor: "pointer",
+    background: "var(--accent)",
+    color: "var(--primary-foreground)",
+  },
+  prioBtnOff: { opacity: 0.45, cursor: "default" },
+  prioErr: { color: "var(--danger, #e05252)", fontSize: 13, margin: "6px 0" },
+  prioSummary: {
+    fontSize: 14,
+    color: "var(--assistant-text)",
+    lineHeight: 1.45,
+    margin: "6px 0 8px",
+  },
+  prioWarning: {
+    margin: "0 0 10px",
+    padding: "9px 12px",
+    borderRadius: 10,
+    background: "var(--accent-soft)",
+    color: "var(--accent)",
+    fontSize: 13.5,
+    fontWeight: 600,
+    lineHeight: 1.4,
+  },
+  prioItem: {
+    padding: "10px 0",
+    borderTopWidth: 1,
+    borderTopStyle: "solid",
+    borderTopColor: "var(--border)",
+  },
+  prioItemHead: {
+    display: "flex",
+    alignItems: "center",
+    gap: 8,
+    flexWrap: "wrap",
+  },
+  prioRank: {
+    flexShrink: 0,
+    borderRadius: 999,
+    padding: "2px 9px",
+    fontSize: 11.5,
+    fontWeight: 700,
+  },
+  prioRankHigh: { background: "var(--danger, #e05252)", color: "#fff" },
+  prioRankMed: { background: "var(--accent-soft)", color: "var(--accent)" },
+  prioRankLow: { background: "var(--border)", color: "var(--muted)" },
+  prioItemTitle: {
+    flex: 1,
+    fontSize: 15,
+    color: "var(--assistant-text)",
+    minWidth: 120,
+  },
+  prioItemMin: { fontSize: 12.5, fontWeight: 600, color: "var(--muted)" },
+  prioWhy: {
+    fontSize: 13,
+    color: "var(--muted)",
+    lineHeight: 1.4,
+    marginTop: 3,
+  },
+  prioWhen: { fontSize: 12.5, fontWeight: 600, color: "var(--accent)" },
+  prioNeeds: { margin: "4px 0 0", paddingLeft: 22, listStyleType: "decimal" },
+  prioNeed: {
+    fontSize: 13.5,
+    color: "var(--assistant-text)",
+    lineHeight: 1.5,
+    marginBottom: 2,
+  },
+  prioSchedule: {
+    marginTop: 14,
+    paddingTop: 12,
+    borderTopWidth: 1,
+    borderTopStyle: "solid",
+    borderTopColor: "var(--border)",
+  },
+  prioScheduleHead: {
+    fontSize: 14.5,
+    fontWeight: 700,
+    color: "var(--assistant-text)",
+    marginBottom: 8,
+  },
+  prioDay: { marginBottom: 10 },
+  prioDayHead: {
+    display: "flex",
+    alignItems: "baseline",
+    gap: 8,
+    marginBottom: 3,
+  },
+  prioDayName: { fontSize: 13.5, fontWeight: 700, color: "var(--accent)" },
+  prioDayMin: { fontSize: 12, color: "var(--muted)" },
+  prioDayOver: { color: "var(--danger, #e05252)", fontWeight: 600 },
+  prioSlot: {
+    display: "flex",
+    gap: 8,
+    fontSize: 13.5,
+    color: "var(--assistant-text)",
+    lineHeight: 1.45,
+    padding: "2px 0",
+  },
+  prioSlotMin: {
+    flexShrink: 0,
+    width: 40,
+    fontSize: 12,
+    fontWeight: 700,
+    color: "var(--muted)",
+  },
+  prioSlotFocus: { color: "var(--muted)" },
+  prioNote: {
+    fontSize: 13.5,
+    color: "var(--muted)",
+    lineHeight: 1.45,
+    margin: "10px 0 0",
+  },
+  prioApply: {
+    width: "100%",
+    marginTop: 12,
+    borderWidth: 1,
+    borderStyle: "solid",
+    borderColor: "var(--accent)",
+    borderRadius: 10,
+    padding: "10px 14px",
+    fontSize: 14,
+    fontWeight: 700,
+    cursor: "pointer",
+    background: "var(--accent-soft)",
+    color: "var(--accent)",
+  },
+  prioApplyDone: {
+    background: "var(--accent)",
+    color: "var(--primary-foreground)",
+    cursor: "default",
+  },
+  prioApplyHint: {
+    fontSize: 12,
+    color: "var(--muted)",
+    textAlign: "center",
+    marginTop: 5,
+    lineHeight: 1.4,
+  },
+  // Pre-submission draft review
+  revAskFor: {
+    margin: "10px 0 0",
+    padding: "9px 12px",
+    borderRadius: 10,
+    background: "var(--accent-soft)",
+    color: "var(--accent)",
+    fontSize: 13.5,
+    fontWeight: 600,
+    lineHeight: 1.4,
+  },
+  // The grade leads — it's the thing that makes a student act on the rest.
+  revGradeRow: {
+    display: "flex",
+    alignItems: "center",
+    gap: 12,
+    padding: "12px 14px",
+    borderRadius: 12,
+    background: "var(--accent-soft)",
+  },
+  revGrade: {
+    flexShrink: 0,
+    minWidth: 54,
+    textAlign: "center",
+    fontSize: 30,
+    fontWeight: 800,
+    lineHeight: 1.1,
+    color: "var(--accent)",
+  },
+  revGradeLabel: {
+    fontSize: 11.5,
+    fontWeight: 700,
+    letterSpacing: 0.3,
+    textTransform: "uppercase",
+    color: "var(--muted)",
+  },
+  revGradeWhy: {
+    fontSize: 13.5,
+    color: "var(--assistant-text)",
+    lineHeight: 1.45,
+    marginTop: 2,
+  },
+  revDelta: {
+    marginTop: 8,
+    padding: "8px 14px",
+    borderRadius: 12,
+    fontSize: 13,
+    fontWeight: 700,
+    lineHeight: 1.35,
+  },
+  revDeltaReqs: { fontWeight: 600, opacity: 0.85, marginTop: 3 },
+  revDeltaUp: { background: "var(--good-soft, #dff5e6)", color: "#1a7f45" },
+  revDeltaDown: { background: "var(--accent-soft)", color: "var(--danger, #e05252)" },
+  revDeltaFlat: { background: "var(--border)", color: "var(--muted)" },
+  revSection: {
+    marginTop: 14,
+    paddingTop: 12,
+    borderTopWidth: 1,
+    borderTopStyle: "solid",
+    borderTopColor: "var(--border)",
+  },
+  revSectionHead: {
+    fontSize: 14.5,
+    fontWeight: 700,
+    color: "var(--assistant-text)",
+    marginBottom: 8,
+  },
+  revSectionHint: { fontSize: 12, fontWeight: 400, color: "var(--muted)" },
+  revRubricRow: { display: "flex", gap: 8, padding: "5px 0" },
+  revVerdict: { flexShrink: 0, fontSize: 14, lineHeight: 1.5 },
+  revReq: { fontSize: 13.5, fontWeight: 600, lineHeight: 1.4 },
+  revMet: { color: "var(--assistant-text)" },
+  revPartial: { color: "var(--accent)" },
+  revMissing: { color: "var(--danger, #e05252)" },
+  revNote: {
+    fontSize: 12.5,
+    color: "var(--muted)",
+    lineHeight: 1.4,
+    marginTop: 1,
+  },
+  revPoints: {
+    flexShrink: 0,
+    fontSize: 12.5,
+    fontWeight: 700,
+    color: "var(--muted)",
+    fontVariantNumeric: "tabular-nums",
+  },
+  revFix: { display: "flex", gap: 10, padding: "7px 0" },
+  revFixNum: {
+    flexShrink: 0,
+    width: 22,
+    height: 22,
+    borderRadius: 999,
+    display: "flex",
+    alignItems: "center",
+    justifyContent: "center",
+    fontSize: 12,
+    fontWeight: 800,
+    background: "var(--accent)",
+    color: "var(--primary-foreground)",
+  },
+  revFixWhere: {
+    fontSize: 12,
+    fontWeight: 700,
+    color: "var(--accent)",
+    lineHeight: 1.35,
+  },
+  revFixWhat: {
+    fontSize: 13.5,
+    color: "var(--assistant-text)",
+    lineHeight: 1.45,
+  },
+  revFixWhy: { fontSize: 12.5, color: "var(--muted)", lineHeight: 1.4 },
+  revStrength: {
+    fontSize: 13.5,
+    color: "var(--assistant-text)",
+    lineHeight: 1.45,
+    padding: "3px 0",
+  },
   // Split-by-priority control row above the task list.
   budgetSplit: {
     display: "flex",
@@ -28540,6 +34377,58 @@ const styles: Record<string, React.CSSProperties> = {
   prio_high: { background: "#fde2e1", color: "#c0392b" },
   prio_med: { background: "#fdeecb", color: "#b8860b" },
   prio_low: { background: "#e2eef3", color: "#3a6d86" },
+  // Rank a task against the others (↑/↓) and drop it (✕). Pushed to the right
+  // of the title so they stay out of the way until you go looking for them.
+  taskRankBtns: { marginLeft: "auto", display: "flex", gap: 2, flexShrink: 0 },
+  taskRankBtn: {
+    width: 22,
+    height: 22,
+    borderWidth: 0,
+    borderRadius: 6,
+    background: "transparent",
+    color: "var(--muted)",
+    fontSize: 13,
+    lineHeight: 1,
+    cursor: "pointer",
+    display: "flex",
+    alignItems: "center",
+    justifyContent: "center",
+  },
+  // "Add your own task" row at the foot of the list.
+  taskAddRow: {
+    display: "flex",
+    alignItems: "center",
+    gap: 8,
+    marginTop: 10,
+    paddingTop: 10,
+    borderTopWidth: 1,
+    borderTopStyle: "solid",
+    borderTopColor: "var(--border)",
+  },
+  taskAddInput: {
+    flex: 1,
+    minWidth: 0,
+    borderWidth: 1,
+    borderStyle: "solid",
+    borderColor: "var(--border)",
+    borderRadius: 8,
+    padding: "6px 10px",
+    fontSize: 14,
+    background: "var(--surface)",
+    color: "var(--assistant-text)",
+  },
+  taskEditInput: {
+    flex: 1,
+    minWidth: 0,
+    borderWidth: 1,
+    borderStyle: "solid",
+    borderColor: "var(--accent)",
+    borderRadius: 8,
+    padding: "3px 8px",
+    fontSize: 15,
+    background: "var(--surface)",
+    color: "var(--assistant-text)",
+  },
   // "Review your work?" banner
   reviewBanner: {
     display: "flex",
@@ -28560,7 +34449,7 @@ const styles: Record<string, React.CSSProperties> = {
     borderRadius: 999,
     border: "none",
     background: "var(--accent)",
-    color: "#fff",
+    color: "var(--primary-foreground)",
     fontSize: 13.5,
     fontWeight: 700,
     cursor: "pointer",
@@ -28589,7 +34478,7 @@ const styles: Record<string, React.CSSProperties> = {
     padding: "5px 14px",
     borderRadius: 999,
     background: "var(--accent)",
-    color: "#fff",
+    color: "var(--primary-foreground)",
     fontSize: 16,
     fontWeight: 800,
   },
@@ -28689,6 +34578,320 @@ const styles: Record<string, React.CSSProperties> = {
     color: "var(--accent)",
     fontSize: 14,
     fontWeight: 600,
+  },
+  helpTitle: {
+    fontSize: 17,
+    fontWeight: 800,
+    color: "var(--assistant-text)",
+    lineHeight: 1.35,
+  },
+  helpStep: {
+    marginTop: 10,
+    padding: "10px 12px",
+    borderRadius: 12,
+    borderWidth: 1,
+    borderStyle: "solid",
+    borderColor: "var(--border)",
+    background: "var(--surface)",
+  },
+  helpStepHead: { display: "flex", alignItems: "center", gap: 8 },
+  helpStepNum: {
+    flexShrink: 0,
+    width: 22,
+    height: 22,
+    borderRadius: 999,
+    background: "var(--accent)",
+    color: "var(--primary-foreground)",
+    fontSize: 12.5,
+    fontWeight: 800,
+    display: "flex",
+    alignItems: "center",
+    justifyContent: "center",
+  },
+  helpStepTitle: {
+    fontSize: 15,
+    fontWeight: 700,
+    color: "var(--assistant-text)",
+    lineHeight: 1.35,
+  },
+  helpStepBody: {
+    marginTop: 6,
+    fontSize: 14.5,
+    color: "var(--assistant-text)",
+    lineHeight: 1.55,
+  },
+  helpHintBtn: {
+    marginTop: 8,
+    padding: "3px 10px",
+    borderRadius: 999,
+    border: "none",
+    background: "var(--accent-soft)",
+    color: "var(--accent)",
+    fontSize: 12.5,
+    fontWeight: 600,
+    cursor: "pointer",
+  },
+  helpHint: {
+    marginTop: 8,
+    padding: "8px 10px",
+    borderRadius: 10,
+    background: "var(--accent-soft)",
+    color: "var(--assistant-text)",
+    fontSize: 14,
+    lineHeight: 1.5,
+  },
+  helpExample: {
+    padding: "10px 12px",
+    borderRadius: 12,
+    background: "var(--accent-soft)",
+    fontSize: 14.5,
+    color: "var(--assistant-text)",
+    lineHeight: 1.55,
+  },
+  helpNote: {
+    margin: "10px 0 0",
+    fontSize: 13.5,
+    fontStyle: "italic",
+    color: "var(--muted)",
+    lineHeight: 1.5,
+  },
+  helpTalkBtn: {
+    marginTop: 10,
+    width: "100%",
+    padding: "9px 12px",
+    borderRadius: 10,
+    border: "1px solid var(--accent)",
+    background: "transparent",
+    color: "var(--accent)",
+    fontSize: 14,
+    fontWeight: 600,
+    cursor: "pointer",
+  },
+  // A tutoring session. The frame around the conversation — who you're with,
+  // how long you've been at it, and the plan on the corner of the page.
+  sesStart: {
+    marginTop: 12,
+    padding: "12px 14px",
+    borderRadius: 14,
+    borderWidth: 1,
+    borderStyle: "solid",
+    borderColor: "var(--border)",
+    background: "var(--surface)",
+  },
+  sesStartHead: {
+    fontSize: 15.5,
+    fontWeight: 800,
+    color: "var(--assistant-text)",
+  },
+  sesStartBlurb: {
+    margin: "5px 0 0",
+    fontSize: 13.5,
+    color: "var(--muted)",
+    lineHeight: 1.5,
+  },
+  sesHead: {
+    marginTop: 12,
+    padding: "10px 12px",
+    borderRadius: 14,
+    background: "var(--accent-soft)",
+  },
+  sesHeadRow: {
+    display: "flex",
+    alignItems: "baseline",
+    justifyContent: "space-between",
+    gap: 8,
+  },
+  sesHeadWho: {
+    fontSize: 14.5,
+    fontWeight: 800,
+    color: "var(--assistant-text)",
+  },
+  sesClock: {
+    flexShrink: 0,
+    fontSize: 12.5,
+    fontWeight: 700,
+    color: "var(--muted)",
+    fontVariantNumeric: "tabular-nums",
+  },
+  sesClockOver: { color: "var(--accent)" },
+  sesBoard: { marginTop: 8 },
+  sesBeat: {
+    display: "flex",
+    alignItems: "flex-start",
+    gap: 8,
+    padding: "5px 0",
+    opacity: 0.75,
+  },
+  sesBeatOn: { opacity: 1 },
+  // Done beats stay legible but stop competing — you're meant to be looking at
+  // the one she's on, not admiring the ones behind you.
+  sesBeatDone: { opacity: 0.5 },
+  sesBeatMark: {
+    flexShrink: 0,
+    width: 16,
+    fontSize: 12.5,
+    color: "var(--accent)",
+    lineHeight: 1.5,
+  },
+  sesBeatBody: { display: "flex", flexDirection: "column", gap: 1 },
+  sesBeatTitle: {
+    fontSize: 14,
+    fontWeight: 700,
+    color: "var(--assistant-text)",
+    lineHeight: 1.4,
+  },
+  sesBeatMins: { fontWeight: 500, color: "var(--muted)", fontSize: 12.5 },
+  sesBeatGoal: { fontSize: 12.5, color: "var(--muted)", lineHeight: 1.4 },
+  sesThinking: {
+    marginTop: 10,
+    fontSize: 13,
+    fontStyle: "italic",
+    color: "var(--muted)",
+  },
+  sesWrapUrgent: { color: "var(--accent)", fontWeight: 800 },
+  sesRecap: {
+    marginTop: 12,
+    padding: "12px 14px",
+    borderRadius: 14,
+    borderWidth: 1,
+    borderStyle: "solid",
+    borderColor: "var(--border)",
+    background: "var(--surface)",
+  },
+  sesRecapHead: {
+    fontSize: 15.5,
+    fontWeight: 800,
+    color: "var(--assistant-text)",
+  },
+  sesRecapList: { margin: "4px 0 0", paddingLeft: 20 },
+  sesRecapItem: {
+    fontSize: 14,
+    color: "var(--assistant-text)",
+    lineHeight: 1.5,
+    marginTop: 3,
+  },
+  // Language tutor. Target-language text is the loudest thing on the card —
+  // it's what they're meant to read, say, and remember.
+  langThread: { marginTop: 10 },
+  langExchange: {
+    marginTop: 10,
+    paddingTop: 10,
+    borderTopWidth: 1,
+    borderTopStyle: "solid",
+    borderTopColor: "var(--border)",
+  },
+  langYou: {
+    padding: "8px 12px",
+    borderRadius: 12,
+    background: "var(--accent-soft)",
+    color: "var(--assistant-text)",
+    fontSize: 14.5,
+    lineHeight: 1.5,
+  },
+  langReply: {
+    marginTop: 8,
+    padding: "10px 12px",
+    borderRadius: 12,
+    borderWidth: 1,
+    borderStyle: "solid",
+    borderColor: "var(--border)",
+    background: "var(--surface)",
+  },
+  langReplyHead: { display: "flex", alignItems: "baseline", gap: 8 },
+  langReplyText: {
+    flex: 1,
+    fontSize: 16,
+    fontWeight: 700,
+    color: "var(--assistant-text)",
+    lineHeight: 1.45,
+  },
+  langReplyEn: {
+    marginTop: 4,
+    fontSize: 13.5,
+    color: "var(--muted)",
+    lineHeight: 1.5,
+  },
+  langSay: {
+    flexShrink: 0,
+    padding: "2px 7px",
+    borderRadius: 999,
+    border: "none",
+    background: "var(--accent-soft)",
+    color: "var(--accent)",
+    fontSize: 12.5,
+    cursor: "pointer",
+  },
+  langFixes: { marginTop: 8 },
+  langFix: {
+    marginTop: 6,
+    padding: "8px 10px",
+    borderRadius: 10,
+    background: "var(--accent-soft)",
+  },
+  langFixLine: {
+    display: "flex",
+    alignItems: "center",
+    gap: 6,
+    flexWrap: "wrap",
+  },
+  langFixWrong: {
+    fontSize: 14,
+    color: "var(--muted)",
+    textDecoration: "line-through",
+  },
+  langFixArrow: { fontSize: 13, color: "var(--muted)" },
+  langFixRight: {
+    fontSize: 14.5,
+    fontWeight: 700,
+    color: "var(--assistant-text)",
+  },
+  langFixWhy: {
+    marginTop: 3,
+    fontSize: 13,
+    color: "var(--muted)",
+    lineHeight: 1.45,
+  },
+  langPhrases: { marginTop: 4 },
+  langPhrase: {
+    marginTop: 8,
+    padding: "9px 11px",
+    borderRadius: 11,
+    borderWidth: 1,
+    borderStyle: "solid",
+    borderColor: "var(--border)",
+    background: "var(--surface)",
+  },
+  langPhraseHead: { display: "flex", alignItems: "baseline", gap: 8 },
+  langPhraseTarget: {
+    flex: 1,
+    fontSize: 15.5,
+    fontWeight: 700,
+    color: "var(--assistant-text)",
+    lineHeight: 1.4,
+  },
+  langPhraseEn: { marginTop: 3, fontSize: 14, color: "var(--assistant-text)" },
+  langPhraseSay: { marginTop: 3, fontSize: 13, color: "var(--accent)" },
+  langPhraseWhen: {
+    marginTop: 3,
+    fontSize: 12.5,
+    fontStyle: "italic",
+    color: "var(--muted)",
+  },
+  langRewrite: {
+    padding: "10px 12px",
+    borderRadius: 12,
+    background: "var(--accent-soft)",
+  },
+  langTip: {
+    marginTop: 10,
+    padding: "8px 10px",
+    borderRadius: 10,
+    borderWidth: 1,
+    borderStyle: "solid",
+    borderColor: "var(--border)",
+    fontSize: 13.5,
+    color: "var(--assistant-text)",
+    lineHeight: 1.5,
   },
   fypJoins: {
     marginTop: 12,

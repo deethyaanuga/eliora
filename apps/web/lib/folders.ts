@@ -10,16 +10,16 @@ import {
   type SharedFolder,
 } from "@eliora/shared";
 
-// Where shared folders live. Like lib/rooms.ts and lib/notifications.ts, this
+// Where shared folders live. Like lib/doubts.ts and lib/notifications.ts, this
 // is a local JSON file matching Eliora's no-database setup — NOT meant for
 // production scale; a real multi-user deployment should move folders to a real
 // datastore (and swap polling for websockets). Clients poll GET
 // /api/folders/[code] every few seconds; every write goes through here.
 const FILE = path.join(process.cwd(), ".shared-folders.json");
 
-// Unlike study rooms (6h), a folder is meant to last a term — friends share it
-// for a whole class. We still sweep so the file can't grow forever, but only
-// after a long stretch with no activity from anyone.
+// A folder is meant to last a term — friends share it for a whole class. We
+// still sweep so the file can't grow forever, but only after a long stretch
+// with no activity from anyone.
 const FOLDER_TTL_MS = 180 * 24 * 60 * 60 * 1000; // ~6 months
 // Cap items per folder so one runaway client can't bloat the file.
 const MAX_ITEMS = 300;

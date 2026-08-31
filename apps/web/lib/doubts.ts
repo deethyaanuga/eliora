@@ -10,6 +10,7 @@ import {
   DOUBT_REPLY_MAX,
   DOUBT_TITLE_MAX,
   DOUBT_WORK_MAX,
+  normalizeDoubtKind,
   normalizeDoubtScope,
   type Doubt,
   type DoubtGroup,
@@ -17,16 +18,16 @@ import {
   type DoubtVoteValue,
 } from "@eliora/shared";
 
-// Where the doubts board lives. Like lib/rooms.ts and lib/folders.ts this is a
+// Where the doubts board lives. Like lib/folders.ts and lib/users.ts this is a
 // local JSON file matching Eliora's no-database setup — NOT meant for
 // production scale; a real multi-user deployment should move this to a real
 // datastore (and swap polling for websockets). Clients poll GET /api/doubts
 // every few seconds; every write goes through here.
 const FILE = path.join(process.cwd(), ".doubts.json");
 
-// Unlike a study room (6h) a doubt is meant to stay useful — someone hitting
-// the same wall next month should still find the answer. We sweep only after a
-// long stretch with no activity so the file can't grow forever.
+// A doubt is meant to stay useful — someone hitting the same wall next month
+// should still find the answer. We sweep only after a long stretch with no
+// activity so the file can't grow forever.
 const DOUBT_TTL_MS = 180 * 24 * 60 * 60 * 1000; // ~6 months
 // Caps so one runaway client can't bloat the file.
 const MAX_DOUBTS_PER_SCOPE = 500;
@@ -206,8 +207,8 @@ export interface DoubtFeed {
 
 // Every doubt in scope. Returns null when a group scope names a group that
 // doesn't exist, so the client can drop a stale saved code instead of polling
-// forever. Deliberately read-only — unlike a study room, a doubts board has no
-// live presence to maintain, so polling costs nothing but a file read.
+// forever. Deliberately read-only — a doubts board has no live presence to
+// maintain, so polling costs nothing but a file read.
 export function readFeed(scope: string): Promise<DoubtFeed | null> {
   const normalized = normalizeDoubtScope(scope);
   if (!normalized) return Promise.resolve(null);
@@ -223,8 +224,8 @@ export function readFeed(scope: string): Promise<DoubtFeed | null> {
 }
 
 // Every mutation below returns the whole in-scope feed rather than just the
-// changed record, so the client can adopt fresh state in one round trip (same
-// trick the rooms API uses to feel instant between polls).
+// changed record, so the client can adopt fresh state in one round trip and
+// feel instant between polls.
 function feedOf(store: Store, scope: string): DoubtFeed {
   return {
     scope,
@@ -257,27 +258,36 @@ function inScope<T>(
 
 // ---- Posting ---------------------------------------------------------------
 
+// Posts a question ("stuck on this") or a solved write-up ("here's the problem
+// and how I got past it") — same record, same feed, `kind` telling them apart.
+// A fix must actually carry the fix, so `work` is required when kind is
+// "solved" (the route turns the null into a message).
 export function askDoubt(input: {
   scope: string;
   authorId: string;
   authorName: string;
   title: string;
   body: string;
+  kind?: string;
   subject?: string;
   work?: string;
 }): Promise<DoubtFeed | null> {
   return inScope(input.scope, (store, scope) => {
     const title = cleanText(input.title, DOUBT_TITLE_MAX);
     if (!title) return null;
+    const kind = normalizeDoubtKind(input.kind);
+    const work = optionalText(input.work, DOUBT_WORK_MAX);
+    if (kind === "solved" && !work) return null;
     const doubt: Doubt = {
       id: crypto.randomUUID(),
       scope,
+      kind,
       authorId: input.authorId,
       authorName: cleanName(input.authorName),
       subject: optionalText(input.subject, 40),
       title,
       body: cleanText(input.body, DOUBT_BODY_MAX),
-      work: optionalText(input.work, DOUBT_WORK_MAX),
+      work,
       createdAt: Date.now(),
       votes: {},
       replies: [],

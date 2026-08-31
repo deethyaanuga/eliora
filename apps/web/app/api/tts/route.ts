@@ -1,8 +1,10 @@
 import OpenAI from "openai";
 import {
+  ELIORA_TTS_INSTRUCTIONS,
   ELIORA_TTS_MODEL,
   ELIORA_TTS_VOICE,
   ELIORA_TTS_VOICES,
+  speechFriendly,
   type ElioraTtsVoice,
 } from "@eliora/shared";
 
@@ -20,6 +22,10 @@ type TtsRequest = {
   text?: string;
   voice?: string;
   speed?: number;
+  /** Extra delivery direction, appended to the house style (e.g. a tutor's). */
+  instructions?: string;
+  /** BCP-47 tag of the language being spoken, when it isn't English. */
+  lang?: string;
 };
 
 function pickVoice(voice: string | undefined): ElioraTtsVoice {
@@ -39,23 +45,36 @@ export async function POST(req: Request) {
   const text = body.text?.trim();
   if (!text) return new Response("Text required", { status: 400 });
 
-  const input = text.length > MAX_CHARS ? text.slice(0, MAX_CHARS) : text;
+  // Say it the way a person would ("e.g." → "for example") before the voice
+  // ever sees it — no amount of delivery direction saves a literal "arrow".
+  const spoken = speechFriendly(text, body.lang);
+  const input = spoken.length > MAX_CHARS ? spoken.slice(0, MAX_CHARS) : spoken;
   const voice = pickVoice(body.voice);
   const speed =
     typeof body.speed === "number" && body.speed >= 0.25 && body.speed <= 4
       ? body.speed
       : 1;
 
+  // Override with OPENAI_TTS_MODEL (e.g. "tts-1") if your OpenAI project
+  // doesn't have access to the default gpt-4o-mini-tts model.
+  const model = process.env.OPENAI_TTS_MODEL || ELIORA_TTS_MODEL;
+  // Only the gpt-4o-mini-tts generation is steerable; the older tts-1 models
+  // reject `instructions` outright, so they just get the flatter reading.
+  const steerable = model.startsWith("gpt-");
+  const extra = body.instructions?.trim().slice(0, 800);
+  const instructions = extra
+    ? `${ELIORA_TTS_INSTRUCTIONS} ${extra}`
+    : ELIORA_TTS_INSTRUCTIONS;
+
   try {
     const client = new OpenAI(); // reads OPENAI_API_KEY; throws if missing
     const speech = await client.audio.speech.create({
-      // Override with OPENAI_TTS_MODEL (e.g. "tts-1") if your OpenAI project
-      // doesn't have access to the default gpt-4o-mini-tts model.
-      model: process.env.OPENAI_TTS_MODEL || ELIORA_TTS_MODEL,
+      model,
       voice,
       input,
       speed,
       response_format: "mp3",
+      ...(steerable ? { instructions } : {}),
     });
 
     return new Response(speech.body, {

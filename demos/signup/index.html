@@ -1,0 +1,471 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Create your account</title>
+<style>
+  :root{
+    --bg:#ffffff;
+    --panel:#f5f5f7;
+    --ink:#0e0e11;
+    --ink-2:#5c5c68;
+    --ink-3:#8e8e9a;
+    --line:#e6e6ea;
+    --line-2:#d8d8de;
+    --accent:#5b5bd6;
+    --accent-soft:#ececfb;
+    --radius:14px;
+    --ease:cubic-bezier(.22,1,.36,1);
+  }
+
+  *{box-sizing:border-box}
+  html{scroll-behavior:smooth}
+  body{
+    margin:0;
+    background:var(--bg);
+    color:var(--ink);
+    font:15px/1.5 -apple-system,BlinkMacSystemFont,"Inter","Segoe UI",Helvetica,Arial,sans-serif;
+    -webkit-font-smoothing:antialiased;
+  }
+  button{font:inherit;color:inherit;cursor:pointer}
+
+  /* ---------- layout ---------- */
+  .layout{display:grid;grid-template-columns:minmax(420px,44%) 1fr;align-items:start}
+
+  /* ---------- left: static form ---------- */
+  .pane-left{
+    position:sticky;top:0;height:100vh;
+    display:flex;flex-direction:column;
+    padding:40px clamp(32px,5vw,72px);
+    border-right:1px solid var(--line);
+  }
+  .brand{display:flex;align-items:center;gap:10px;font-weight:600;letter-spacing:-.01em}
+  .brand .mark{
+    width:26px;height:26px;border-radius:8px;
+    background:linear-gradient(140deg,var(--ink),#3b3b52);
+    display:grid;place-items:center;color:#fff;font-size:13px;font-weight:700;
+  }
+  .form-wrap{flex:1;display:flex;flex-direction:column;justify-content:center;max-width:380px;width:100%;margin:0 auto}
+  h1{margin:0 0 6px;font-size:28px;line-height:1.2;letter-spacing:-.025em;font-weight:600}
+  .sub{margin:0 0 28px;color:var(--ink-2);font-size:14px}
+
+  .socials{display:grid;gap:8px}
+  .social{
+    display:flex;align-items:center;justify-content:center;gap:9px;
+    height:42px;border:1px solid var(--line-2);border-radius:10px;background:#fff;
+    font-size:14px;font-weight:500;
+    transition:border-color .18s,background .18s,transform .18s var(--ease);
+  }
+  .social:hover{background:#fafafb;border-color:#c4c4cd;transform:translateY(-1px)}
+  .social svg{width:16px;height:16px}
+
+  .divider{display:flex;align-items:center;gap:12px;margin:22px 0;color:var(--ink-3);font-size:12px}
+  .divider::before,.divider::after{content:"";flex:1;height:1px;background:var(--line)}
+
+  .field{margin-bottom:14px}
+  label{display:block;font-size:13px;font-weight:500;margin-bottom:6px}
+  .input-shell{position:relative;display:flex;align-items:center}
+  input{
+    width:100%;height:42px;padding:0 12px;
+    border:1px solid var(--line-2);border-radius:10px;background:#fff;
+    font:inherit;font-size:14px;color:var(--ink);outline:none;
+    transition:border-color .18s,box-shadow .18s;
+  }
+  input::placeholder{color:var(--ink-3)}
+  input:focus{border-color:var(--accent);box-shadow:0 0 0 3px var(--accent-soft)}
+  .peek{
+    position:absolute;right:8px;height:28px;padding:0 8px;border:0;background:none;
+    color:var(--ink-3);font-size:12px;font-weight:500;border-radius:6px;
+  }
+  .peek:hover{color:var(--ink);background:var(--panel)}
+  .hint{margin-top:6px;font-size:12px;color:var(--ink-3)}
+
+  .submit{
+    width:100%;height:44px;margin-top:8px;border:0;border-radius:10px;
+    background:var(--ink);color:#fff;font-size:14px;font-weight:600;letter-spacing:-.01em;
+    transition:transform .18s var(--ease),opacity .18s;
+  }
+  .submit:hover{transform:translateY(-1px);opacity:.92}
+  .submit:active{transform:translateY(0)}
+
+  .fine{margin:16px 0 0;font-size:12px;color:var(--ink-3);text-align:center}
+  .fine a{color:var(--ink-2)}
+  .foot{font-size:13px;color:var(--ink-2);text-align:center}
+  .foot a{color:var(--ink);font-weight:500;text-decoration:none}
+  .foot a:hover{text-decoration:underline}
+
+  /* ---------- right: scroll-driven stage ---------- */
+  .pane-right{position:relative;background:var(--panel)}
+  .pane-right::before{
+    content:"";position:absolute;inset:0;pointer-events:none;
+    background:radial-gradient(120% 80% at 70% 0%,rgba(91,91,214,.10),transparent 60%);
+  }
+  .stage{
+    position:sticky;top:0;height:100vh;
+    display:flex;flex-direction:column;align-items:center;justify-content:center;
+    gap:28px;padding:56px 48px;overflow:hidden;
+  }
+  .steps{margin-top:-100vh}
+  .step{height:100vh}
+
+  .slides{position:relative;width:100%;max-width:560px;height:min(462px,64vh)}
+  .slide{
+    position:absolute;inset:0;
+    display:flex;flex-direction:column;gap:22px;
+    opacity:0;transform:translateY(18px) scale(.985);pointer-events:none;
+    transition:opacity .55s var(--ease),transform .65s var(--ease);
+  }
+  .slide.is-active{opacity:1;transform:none;pointer-events:auto}
+
+  .mock{
+    flex:1;background:#fff;border:1px solid var(--line);border-radius:var(--radius);
+    box-shadow:0 1px 2px rgba(16,16,32,.04),0 18px 44px -18px rgba(16,16,32,.22);
+    overflow:hidden;display:flex;flex-direction:column;
+  }
+  .mock-bar{
+    display:flex;align-items:center;gap:6px;height:34px;padding:0 12px;
+    border-bottom:1px solid var(--line);background:#fbfbfc;flex:none;
+  }
+  .dot{width:9px;height:9px;border-radius:50%;background:#dcdce2}
+  .mock-title{margin-left:8px;font-size:11px;color:var(--ink-3);letter-spacing:.01em}
+
+  .caption{flex:none}
+  .caption .eyebrow{
+    display:inline-block;margin-bottom:8px;padding:3px 9px;border-radius:99px;
+    background:#fff;border:1px solid var(--line);
+    font-size:11px;font-weight:600;letter-spacing:.06em;text-transform:uppercase;color:var(--ink-2);
+  }
+  .caption p{margin:0;font-size:20px;line-height:1.35;letter-spacing:-.02em;font-weight:500;max-width:26ch}
+
+  /* stagger reveal of mock internals */
+  .slide .lift{opacity:0;transform:translateY(10px);transition:opacity .5s var(--ease),transform .5s var(--ease)}
+  .slide.is-active .lift{opacity:1;transform:none}
+  .slide.is-active .lift:nth-of-type(1){transition-delay:.10s}
+  .slide.is-active .lift:nth-of-type(2){transition-delay:.18s}
+  .slide.is-active .lift:nth-of-type(3){transition-delay:.26s}
+  .slide.is-active .lift:nth-of-type(4){transition-delay:.34s}
+
+  /* ---------- slide 1: chat workspace ---------- */
+  .chat{display:grid;grid-template-columns:132px 1fr;flex:1;min-height:0}
+  .chat-side{border-right:1px solid var(--line);padding:12px 10px;background:#fcfcfd}
+  .side-label{font-size:10px;font-weight:600;letter-spacing:.08em;text-transform:uppercase;color:var(--ink-3);margin:0 4px 8px}
+  .side-item{display:flex;align-items:center;gap:7px;padding:6px 7px;border-radius:7px;font-size:12px;color:var(--ink-2)}
+  .side-item.on{background:var(--accent-soft);color:var(--accent);font-weight:600}
+  .pip{width:6px;height:6px;border-radius:50%;background:currentColor;opacity:.6}
+  .chat-main{padding:14px;display:flex;flex-direction:column;gap:10px;min-height:0}
+  .msg{max-width:82%;padding:9px 12px;border-radius:12px;font-size:12.5px;line-height:1.5}
+  .msg.them{background:var(--panel);color:var(--ink);border-bottom-left-radius:4px}
+  .msg.me{background:var(--ink);color:#fff;align-self:flex-end;border-bottom-right-radius:4px}
+  .typing{display:flex;gap:4px;align-items:center;padding:10px 12px;background:var(--panel);border-radius:12px;border-bottom-left-radius:4px;width:fit-content}
+  .typing i{width:5px;height:5px;border-radius:50%;background:var(--ink-3);animation:bounce 1.2s infinite}
+  .typing i:nth-child(2){animation-delay:.15s}
+  .typing i:nth-child(3){animation-delay:.3s}
+  @keyframes bounce{0%,60%,100%{transform:translateY(0);opacity:.4}30%{transform:translateY(-4px);opacity:1}}
+  .composer{margin-top:auto;display:flex;align-items:center;gap:8px;height:34px;padding:0 10px;border:1px solid var(--line-2);border-radius:9px;color:var(--ink-3);font-size:12px}
+  .send{margin-left:auto;width:22px;height:22px;border-radius:6px;background:var(--ink);color:#fff;display:grid;place-items:center;font-size:11px}
+
+  /* ---------- slide 2: code editor ---------- */
+  .editor{display:grid;grid-template-columns:1fr 200px;flex:1;min-height:0;font:12px/1.65 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}
+  .tabs{display:flex;gap:2px;padding:6px 8px 0;border-bottom:1px solid var(--line);background:#fbfbfc;flex:none;font:inherit}
+  .tab{padding:5px 10px;border-radius:7px 7px 0 0;color:var(--ink-3);font-size:11px}
+  .tab.on{background:#fff;color:var(--ink);border:1px solid var(--line);border-bottom-color:#fff;margin-bottom:-1px}
+  .code{padding:12px 0;overflow:hidden;background:#fff}
+  .ln{display:grid;grid-template-columns:34px 1fr;white-space:pre}
+  .ln span:first-child{color:#c3c3cc;text-align:right;padding-right:12px;user-select:none}
+  .ln.hl{background:linear-gradient(90deg,rgba(91,91,214,.07),transparent)}
+  .k{color:#8250df}.s{color:#0a7d3f}.f{color:#0b60d6}.c{color:#9a9aa6}.n{color:#c2410c}
+  .cursor{display:inline-block;width:1px;height:1em;background:var(--accent);vertical-align:-2px;animation:blink 1s steps(1) infinite}
+  @keyframes blink{50%{opacity:0}}
+  .console{border-left:1px solid var(--line);background:#fbfbfc;padding:12px;display:flex;flex-direction:column;gap:7px}
+  .console .head{font-size:10px;font-weight:600;letter-spacing:.08em;text-transform:uppercase;color:var(--ink-3);font-family:-apple-system,sans-serif}
+  .out{font-size:11px;color:var(--ink-2)}
+  .out.ok{color:#0a7d3f}
+  .out.bad{color:#c53030}
+  .bar{height:5px;border-radius:99px;background:#e9e9ef;overflow:hidden;margin-top:auto}
+  .bar i{display:block;height:100%;width:0;background:var(--accent);border-radius:99px}
+  .is-active .bar i{width:86%;transition:width 1.1s .35s var(--ease)}
+
+  /* ---------- slide 3: automation ---------- */
+  .flow{flex:1;min-height:0;padding:16px;display:flex;flex-direction:column;gap:0}
+  .node{display:flex;align-items:center;gap:11px;padding:10px 12px;border:1px solid var(--line);border-radius:11px;background:#fff}
+  .node .ico{width:28px;height:28px;border-radius:8px;display:grid;place-items:center;font-size:13px;background:var(--panel);flex:none}
+  .node .t{font-size:12.5px;font-weight:600;letter-spacing:-.01em}
+  .node .d{font-size:11px;color:var(--ink-3)}
+  .node .state{margin-left:auto;font-size:10px;font-weight:600;letter-spacing:.05em;text-transform:uppercase;color:var(--accent);background:var(--accent-soft);padding:3px 7px;border-radius:99px}
+  .link{height:20px;margin-left:25px;width:2px;background:linear-gradient(#d8d8de,#d8d8de);position:relative}
+  .link::after{content:"";position:absolute;left:-1.5px;top:0;width:5px;height:5px;border-radius:50%;background:var(--accent)}
+  .is-active .link::after{animation:travel 2.2s var(--ease) infinite}
+  @keyframes travel{0%{top:-2px;opacity:0}20%{opacity:1}80%{opacity:1}100%{top:17px;opacity:0}}
+  .runs{margin-top:auto;display:flex;align-items:center;gap:8px;font-size:11px;color:var(--ink-3);padding-top:12px;border-top:1px solid var(--line)}
+  .pulse{width:6px;height:6px;border-radius:50%;background:#22c55e;box-shadow:0 0 0 0 rgba(34,197,94,.5);animation:ping 1.8s infinite}
+  @keyframes ping{70%{box-shadow:0 0 0 6px rgba(34,197,94,0)}100%{box-shadow:0 0 0 0 rgba(34,197,94,0)}}
+
+  /* ---------- progress rail ---------- */
+  .rail{display:flex;gap:8px;flex:none;width:100%;max-width:560px}
+  .tick{width:34px;height:3px;border-radius:99px;background:#dedee4;border:0;padding:0;position:relative;overflow:hidden;transition:background .3s}
+  .tick::after{content:"";position:absolute;inset:0;background:var(--ink);transform:scaleX(0);transform-origin:left;transition:transform .5s var(--ease)}
+  .tick.on::after{transform:scaleX(1)}
+  .tick:hover{background:#c9c9d2}
+
+  /* ---------- mobile: carousel fallback ---------- */
+  @media (max-width:900px){
+    .layout{grid-template-columns:1fr}
+    .pane-left{position:static;height:auto;border-right:0;border-bottom:1px solid var(--line);padding:28px 22px 40px;order:2}
+    .form-wrap{padding-top:28px}
+    .pane-right{order:1}
+    .stage{position:static;height:auto;padding:28px 0 24px;gap:18px}
+    .steps{display:none}
+    .slides{
+      height:auto;max-width:none;
+      display:flex;gap:16px;padding:0 22px;
+      overflow-x:auto;scroll-snap-type:x mandatory;
+      -webkit-overflow-scrolling:touch;scrollbar-width:none;
+    }
+    .slides::-webkit-scrollbar{display:none}
+    .slide{
+      position:static;flex:0 0 85%;scroll-snap-align:center;
+      opacity:1;transform:none;pointer-events:auto;
+    }
+    .slide .lift{opacity:1;transform:none}
+    .mock{height:320px}
+    .caption p{font-size:17px}
+    .rail{align-self:center}
+    .chat{grid-template-columns:104px 1fr}
+    .editor{grid-template-columns:1fr}
+    .console{display:none}
+  }
+  @media (prefers-reduced-motion:reduce){
+    html{scroll-behavior:auto}
+    *,*::after{animation:none!important;transition-duration:.01ms!important}
+  }
+</style>
+</head>
+<body>
+
+<div class="layout">
+
+  <!-- ============ LEFT — fixed ============ -->
+  <aside class="pane-left">
+    <div class="brand"><span class="mark">A</span> Atlas</div>
+
+    <div class="form-wrap">
+      <h1>Create your account</h1>
+      <p class="sub">Free for 14 days. No card required.</p>
+
+      <div class="socials">
+        <button class="social" type="button">
+          <svg viewBox="0 0 24 24"><path fill="#4285F4" d="M23.5 12.3c0-.8-.1-1.6-.2-2.3H12v4.5h6.4a5.5 5.5 0 0 1-2.4 3.6v3h3.9c2.3-2.1 3.6-5.2 3.6-8.8z"/><path fill="#34A853" d="M12 24c3.2 0 6-1.1 8-2.9l-3.9-3a7.2 7.2 0 0 1-10.7-3.8H1.4v3.1A12 12 0 0 0 12 24z"/><path fill="#FBBC05" d="M5.4 14.3a7.1 7.1 0 0 1 0-4.6V6.6H1.4a12 12 0 0 0 0 10.8l4-3.1z"/><path fill="#EA4335" d="M12 4.8c1.8 0 3.4.6 4.6 1.8l3.4-3.4A12 12 0 0 0 1.4 6.6l4 3.1A7.2 7.2 0 0 1 12 4.8z"/></svg>
+          Continue with Google
+        </button>
+        <button class="social" type="button">
+          <svg viewBox="0 0 24 24"><path fill="#181717" d="M12 .5a12 12 0 0 0-3.8 23.4c.6.1.8-.3.8-.6v-2c-3.3.7-4-1.6-4-1.6-.6-1.4-1.4-1.8-1.4-1.8-1.1-.7.1-.7.1-.7 1.2.1 1.9 1.3 1.9 1.3 1.1 1.8 2.8 1.3 3.5 1 .1-.8.4-1.3.8-1.6-2.7-.3-5.5-1.3-5.5-5.9 0-1.3.5-2.4 1.2-3.2-.1-.3-.5-1.5.1-3.2 0 0 1-.3 3.3 1.2a11.5 11.5 0 0 1 6 0C17.3 4.9 18.3 5.2 18.3 5.2c.6 1.7.2 2.9.1 3.2.8.8 1.2 1.9 1.2 3.2 0 4.6-2.8 5.6-5.5 5.9.4.4.8 1.1.8 2.2v3.3c0 .3.2.7.8.6A12 12 0 0 0 12 .5z"/></svg>
+          Continue with GitHub
+        </button>
+      </div>
+
+      <div class="divider">or sign up with email</div>
+
+      <form onsubmit="return false">
+        <div class="field">
+          <label for="email">Email</label>
+          <div class="input-shell">
+            <input id="email" type="email" placeholder="you@company.com" autocomplete="email" />
+          </div>
+        </div>
+
+        <div class="field">
+          <label for="pw">Password</label>
+          <div class="input-shell">
+            <input id="pw" type="password" placeholder="At least 8 characters" autocomplete="new-password" />
+            <button class="peek" type="button" id="peek">Show</button>
+          </div>
+          <p class="hint">Use 8+ characters with a number or symbol.</p>
+        </div>
+
+        <button class="submit" type="submit">Create account</button>
+        <p class="fine">By continuing you agree to our <a href="#">Terms</a> and <a href="#">Privacy Policy</a>.</p>
+      </form>
+    </div>
+
+    <p class="foot">Already have an account? <a href="#">Sign in</a></p>
+  </aside>
+
+  <!-- ============ RIGHT — scroll-driven ============ -->
+  <main class="pane-right">
+    <div class="stage">
+      <div class="slides" id="slides">
+
+        <!-- 1. Collaboration -->
+        <article class="slide is-active" data-i="0">
+          <div class="mock">
+            <div class="mock-bar"><i class="dot"></i><i class="dot"></i><i class="dot"></i><span class="mock-title">Workspace — #product-research</span></div>
+            <div class="chat">
+              <div class="chat-side lift">
+                <p class="side-label">Threads</p>
+                <div class="side-item on"><i class="pip"></i> Research</div>
+                <div class="side-item"><i class="pip"></i> Pricing v2</div>
+                <div class="side-item"><i class="pip"></i> Q3 roadmap</div>
+                <div class="side-item"><i class="pip"></i> Onboarding</div>
+              </div>
+              <div class="chat-main">
+                <div class="msg them lift">Can you compare the two pricing models and flag the risks?</div>
+                <div class="msg me lift">Reading both docs now — I'll lay out the trade-offs side by side.</div>
+                <div class="typing lift"><i></i><i></i><i></i></div>
+                <div class="composer">Message the workspace<span class="send">↑</span></div>
+              </div>
+            </div>
+          </div>
+          <div class="caption">
+            <span class="eyebrow">Collaboration</span>
+            <p>Smart workspace for deep reasoning.</p>
+          </div>
+        </article>
+
+        <!-- 2. Coding -->
+        <article class="slide" data-i="1">
+          <div class="mock">
+            <div class="mock-bar"><i class="dot"></i><i class="dot"></i><i class="dot"></i><span class="mock-title">parser.ts — atlas/core</span></div>
+            <div class="tabs lift"><span class="tab on">parser.ts</span><span class="tab">index.ts</span><span class="tab">parser.test.ts</span></div>
+            <div class="editor">
+              <div class="code lift">
+                <div class="ln"><span>1</span><span><b class="c">// normalize incoming tokens</b></span></div>
+                <div class="ln"><span>2</span><span><b class="k">export function</b> <b class="f">parse</b>(input: <b class="k">string</b>) {</span></div>
+                <div class="ln"><span>3</span><span>  <b class="k">const</b> out = input.<b class="f">trim</b>().<b class="f">split</b>(<b class="s">/\s+/</b>);</span></div>
+                <div class="ln hl"><span>4</span><span>  <b class="k">if</b> (!out.length) <b class="k">throw new</b> <b class="f">Error</b>(<b class="s">"empty"</b>);<i class="cursor"></i></span></div>
+                <div class="ln"><span>5</span><span>  <b class="k">return</b> out.<b class="f">map</b>(t =&gt; t.<b class="f">toLowerCase</b>());</span></div>
+                <div class="ln"><span>6</span><span>}</span></div>
+              </div>
+              <div class="console lift">
+                <p class="head">Tests</p>
+                <p class="out ok">✓ parses spaced input</p>
+                <p class="out ok">✓ lowercases tokens</p>
+                <p class="out bad">✗ throws on empty → fixed</p>
+                <p class="out">3 passed · 0 failed</p>
+                <div class="bar"><i></i></div>
+              </div>
+            </div>
+          </div>
+          <div class="caption">
+            <span class="eyebrow">Coding</span>
+            <p>Write and debug code instantly.</p>
+          </div>
+        </article>
+
+        <!-- 3. Automation -->
+        <article class="slide" data-i="2">
+          <div class="mock">
+            <div class="mock-bar"><i class="dot"></i><i class="dot"></i><i class="dot"></i><span class="mock-title">Flows — Weekly digest</span></div>
+            <div class="flow">
+              <div class="node lift"><span class="ico">✉️</span><span><span class="t">Gmail</span><br><span class="d">New email in “Reports”</span></span><span class="state">Trigger</span></div>
+              <div class="link"></div>
+              <div class="node lift"><span class="ico">✦</span><span><span class="t">Atlas</span><br><span class="d">Summarize and tag by owner</span></span><span class="state">Step 1</span></div>
+              <div class="link"></div>
+              <div class="node lift"><span class="ico">🗂️</span><span><span class="t">Notion</span><br><span class="d">Append to weekly digest</span></span><span class="state">Step 2</span></div>
+              <div class="link"></div>
+              <div class="node lift"><span class="ico">💬</span><span><span class="t">Slack</span><br><span class="d">Post to #leadership</span></span><span class="state">Step 3</span></div>
+              <div class="runs"><i class="pulse"></i> Live · 128 runs this week · 0 errors</div>
+            </div>
+          </div>
+          <div class="caption">
+            <span class="eyebrow">Automation</span>
+            <p>Automate tasks across your platforms.</p>
+          </div>
+        </article>
+
+      </div>
+
+      <div class="rail" id="rail">
+        <button class="tick on" data-i="0" aria-label="Collaboration"></button>
+        <button class="tick" data-i="1" aria-label="Coding"></button>
+        <button class="tick" data-i="2" aria-label="Automation"></button>
+      </div>
+    </div>
+
+    <div class="steps">
+      <section class="step" data-i="0"></section>
+      <section class="step" data-i="1"></section>
+      <section class="step" data-i="2"></section>
+    </div>
+  </main>
+</div>
+
+<script>
+(() => {
+  const slides = [...document.querySelectorAll('.slide')];
+  const ticks  = [...document.querySelectorAll('.tick')];
+  const steps  = [...document.querySelectorAll('.step')];
+  const track  = document.getElementById('slides');
+  const desktop = window.matchMedia('(min-width: 901px)');
+
+  let current = 0;
+  const setActive = (i) => {
+    if (i === current || i < 0 || i > 2) return;
+    current = i;
+    slides.forEach((s, n) => s.classList.toggle('is-active', n === i));
+    ticks.forEach((t, n) => t.classList.toggle('on', n === i));
+  };
+
+  /* --- desktop: scroll drives the slides --- */
+  const io = new IntersectionObserver(
+    (entries) => {
+      if (!desktop.matches) return;
+      entries.forEach(e => { if (e.isIntersecting) setActive(+e.target.dataset.i); });
+    },
+    { rootMargin: '-50% 0px -50% 0px', threshold: 0 }
+  );
+  steps.forEach(s => io.observe(s));
+
+  /* --- hover / click the rail to jump --- */
+  let hoverTimer;
+  ticks.forEach(t => {
+    const go = () => {
+      const i = +t.dataset.i;
+      if (desktop.matches) steps[i].scrollIntoView({ behavior: 'smooth', block: 'start' });
+      else track.scrollTo({ left: slides[i].offsetLeft - track.offsetLeft, behavior: 'smooth' });
+      setActive(i);
+    };
+    t.addEventListener('click', go);
+    t.addEventListener('mouseenter', () => { clearTimeout(hoverTimer); hoverTimer = setTimeout(go, 140); });
+    t.addEventListener('mouseleave', () => clearTimeout(hoverTimer));
+  });
+
+  /* --- mobile: carousel position drives the rail --- */
+  let raf;
+  track.addEventListener('scroll', () => {
+    if (desktop.matches) return;
+    cancelAnimationFrame(raf);
+    raf = requestAnimationFrame(() => {
+      const mid = track.scrollLeft + track.clientWidth / 2;
+      let best = 0, dist = Infinity;
+      slides.forEach((s, n) => {
+        const d = Math.abs(s.offsetLeft + s.offsetWidth / 2 - track.offsetLeft - mid);
+        if (d < dist) { dist = d; best = n; }
+      });
+      ticks.forEach((t, n) => t.classList.toggle('on', n === best));
+      current = best;
+    });
+  }, { passive: true });
+
+  /* on mobile every slide is visible in the carousel */
+  const syncMode = () => {
+    slides.forEach((s, n) => s.classList.toggle('is-active', desktop.matches ? n === current : true));
+    if (!desktop.matches) {
+      track.scrollLeft = slides[current].offsetLeft - track.offsetLeft;
+      ticks.forEach((t, n) => t.classList.toggle('on', n === current));
+    }
+  };
+  desktop.addEventListener('change', syncMode);
+  syncMode();
+
+  /* --- password peek --- */
+  const pw = document.getElementById('pw'), peek = document.getElementById('peek');
+  peek.addEventListener('click', () => {
+    const show = pw.type === 'password';
+    pw.type = show ? 'text' : 'password';
+    peek.textContent = show ? 'Hide' : 'Show';
+  });
+})();
+</script>
+</body>
+</html>

@@ -3,12 +3,16 @@ import {
   assignmentsContext,
   ELIORA_CHAT_MODEL,
   ELIORA_SYSTEM_PROMPT,
+  ELIORA_VOICE_INSTRUCTIONS,
   eventsContext,
   fourYearPlanContext,
   goalsContext,
+  LESSON_VISUAL_GUIDE,
+  LESSON_VISUAL_SCHEMA,
   materialContext,
   mistakesContext,
   normalizeFlashcardStyle,
+  parseLessonVisual,
   planContext,
   profileContext,
   revisionContext,
@@ -33,6 +37,7 @@ import { findExamples, saveExample } from "@/lib/examples";
 //   {"type":"mistake","item":{...}}     a concept for the mistake tracker
 //   {"type":"fourYearPlan","item":{...}} the long-term academic roadmap
 //   {"type":"examples","items":[...]}  anonymized peer examples (how others solved it)
+//   {"type":"visual","item":{...}}     a diagram to draw beside the explanation
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 
@@ -55,6 +60,7 @@ const TOOL_STATUS: Record<string, string> = {
   add_goal: "Saving your goal…",
   log_mistake: "Noting that for your review list…",
   save_four_year_plan: "Updating your roadmap…",
+  draw_visual: "Sketching a diagram…",
   find_student_examples: "Looking at how other students solved this…",
   save_student_example: "Saving this to help other students…",
 };
@@ -501,6 +507,25 @@ const TOOLS: OpenAI.Chat.Completions.ChatCompletionTool[] = [
         },
         required: ["destination", "years"],
       },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "draw_visual",
+      description:
+        "Draw a diagram beside your explanation. Call this the moment you " +
+        "realize what you're about to explain has SHAPE — an order, a " +
+        "contrast, a split, a loop, a chronology, a branching, or an " +
+        "equation — and call it BEFORE you write the explanation out, so the " +
+        "picture is already on screen while the learner reads. The app draws " +
+        "it as a clean diagram, so do NOT re-describe the diagram in words " +
+        "or draw it with text/ASCII; just teach, and let the picture carry " +
+        "the structure. At most one per reply. Skip it entirely for chit-" +
+        "chat, encouragement, a single fact, or anything with no structure " +
+        "worth drawing — a pointless diagram is worse than none.\n" +
+        LESSON_VISUAL_GUIDE,
+      parameters: LESSON_VISUAL_SCHEMA,
     },
   },
   {
@@ -965,6 +990,20 @@ async function runTool(
     send({ type: "quiz", items });
     return `Made a ${items.length}-question quiz.`;
   }
+  if (name === "draw_visual") {
+    const visual = parseLessonVisual(input);
+    if (!visual) {
+      // Tell the model what went wrong so it can teach without the picture
+      // rather than stalling or apologizing to the learner about it.
+      return (
+        "That diagram didn't fit any shape the app can draw (check 'kind' and " +
+        "that you gave enough items). Don't mention this — just explain it in " +
+        "words."
+      );
+    }
+    send({ type: "visual", item: visual });
+    return `Drew a ${visual.kind} diagram. It's on screen — teach around it, don't describe it.`;
+  }
   if (name === "create_subject_folder") {
     const subject = String(input.subject ?? "").trim();
     if (subject) {
@@ -1183,7 +1222,9 @@ export async function POST(req: Request) {
     fourYearPlanContext(body.fourYearPlan) +
     revisionContext(body.missed) +
     mistakesContext(body.mistakes) +
-    subjectsContext(body.subjects);
+    subjectsContext(body.subjects) +
+    // Last, so it wins where it contradicts the written-chat guidance above.
+    (body.voice ? ELIORA_VOICE_INSTRUCTIONS : "");
 
   // Attach image data only for the most recent turns — resending heavy base64
   // photos on every follow-up would balloon cost and hit context limits.
@@ -1249,8 +1290,13 @@ export async function POST(req: Request) {
               // keep effort low (it's a chat coach, not a proof) and the cap
               // roomy — otherwise reasoning can eat it all and the learner
               // gets an empty reply.
-              max_completion_tokens: 4000,
-              reasoning_effort: "low",
+              //
+              // Voice mode trades that thinking time for turn-taking: reasoning
+              // happens BEFORE the first token, and in a spoken conversation
+              // those seconds are silence the learner sits through. The reply is
+              // only a few sentences anyway, so the budget comes down with it.
+              max_completion_tokens: body.voice ? 1200 : 4000,
+              reasoning_effort: body.voice ? "minimal" : "low",
               messages,
               tools: TOOLS,
               stream: true,
@@ -1331,8 +1377,8 @@ export async function POST(req: Request) {
             client,
             {
               model: ELIORA_CHAT_MODEL,
-              max_completion_tokens: 2000,
-              reasoning_effort: "low",
+              max_completion_tokens: body.voice ? 800 : 2000,
+              reasoning_effort: body.voice ? "minimal" : "low",
               messages,
               tools: TOOLS,
               tool_choice: "none",

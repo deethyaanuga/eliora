@@ -3,6 +3,7 @@ node_modules/
 .expo/
 dist/
 *.log
+*.tsbuildinfo
 
 # Env / secrets
 .env
@@ -20,11 +21,6 @@ apps/web/.auth-users.json
 .notif-subs.json
 apps/web/.notif-subs.json
 
-# Local Study Together rooms store (dev only)
-.study-rooms.json
-apps/web/.study-rooms.json
-apps/web/.study-rooms.json.*.tmp
-
 # Local shared-folders store (dev only)
 .shared-folders.json
 apps/web/.shared-folders.json
@@ -38,3 +34,7 @@ apps/web/.doubts.json.*.tmp
 # Local anonymized peer-example bank (dev only)
 .student-examples.json
 apps/web/.student-examples.json
+
+# Local learner-profile store (dev only)
+.learner-profiles.json
+apps/web/.learner-profiles.json

@@ -5,8 +5,8 @@ import {
   type LearnerProfile,
 } from "@eliora/shared";
 
-// Turns one week of the learner's tracked activity (effort/XP, study hours,
-// active days, streak, subjects/topics practiced, concepts captured or still
+// Turns one week of the learner's tracked activity (study hours, active days,
+// subjects/topics practiced, concepts captured or still
 // open, goal progress, what's due) into a warm "what you learned this week"
 // recap + a few forward focuses. Returns { message, focus }. Forces a tool call
 // for clean, structured output — same shape as /api/monthly-report.
@@ -43,12 +43,8 @@ const REPORT_TOOL: OpenAI.Chat.Completions.ChatCompletionTool = {
 type WeeklyReportRequest = {
   weekLabel?: string; // e.g. "Jul 13 – Jul 19, 2026"
   career?: string;
-  xp?: number; // total XP earned in the week
   studyHours?: number; // hours studied in the week
   activeDays?: number; // days with any activity (out of 7)
-  bestDayXp?: number;
-  bestDayLabel?: string;
-  streak?: number; // current day streak (as of now)
   topics?: string[]; // subjects/topics practiced this week
   conceptsLearned?: string[]; // concepts nailed / marked resolved
   mistakesLogged?: number; // new concepts captured to work on this week
@@ -87,19 +83,10 @@ export async function POST(req: Request) {
     body.weekLabel?.trim() ? `Week: ${body.weekLabel.trim()}` : "",
     body.career?.trim() ? `Career goal: ${body.career.trim()}` : "",
     body.quiet ? "This was a QUIET week — little or no tracked activity." : "",
-    n(body.xp) ? `Effort this week: ${body.xp} XP` : "",
     n(body.studyHours)
       ? `Time studied: ${body.studyHours} hour${body.studyHours === 1 ? "" : "s"}`
       : "",
     n(body.activeDays) ? `Active days: ${body.activeDays} of 7` : "",
-    n(body.bestDayXp) && body.bestDayXp! > 0
-      ? `Best single day: ${body.bestDayXp} XP${
-          body.bestDayLabel?.trim() ? ` (${body.bestDayLabel.trim()})` : ""
-        }`
-      : "",
-    n(body.streak) && body.streak! > 0
-      ? `Current streak: ${body.streak} day${body.streak === 1 ? "" : "s"}`
-      : "",
     topics.length ? `Subjects/topics practiced: ${topics.join("; ")}` : "",
     conceptsLearned.length
       ? `Concepts nailed this week: ${conceptsLearned.join("; ")}`

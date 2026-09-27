@@ -43,6 +43,8 @@ import {
   scheduleClock,
   scheduleMinutes,
   sortDoubts,
+  STUDY_BLOCKERS,
+  STUDY_HORIZONS,
   speechFriendly,
   speechLangTag,
   studyTipPrompt,
@@ -64,20 +66,28 @@ import {
   type DayIntakeAnswers,
   type DayIntakeReply,
   type DayIntakeTurn,
+  type DeckCard,
   type DoubtGroup,
   type DoubtKind,
   type DoubtReplyNode,
   type DoubtSort,
   type DoubtView,
   type ElioraTutor,
+  // Aliased: this file already has a <FlashcardDeck> component — the simple
+  // prev/next viewer the summarizer's cards render in. The type is the saved,
+  // editable deck the Flashcards studio keeps.
+  type FlashcardDeck as SavedDeck,
   type Lesson,
   type LessonSize,
   type LessonSlide,
   type LessonVisual,
   type LessonVisualItem,
+  type PresentationFeedback,
   type PriorityInput,
   type PriorityLevel,
   type PriorityPlan,
+  type RubricGrade,
+  type RubricUpload,
   type RubricVerdict,
   // Aliased: the Study tab already has its own hour-grid ScheduleBlock, which
   // is a different thing entirely (one day, one hour per row).
@@ -88,6 +98,8 @@ import {
   type SessionBeat,
   type SessionRecap,
   type StudyMaterial,
+  type TaskBreakdown,
+  type TaskStep,
   type TutorCorrection,
   type TutorLevel,
   type TutorMode,
@@ -126,6 +138,29 @@ const SOCIAL_META: Record<
   youtube: { label: "YouTube", emoji: "▶️", color: "#ff0000" },
   tiktok: { label: "TikTok", emoji: "🎵", color: "#111111" },
   instagram: { label: "Instagram", emoji: "📸", color: "#c13584" },
+};
+// Non-video study resources Eliora recommends (sites, books, practice sets…).
+// `searched` marks a card whose url is a web search rather than the resource
+// itself — the route builds one whenever the model didn't supply a URL it was
+// sure of, so we label the card honestly instead of promising the real page.
+type ResourceKind = "site" | "book" | "practice" | "article" | "course" | "tool";
+type ResourceRec = {
+  kind: ResourceKind;
+  title: string;
+  note?: string;
+  url: string;
+  searched?: boolean;
+};
+const RESOURCE_META: Record<
+  ResourceKind,
+  { label: string; emoji: string; color: string }
+> = {
+  site: { label: "Website", emoji: "🌐", color: "#2f6fd0" },
+  book: { label: "Book", emoji: "📕", color: "#b0472f" },
+  practice: { label: "Practice", emoji: "📝", color: "#1f8a5f" },
+  article: { label: "Article", emoji: "📄", color: "#5a5f6b" },
+  course: { label: "Course", emoji: "🎓", color: "#7b4bd0" },
+  tool: { label: "Tool", emoji: "🧰", color: "#c07a1f" },
 };
 // An anonymized peer example (mirrors StudentExample in @eliora/shared) — how
 // another student worked through a similar problem, shown as a card in chat.
@@ -180,6 +215,7 @@ type Message = {
   content: string;
   videos?: Video[];
   socials?: SocialRec[];
+  resources?: ResourceRec[];
   examples?: StudentExample[];
   flashcards?: Flashcard[];
   quiz?: QuizQuestion[];
@@ -635,11 +671,14 @@ type ScheduleKind = "study" | "break" | "class" | "other";
 // full hour. It also sets the length of the block's focus countdown.
 // `auto` marks a block the time budget laid down itself — re-budgeting clears
 // those and places fresh ones, so the learner's own blocks are never touched.
+// `doneMin` is how many minutes of this block are actually behind them — written
+// when a countdown runs out, so the day's progress bar survives a reload.
 type ScheduleBlock = {
   text: string;
   kind: ScheduleKind;
   min?: number;
   auto?: boolean;
+  doneMin?: number;
 };
 type DaySchedule = { date: string; blocks: Record<number, ScheduleBlock> };
 // The hours the schedule covers: 9:00 (9am) through the 20:00 (8–9pm) block.
@@ -701,6 +740,77 @@ function playTimerChime(): void {
   }
 }
 
+// ── Visual time ────────────────────────────────────────────────────────────
+// "8:42 left" is a number you have to convert into a feeling. The wedge is the
+// feeling directly — a Time Timer face, where the coloured slice is what's
+// still yours and it visibly shrinks back toward twelve o'clock. Paired with
+// the digits, not instead of them: the shape for the glance, the number when
+// you actually want to know.
+function TimeTimerDisc({
+  left,
+  total,
+  size = 20,
+  color = "var(--accent)",
+}: {
+  left: number; // seconds remaining
+  total: number; // seconds the block started with
+  size?: number;
+  color?: string;
+}) {
+  const frac = total > 0 ? Math.min(1, Math.max(0, left / total)) : 0;
+  const c = size / 2;
+  const r = c - 1; // leave room for the 1px rim
+  // The remaining slice, swept clockwise from twelve. A full circle can't be
+  // drawn as one arc (start and end land on the same point), so it gets its own
+  // <circle> rather than a path.
+  const angle = frac * 2 * Math.PI;
+  const wedge =
+    frac >= 0.999
+      ? null
+      : `M ${c} ${c} L ${c} ${c - r} A ${r} ${r} 0 ${
+          frac > 0.5 ? 1 : 0
+        } 1 ${(c + r * Math.sin(angle)).toFixed(2)} ${(
+          c -
+          r * Math.cos(angle)
+        ).toFixed(2)} Z`;
+  return (
+    <svg
+      width={size}
+      height={size}
+      viewBox={`0 0 ${size} ${size}`}
+      aria-hidden="true"
+      style={{ flexShrink: 0, display: "block" }}
+    >
+      <circle
+        cx={c}
+        cy={c}
+        r={r}
+        fill="none"
+        stroke="var(--border)"
+        strokeWidth={1}
+      />
+      {frac <= 0 ? (
+        // Run out: the face turns into a tick rather than an empty ring, so a
+        // finished block reads as finished and not as "never started".
+        <path
+          d={`M ${c - r * 0.45} ${c} L ${c - r * 0.1} ${c + r * 0.38} L ${
+            c + r * 0.5
+          } ${c - r * 0.38}`}
+          fill="none"
+          stroke="#2f6f4f"
+          strokeWidth={Math.max(1.5, size * 0.11)}
+          strokeLinecap="round"
+          strokeLinejoin="round"
+        />
+      ) : wedge === null ? (
+        <circle cx={c} cy={c} r={r} fill={color} opacity={0.85} />
+      ) : (
+        <path d={wedge} fill={color} opacity={0.85} />
+      )}
+    </svg>
+  );
+}
+
 // ── Block reminders ────────────────────────────────────────────────────────
 // When a scheduled block comes around, Eliora says so: a banner in the app, and
 // a browser notification too if the learner allowed one (so it still lands when
@@ -752,13 +862,7 @@ function nudgeLine(kind: ScheduleKind, hour: number): string {
   const lines = NUDGE_LINES[kind] ?? NUDGE_LINES.other;
   return lines[hour % lines.length];
 }
-type EventKind =
-  | "exam"
-  | "final"
-  | "quiz"
-  | "assignment"
-  | "project"
-  | "other";
+type EventKind = "exam" | "final" | "quiz" | "assignment" | "project" | "other";
 type StudyEvent = {
   id: string;
   title: string;
@@ -811,6 +915,7 @@ type Assignment = {
   type?: AssignmentType;
   notes?: string; // anything else the learner wants to remember about it
   concern?: string; // what the learner is worried about / stuck on
+  steps?: TaskStep[]; // "Break it down" checklist — the steps this actually takes
   done: boolean;
 };
 // Turn an ISO due date (YYYY-MM-DD) into a friendly deadline for display:
@@ -852,7 +957,13 @@ function formatDeadline(
 }
 // A SMART goal the learner sets (Specific, Measurable, Achievable, Relevant,
 // Time-bound). Only `specific` is required; `target`/`current` drive a progress bar.
-type GoalTask = { title: string; done: boolean };
+// One step toward a goal, or one prep step for a date on the calendar. `due` is
+// the day the step is meant to happen: paced out from the deadline when the
+// steps are generated (see `paceStepDates`) and the learner's to move
+// afterwards. A step without one simply doesn't appear on the calendar.
+// due: YYYY-MM-DD. `detail` is the notes line under the step — what it actually
+// means, in the learner's own words.
+type GoalTask = { title: string; done: boolean; due?: string; detail?: string };
 type GoalHorizon = "short" | "mid" | "long";
 const GOAL_HORIZONS: {
   key: GoalHorizon;
@@ -1857,7 +1968,6 @@ async function speak(
     onState?.("idle");
   }
 }
-
 
 // Markdown reads badly out loud — strip the syntax (and the emoji Eliora likes
 // to sprinkle in) so the voice says the words and nothing else.
@@ -2948,22 +3058,36 @@ function renderInline(text: string, linkColor: string): React.ReactNode[] {
   return out;
 }
 
-// Lightweight markdown renderer for AI study notes: #/##/### headings, - / *
-// bullets, 1. numbered items, **bold**, and links — kept plain and scannable.
-// (The AI's notes use this structure; chat stays on the simpler renderContent.)
-function renderMarkdown(text: string, linkColor: string): React.ReactNode {
+// Lightweight markdown renderer for Eliora's writing: #/##/### headings, - / *
+// bullets, 1. numbered items, **bold**, ==highlight==, and links — kept plain
+// and scannable. Two variants share one parser so chat and notes can't drift:
+// "notes" is the roomy study-notes page; "chat" is the same structure sized
+// down to sit inside a message bubble.
+function renderMarkdown(
+  text: string,
+  linkColor: string,
+  variant: "notes" | "chat" = "notes",
+): React.ReactNode {
+  const chat = variant === "chat";
+  const h2 = chat ? styles.chatMdH2 : styles.mdH2;
+  const h3 = chat ? styles.chatMdH3 : styles.mdH3;
+  const gap = chat ? 4 : 6;
   const blocks: React.ReactNode[] = [];
   text.split("\n").forEach((raw, i) => {
     const line = raw.replace(/\s+$/, "");
     if (!line.trim()) {
-      blocks.push(<div key={i} style={{ height: 6 }} />);
+      // Leading blank lines would push the first line off the top of a bubble.
+      if (blocks.length) blocks.push(<div key={i} style={{ height: gap }} />);
       return;
     }
+    // A heading that opens the message shouldn't carry its top margin — inside
+    // a bubble that reads as a stray gap under the padding.
+    const first = blocks.length === 0;
     let m: RegExpMatchArray | null;
     if ((m = line.match(/^(#{1,6})\s+(.*)$/))) {
-      const style = m[1].length <= 2 ? styles.mdH2 : styles.mdH3;
+      const style = m[1].length <= 2 ? h2 : h3;
       blocks.push(
-        <div key={i} style={style}>
+        <div key={i} style={first ? { ...style, marginTop: 0 } : style}>
           {renderInline(m[2], linkColor)}
         </div>,
       );
@@ -3222,6 +3346,39 @@ function SocialCards({ socials }: { socials: SocialRec[] }) {
   );
 }
 
+// Study resources that aren't video — sites, books, practice sets, articles.
+// Rendered from the chat stream's {type:"resources"} event (recommend_resources).
+function ResourceCards({ resources }: { resources: ResourceRec[] }) {
+  return (
+    <div style={styles.resourceWrap}>
+      <div style={styles.resourceHeader}>📚 Resources for this</div>
+      {resources.map((r, i) => {
+        const meta = RESOURCE_META[r.kind] ?? RESOURCE_META.site;
+        return (
+          <a
+            key={`${r.kind}-${i}`}
+            href={r.url}
+            target="_blank"
+            rel="noopener noreferrer"
+            style={styles.resourceCard}
+          >
+            <div style={styles.resourceTopRow}>
+              <span style={{ ...styles.resourceBadge, background: meta.color }}>
+                {meta.emoji} {meta.label}
+              </span>
+              <span style={styles.resourceTitle}>{r.title}</span>
+            </div>
+            {r.note && <span style={styles.resourceNote}>{r.note}</span>}
+            <span style={styles.resourceOpen}>
+              {r.searched ? "Search for it →" : "Open →"}
+            </span>
+          </a>
+        );
+      })}
+    </div>
+  );
+}
+
 // Shows a few ANONYMIZED examples of how OTHER students worked through a similar
 // problem, so the learner can feed off the approach. Rendered from the chat
 // stream's {type:"examples"} event (see the chat route's find_student_examples).
@@ -3257,12 +3414,7 @@ function ExampleCards({ examples }: { examples: StudentExample[] }) {
 // (rigorous — precise terms, edge cases, probing follow-ups). Higher rungs
 // expect more depth. Threaded into every teach-back entry point so the
 // challenge Eliora sets matches the pick.
-type TeachLevel =
-  | "kindergarten"
-  | "elementary"
-  | "middle"
-  | "high"
-  | "college";
+type TeachLevel = "kindergarten" | "elementary" | "middle" | "high" | "college";
 
 const TEACH_LEVELS: { id: TeachLevel; label: string; emoji: string; hint: string }[] = [
   { id: "kindergarten", label: "Kindergarten", emoji: "🧸", hint: "Explain the gist to a 5-year-old — plainest words, hints welcome" },
@@ -4089,7 +4241,203 @@ function ConcernField({
   );
 }
 
-// The learner types in their day-to-day assignments / homework here.
+// The AI Task Shredder — the one control that turns any single thing on the
+// plate into the steps it actually takes. Drops into an assignment row, a
+// priority item, an event; anywhere there's a title and a deadline. The parent
+// owns the steps (so they persist wherever that item lives) and this handles
+// the call, the ticking off and the progress bar.
+//
+// The name is the only place the metaphor lives: the steps, the progress and
+// the errors stay in Eliora's plain voice, because someone who's already
+// overwhelmed doesn't need the UI being clever at them.
+function TaskShredder({
+  task,
+  context,
+  subject,
+  due,
+  minutes,
+  profile,
+  steps,
+  onChange,
+}: {
+  task: string;
+  context?: string;
+  subject?: string;
+  due?: string;
+  minutes?: number;
+  profile?: LearnerProfile | null;
+  steps?: TaskStep[];
+  onChange: (steps: TaskStep[] | undefined) => void;
+}) {
+  const [loading, setLoading] = useState(false);
+  const [err, setErr] = useState("");
+  const [meta, setMeta] = useState<{ firstMove?: string; note?: string }>({});
+  const [showDetail, setShowDetail] = useState<Record<number, boolean>>({});
+
+  const list = steps ?? [];
+  const listRef = useRef(list);
+  listRef.current = list;
+  const doneCount = list.filter((s) => s.done).length;
+  const leftMin = list.filter((s) => !s.done).reduce((n, s) => n + s.estMin, 0);
+  const totalMin = list.reduce((n, s) => n + s.estMin, 0);
+  const pct = list.length ? Math.round((doneCount / list.length) * 100) : 0;
+  const fmtMin = (m: number) =>
+    m >= 60 ? `${Math.round((m / 60) * 10) / 10} hr` : `${m} min`;
+
+  async function run() {
+    if (loading || !task.trim()) return;
+    setLoading(true);
+    setErr("");
+    try {
+      const res = await fetch("/api/breakdown", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          task,
+          context: context?.trim() || undefined,
+          subject: subject?.trim() || undefined,
+          due: due || undefined,
+          today: localISO(new Date()),
+          minutes: minutes || undefined,
+          profile: profile ?? undefined,
+        }),
+      });
+      const data = (await res.json()) as {
+        breakdown?: TaskBreakdown;
+        error?: string;
+      };
+      if (data.breakdown) {
+        // Re-running keeps whatever they'd already ticked off — and whatever
+        // day they'd moved a step to — matched by step title. Losing your
+        // progress is a reason never to press the button twice.
+        const before = new Map(
+          list.map((s) => [s.title.toLowerCase(), s] as const),
+        );
+        // Spread the steps between now and the deadline so they land on the
+        // calendar as work with somewhere to sit, the same way goal steps do.
+        // No deadline means no dates — the learner can put them on days
+        // themselves rather than have Eliora invent a schedule.
+        const dues = paceStepDates(data.breakdown.steps.length, due);
+        onChange(
+          data.breakdown.steps.map((s, i) => {
+            const prev = before.get(s.title.toLowerCase());
+            return {
+              ...s,
+              due: prev?.due ?? dues[i],
+              done: !!prev?.done,
+            };
+          }),
+        );
+        setMeta({ firstMove: data.breakdown.firstMove, note: data.breakdown.note });
+        setShowDetail({});
+      } else setErr(data.error || "Couldn't break that down — try again.");
+    } catch {
+      setErr("Couldn't reach Eliora. Check your connection and try again.");
+    }
+    setLoading(false);
+  }
+
+  // Tick off a step. Reads through a ref rather than the render closure so two
+  // fast taps don't both compute from the same stale list and quietly drop one
+  // — React batches anything inside a single tick.
+  function toggle(i: number) {
+    const cur = listRef.current;
+    const next = cur.map((s, n) => (n === i ? { ...s, done: !s.done } : s));
+    listRef.current = next;
+    onChange(next);
+  }
+
+  // Move a step to another day, or clear the day to take it off the calendar.
+  function setDue(i: number, day: string) {
+    const cur = listRef.current;
+    const next = cur.map((s, n) =>
+      n === i ? { ...s, due: day || undefined } : s,
+    );
+    listRef.current = next;
+    onChange(next);
+  }
+
+  if (!list.length) {
+    return (
+      <div style={styles.bdWrap}>
+        <button style={styles.linkBtn} onClick={run} disabled={loading}>
+          {loading ? "Breaking it down…" : "✂️ Shred it into steps"}
+        </button>
+        {err && <div style={styles.bdErr}>{err}</div>}
+      </div>
+    );
+  }
+
+  return (
+    <div style={styles.bdWrap}>
+      <div style={styles.bdName}>✂️ AI Task Shredder</div>
+      <div style={styles.bdHead}>
+        <div style={styles.bdBar}>
+          <div style={{ ...styles.bdBarFill, width: `${pct}%` }} />
+        </div>
+        <span style={styles.bdCount}>
+          {doneCount}/{list.length}
+          {leftMin > 0 ? ` · ${fmtMin(leftMin)} left` : " · done 🎉"}
+        </span>
+      </div>
+      {list.map((s, i) => (
+        <div key={i} style={styles.bdStep}>
+          <button
+            style={{
+              ...styles.assignCheck,
+              ...(s.done ? styles.assignCheckDone : {}),
+            }}
+            onClick={() => toggle(i)}
+            aria-label={s.done ? "Mark step not done" : "Mark step done"}
+          >
+            {s.done ? "✓" : ""}
+          </button>
+          <div style={{ flex: 1 }}>
+            <div style={s.done ? styles.bdStepTitleDone : styles.bdStepTitle}>
+              {s.title}
+            </div>
+            {s.detail &&
+              (showDetail[i] ? (
+                <div style={styles.bdDetail}>{s.detail}</div>
+              ) : (
+                <button
+                  style={styles.bdMore}
+                  onClick={() => setShowDetail((p) => ({ ...p, [i]: true }))}
+                >
+                  what this means
+                </button>
+              ))}
+          </div>
+          {/* The day this step sits on. Clearing it takes the step off the
+              calendar without deleting it — the same deal goal steps get. */}
+          <input
+            type="date"
+            style={styles.bdDate}
+            value={s.due ?? ""}
+            title="The day you'll do this step"
+            onChange={(e) => setDue(i, e.target.value)}
+          />
+          <span style={styles.bdMin}>{fmtMin(s.estMin)}</span>
+        </div>
+      ))}
+      {meta.firstMove && doneCount === 0 && (
+        <div style={styles.bdFirst}>▶ Right now: {meta.firstMove}</div>
+      )}
+      {meta.note && <div style={styles.bdNote}>{meta.note}</div>}
+      <div style={styles.bdFoot}>
+        <span style={styles.bdTotal}>{fmtMin(totalMin)} in total</span>
+        <button style={styles.linkBtn} onClick={run} disabled={loading}>
+          {loading ? "Redoing…" : "↻ Redo"}
+        </button>
+        <button style={styles.linkBtn} onClick={() => onChange(undefined)}>
+          Clear
+        </button>
+      </div>
+      {err && <div style={styles.bdErr}>{err}</div>}
+    </div>
+  );
+}
+
 function AssignmentsPanel({
   assignments,
   subjects,
@@ -4100,6 +4448,7 @@ function AssignmentsPanel({
   onToggleTimeMgmt,
   onSetTime,
   onSetConcern,
+  onSetSteps,
   onAdd,
   onToggle,
   onRemove,
@@ -4113,6 +4462,7 @@ function AssignmentsPanel({
   onToggleTimeMgmt: () => void;
   onSetTime: (id: string, f: { estMin?: number; planDate?: string }) => void;
   onSetConcern: (id: string, concern: string) => void;
+  onSetSteps: (id: string, steps: TaskStep[] | undefined) => void;
   onAdd: (a: {
     title: string;
     subject?: string;
@@ -4313,6 +4663,20 @@ function AssignmentsPanel({
                 <ConcernField
                   value={a.concern}
                   onCommit={(c) => onSetConcern(a.id, c)}
+                />
+              )}
+              {!a.done && (
+                <TaskShredder
+                  task={a.title}
+                  subject={a.subject}
+                  due={a.due}
+                  minutes={a.estMin}
+                  profile={profile}
+                  // What they're stuck on is the most useful thing Eliora has
+                  // for deciding where the hard step really is.
+                  context={[a.notes, a.concern].filter(Boolean).join("\n")}
+                  steps={a.steps}
+                  onChange={(s) => onSetSteps(a.id, s)}
                 />
               )}
             </div>
@@ -4712,6 +5076,7 @@ function ScheduleStudio({
                                 {scheduleClock(b.start)} ·{" "}
                                 {b.min >= 60 ? hrs(b.min) : `${b.min}m`}
                                 {b.fixed ? " · 📌" : ""}
+                                {b.pomodoroMin ? ` · 🍅 ${b.pomodoroMin}m` : ""}
                               </div>
                               <div style={styles.weekBlockTitle}>{b.title}</div>
                               {!!b.detail && (
@@ -4752,6 +5117,25 @@ function ScheduleStudio({
                                     }}
                                   />
                                 </div>
+                                {b.kind === "study" && (
+                                  <div style={styles.weekEditRow}>
+                                    <select
+                                      style={styles.weekEditField}
+                                      value={b.pomodoroMin ?? 0}
+                                      onChange={(e) => {
+                                        const n = parseInt(e.target.value, 10);
+                                        editBlock(b.id, {
+                                          pomodoroMin: n > 0 ? n : undefined,
+                                        });
+                                      }}
+                                    >
+                                      <option value={0}>No pomodoro</option>
+                                      <option value={15}>🍅 15 min sprints</option>
+                                      <option value={25}>🍅 25 min sprints</option>
+                                      <option value={45}>🍅 45 min sprints</option>
+                                    </select>
+                                  </div>
+                                )}
                                 {/* Dragging needs a mouse, so the day is
                                     changeable here too — this is the only way
                                     to move a block on a phone. */}
@@ -4805,11 +5189,13 @@ function PriorityPlanner({
   events,
   profile,
   onApply,
+  onSetSteps,
 }: {
   assignments: Assignment[];
   events: StudyEvent[];
   profile: LearnerProfile | null;
   onApply: (plan: PriorityPlan) => void;
+  onSetSteps: (id: string, steps: TaskStep[] | undefined) => void;
 }) {
   const [perDay, setPerDay] = useState(String(PRIORITY_DEFAULT_MIN_PER_DAY));
   const [loading, setLoading] = useState(false);
@@ -4817,6 +5203,10 @@ function PriorityPlanner({
   const [err, setErr] = useState("");
   const [applied, setApplied] = useState(false);
   const [openNeeds, setOpenNeeds] = useState<Record<string, boolean>>({});
+  // Exams aren't assignments, so there's nowhere on them to hang a checklist —
+  // those steps live here for the session. Anything that IS an assignment
+  // writes through to it, so it's the same list you see on the to-do row.
+  const [examSteps, setExamSteps] = useState<Record<string, TaskStep[]>>({});
 
   const todayISO = localISO(new Date());
   const horizonISO = new Date(Date.now() + 14 * 86_400_000)
@@ -4996,6 +5386,41 @@ function PriorityPlanner({
                     )}
                   </>
                 )}
+                {(() => {
+                  const src = assignments.find((a) => a.id === it.id);
+                  return (
+                    <TaskShredder
+                      task={it.title}
+                      subject={src?.subject}
+                      due={src?.due ?? events.find((e) => e.id === it.id)?.date}
+                      minutes={it.estMin}
+                      profile={profile}
+                      // Eliora already worked out what this needs while
+                      // ranking — hand that over so the steps agree with the
+                      // plan instead of starting from scratch.
+                      context={[
+                        it.why,
+                        it.needs.length
+                          ? `What it needs:\n${it.needs.map((n) => `- ${n}`).join("\n")}`
+                          : "",
+                        src?.concern,
+                      ]
+                        .filter(Boolean)
+                        .join("\n")}
+                      steps={src ? src.steps : examSteps[it.id]}
+                      onChange={(s) => {
+                        if (src) onSetSteps(it.id, s);
+                        else
+                          setExamSteps((p) => {
+                            const next = { ...p };
+                            if (s?.length) next[it.id] = s;
+                            else delete next[it.id];
+                            return next;
+                          });
+                      }}
+                    />
+                  );
+                })()}
               </div>
             );
           })}
@@ -5008,31 +5433,34 @@ function PriorityPlanner({
                 // over. Say so rather than quietly handing them a heavier day.
                 const over = b.totalMin > budget;
                 return (
-                <div key={b.date} style={styles.prioDay}>
-                  <div style={styles.prioDayHead}>
-                    <span style={styles.prioDayName}>{dayLabel(b.date)}</span>
-                    <span
-                      style={{
-                        ...styles.prioDayMin,
-                        ...(over ? styles.prioDayOver : {}),
-                      }}
-                    >
-                      {fmtMin(b.totalMin)}
-                      {over ? ` · over your ${fmtMin(budget)}` : ""}
-                    </span>
-                  </div>
-                  {b.slots.map((s, i) => (
-                    <div key={`${s.id}-${i}`} style={styles.prioSlot}>
-                      <span style={styles.prioSlotMin}>{s.min}m</span>
-                      <span style={{ flex: 1 }}>
-                        {s.title}
-                        {s.focus && (
-                          <span style={styles.prioSlotFocus}> — {s.focus}</span>
-                        )}
+                  <div key={b.date} style={styles.prioDay}>
+                    <div style={styles.prioDayHead}>
+                      <span style={styles.prioDayName}>{dayLabel(b.date)}</span>
+                      <span
+                        style={{
+                          ...styles.prioDayMin,
+                          ...(over ? styles.prioDayOver : {}),
+                        }}
+                      >
+                        {fmtMin(b.totalMin)}
+                        {over ? ` · over your ${fmtMin(budget)}` : ""}
                       </span>
                     </div>
-                  ))}
-                </div>
+                    {b.slots.map((s, i) => (
+                      <div key={`${s.id}-${i}`} style={styles.prioSlot}>
+                        <span style={styles.prioSlotMin}>{s.min}m</span>
+                        <span style={{ flex: 1 }}>
+                          {s.title}
+                          {s.focus && (
+                            <span style={styles.prioSlotFocus}>
+                              {" "}
+                              — {s.focus}
+                            </span>
+                          )}
+                        </span>
+                      </div>
+                    ))}
+                  </div>
                 );
               })}
             </div>
@@ -5264,6 +5692,129 @@ function GoalBuilder({
   );
 }
 
+// One step in a checklist — a goal's steps or an exam's prep steps — drawn the
+// way Google Tasks draws a task: round tick box, title, grey details line, then
+// the day as a chip. Goal steps and prep steps are the same shape and the same
+// handlers (id + index), so they share this rather than keeping two copies of
+// the markup in step with each other.
+function ChecklistRow({
+  task,
+  index,
+  ownerId,
+  maxDate,
+  onToggle,
+  onSetDue,
+  onSetDetail,
+  onHelp,
+}: {
+  task: GoalTask;
+  index: number;
+  ownerId: string;
+  maxDate?: string; // the goal's / exam's own date — a step can't fall after it
+  onToggle: (ownerId: string, index: number) => void;
+  onSetDue: (ownerId: string, index: number, due: string) => void;
+  onSetDetail: (ownerId: string, index: number, detail: string) => void;
+  onHelp?: () => void; // only goal steps offer coaching
+}) {
+  const today = localISO();
+  const [editing, setEditing] = useState(false);
+  const [text, setText] = useState("");
+  const overdue = !task.done && !!task.due && task.due < today;
+  const commit = () => {
+    onSetDetail(ownerId, index, text);
+    setEditing(false);
+  };
+  return (
+    <div style={styles.gtRow}>
+      <button
+        style={{ ...styles.gtCheck, ...(task.done ? styles.gtCheckDone : {}) }}
+        onClick={() => onToggle(ownerId, index)}
+        aria-pressed={task.done}
+        aria-label={task.done ? "Mark not done" : "Mark done"}
+      >
+        {task.done ? "✓" : ""}
+      </button>
+      <div style={styles.gtBody}>
+        <div style={styles.gtTitleLine}>
+          <span
+            style={{
+              ...styles.gtTitle,
+              ...(task.done ? styles.gtTitleDone : {}),
+              cursor: "default",
+            }}
+          >
+            {task.title}
+          </span>
+          {!task.done && onHelp && (
+            <button
+              style={styles.goalTaskHelp}
+              onClick={onHelp}
+              title="Get help with this step"
+            >
+              Help
+            </button>
+          )}
+        </div>
+        {editing ? (
+          <textarea
+            autoFocus
+            rows={2}
+            style={styles.gtDetailInput}
+            value={text}
+            placeholder="Details"
+            aria-label={`Details for “${task.title}”`}
+            onChange={(e) => setText(e.target.value)}
+            onBlur={commit}
+            onKeyDown={(e) => {
+              if (e.key === "Enter" && !e.shiftKey) {
+                e.preventDefault();
+                commit();
+              }
+              if (e.key === "Escape") setEditing(false);
+            }}
+          />
+        ) : (
+          <div
+            style={{
+              ...styles.gtDetail,
+              ...(task.detail ? {} : styles.gtDetailEmpty),
+            }}
+            title="Click to write details"
+            onClick={() => {
+              setText(task.detail ?? "");
+              setEditing(true);
+            }}
+          >
+            {task.detail || "Add details"}
+          </div>
+        )}
+        <div style={styles.gtChips}>
+          {/* The day this step happens — what puts it on the calendar. Clearing
+              it takes it off without deleting the step. */}
+          <label
+            style={{
+              ...styles.gtChip,
+              ...styles.gtChipDue,
+              ...(overdue ? styles.gtChipOverdue : {}),
+            }}
+            title="The day to do this step"
+          >
+            ▤ {task.due ? chipDay(task.due, today) : "No day"}
+            <input
+              type="date"
+              style={styles.gtChipInput}
+              value={task.due ?? ""}
+              max={maxDate || undefined}
+              aria-label={`Day for “${task.title}”`}
+              onChange={(e) => onSetDue(ownerId, index, e.target.value)}
+            />
+          </label>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 // The learner's SMART goals — each with progress, deadline, and the SMART
 // breakdown. New goals are added via the GoalBuilder.
 function GoalsPanel({
@@ -5278,6 +5829,8 @@ function GoalsPanel({
   onRemove,
   onBreakDown,
   onToggleTask,
+  onSetTaskDue,
+  onSetTaskDetail,
   onHelpTask,
   breakingGoalId,
 }: {
@@ -5292,6 +5845,8 @@ function GoalsPanel({
   onRemove: (id: string) => void;
   onBreakDown: (g: SmartGoal) => void;
   onToggleTask: (goalId: string, index: number) => void;
+  onSetTaskDue: (goalId: string, index: number, due: string) => void;
+  onSetTaskDetail: (goalId: string, index: number, detail: string) => void;
   onHelpTask: (goal: SmartGoal, taskTitle: string) => void;
   breakingGoalId: string | null;
 }) {
@@ -5440,44 +5995,22 @@ function GoalsPanel({
         {g.tasks && g.tasks.length > 0 && (
           <div style={styles.goalTasks}>
             <div style={styles.goalTasksHead}>
-              Steps to get there ·{" "}
-              {g.tasks.filter((t) => t.done).length}/{g.tasks.length}
+              Steps to get there · {g.tasks.filter((t) => t.done).length}/
+              {g.tasks.length} · on your calendar
             </div>
             {g.tasks.map((t, i) => (
-              <div key={i} style={styles.goalTaskRow}>
-                <button
-                  style={{ ...styles.goalTaskToggle, flex: 1 }}
-                  onClick={() => onToggleTask(g.id, i)}
-                >
-                  <span
-                    style={{
-                      ...styles.checkbox,
-                      borderColor: "var(--accent)",
-                      background: t.done ? "var(--accent)" : "transparent",
-                      color: t.done ? "#fff" : "transparent",
-                    }}
-                  >
-                    ✓
-                  </span>
-                  <span
-                    style={{
-                      textDecoration: t.done ? "line-through" : "none",
-                      color: t.done ? "var(--muted)" : "var(--assistant-text)",
-                    }}
-                  >
-                    {t.title}
-                  </span>
-                </button>
-                {!t.done && (
-                  <button
-                    style={styles.goalTaskHelp}
-                    onClick={() => onHelpTask(g, t.title)}
-                    title="Get help with this step"
-                  >
-                    Help
-                  </button>
-                )}
-              </div>
+              <ChecklistRow
+                key={i}
+                task={t}
+                index={i}
+                ownerId={g.id}
+                // A step can't land after the goal's own target date.
+                maxDate={g.timeBound}
+                onToggle={onToggleTask}
+                onSetDue={onSetTaskDue}
+                onSetDetail={onSetTaskDetail}
+                onHelp={() => onHelpTask(g, t.title)}
+              />
             ))}
           </div>
         )}
@@ -5674,10 +6207,36 @@ type DailyTask = {
   subject?: string;
   priority?: Priority; // importance ranking (defaults to "med" when unset)
   estMin?: number; // estimated minutes — the time budget for this task
+  date?: string; // YYYY-MM-DD — the day it's for, when that isn't the list's own day
   done: boolean;
   mine?: boolean; // the learner added this one themselves — regeneration keeps it
 };
+// `date` on the state is the day the list was built for; a task's own `date`
+// overrides it, which is how a to-do gets parked on a day further out.
 type DailyTasksState = { date: string; tasks: DailyTask[] };
+// Which day a task actually belongs to.
+const taskDay = (t: DailyTask, listDate: string) => t.date || listDate;
+// A task set for a day that hasn't come round yet. It rides along on today's
+// list so it isn't forgotten, but it isn't today's work: it takes none of
+// today's minutes, none of today's schedule slots, and doesn't count as left.
+const isLaterDay = (t: DailyTask, today: string) => !!t.date && t.date > today;
+
+// The day as it reads on a task's date chip. Google Tasks says "Today" and
+// "Tomorrow" rather than making you work out what the 24th is, and drops the
+// year for anything inside this one.
+const chipDay = (iso: string, today: string) => {
+  if (iso === today) return "Today";
+  const d = new Date(`${iso}T00:00:00`);
+  const t = new Date(`${today}T00:00:00`);
+  const days = Math.round((d.getTime() - t.getTime()) / 86400000);
+  if (days === 1) return "Tomorrow";
+  if (days === -1) return "Yesterday";
+  return d.toLocaleDateString(undefined, {
+    month: "short",
+    day: "numeric",
+    ...(d.getFullYear() === t.getFullYear() ? {} : { year: "numeric" }),
+  });
+};
 
 // When a task carries no estimate of its own, this is how much work we assume it
 // needs — a "high" task is treated as the meatier one.
@@ -5712,13 +6271,16 @@ const taskNeedMin = (t: DailyTask): number =>
 // short, every task is trimmed in proportion to what it needed (with high-priority
 // work trimmed the least), never below 5 min, and rounding drift lands on the
 // highest-priority task so the slices sum back to the block.
+// Tasks parked on a later day sit this out — the block being divided is time on
+// a particular day, and they'll get their share when that day comes.
 function budgetByNeed(
   tasks: DailyTask[],
   blockMin: number,
+  today: string = localISO(),
 ): (number | undefined)[] {
   const idx = tasks
     .map((t, i) => ({ t, i, need: taskNeedMin(t) }))
-    .filter(({ t }) => !t.done && t.title.trim());
+    .filter(({ t }) => !t.done && t.title.trim() && !isLaterDay(t, today));
   const out: (number | undefined)[] = tasks.map(() => undefined);
   if (!idx.length || blockMin < 5) return out;
 
@@ -5842,13 +6404,7 @@ function Suggestions({
 // and subject folders, so the prompts stay on-subject even when the topic is vague.
 type LessonPrompt = { label: string; prompt: string };
 type LessonSubjectKind =
-  | "math"
-  | "cs"
-  | "history"
-  | "science"
-  | "language"
-  | "english"
-  | "generic";
+  "math" | "cs" | "history" | "science" | "language" | "english" | "generic";
 
 function lessonSubjectKind(text: string): LessonSubjectKind {
   const t = text.toLowerCase();
@@ -6753,7 +7309,7 @@ function DeadlineCountdownCard({
 
 // A progress-aware nudge for the day's task list. Picks an encouraging line from
 // how far the learner has gotten so momentum itself becomes the reward: an empty
-// list invites a first small win, a partial list names the streak, a full list
+// list invites a first small win, a partial list names the progress, a full list
 // celebrates. `seed` (the done count) rotates the copy so it doesn't feel canned.
 function taskCheer(done: number, total: number, seed: number): string {
   const pick = (msgs: string[]) => msgs[seed % msgs.length];
@@ -6794,9 +7350,11 @@ function DailyTasksCard({
   onGenerate,
   onToggle,
   onSetMin,
+  onSetWhy,
   onSetPriority,
   onBudget,
   onAdd,
+  onSetDate,
   onDelete,
   onMove,
   onRename,
@@ -6808,17 +7366,34 @@ function DailyTasksCard({
   onGenerate: () => void;
   onToggle: (i: number) => void;
   onSetMin: (i: number, min: number) => void;
+  onSetWhy: (i: number, why: string) => void;
   onSetPriority: (i: number, p: Priority) => void;
   onBudget: (blockMin: number) => void;
-  onAdd: (title: string, priority: Priority) => void;
+  onAdd: (title: string, priority: Priority, date?: string) => void;
+  onSetDate: (i: number, date: string) => void;
   onDelete: (i: number) => void;
   onMove: (i: number, dir: -1 | 1) => void;
   onRename: (i: number, title: string) => void;
   onSortByPriority: () => void;
 }) {
   const today = localISO();
-  const fresh = state?.date === today;
-  const tasks = fresh ? state!.tasks : [];
+  const all = state?.tasks ?? [];
+  // The list was built for an earlier day. Yesterday's to-dos are done with, but
+  // anything parked on a day still ahead is still owed, so that much of a stale
+  // list stays on screen instead of vanishing at midnight.
+  const stale = !!state && state.date !== today;
+  // Every row carries its index into `state.tasks`, because that's what the
+  // handlers address — so the view can hide and regroup rows without ever
+  // toggling, renaming, or deleting the wrong one.
+  const shown = all
+    .map((t, i) => ({ t, i }))
+    .filter(({ t }) => !stale || isLaterDay(t, today));
+  // Two lists, not one: a task set for Friday sitting between two for this
+  // afternoon reads as today's work, and it isn't.
+  const ordered = shown.filter(({ t }) => !isLaterDay(t, today));
+  const later = shown.filter(({ t }) => isLaterDay(t, today));
+  // Counts, cheers and the time budget are all about TODAY.
+  const tasks = ordered.map(({ t }) => t);
   const doneCount = tasks.filter((t) => t.done).length;
   // How many minutes to divide across tasks by what each needs. Seeds from
   // today's scheduled study time; the learner can override it before splitting.
@@ -6829,18 +7404,26 @@ function DailyTasksCard({
   // The list is shown in the learner's own order — the array itself is the
   // ranking, so ↑/↓ move a task and it stays put. Freshly generated tasks
   // arrive priority-sorted, and "⇅ By priority" re-applies that sort on demand.
-  const ordered = tasks.map((t, i) => ({ t, i }));
   // The "add your own task" row, and which task (if any) is being renamed.
   const [draft, setDraft] = useState("");
   const [draftPrio, setDraftPrio] = useState<Priority>("med");
+  // Blank means today. Pick a day and the task goes onto the calendar there
+  // instead, and waits until then.
+  const [draftDate, setDraftDate] = useState("");
   const [editing, setEditing] = useState<number | null>(null);
   const [editText, setEditText] = useState("");
+  // The details line and the minutes chip open into editors the same way the
+  // title does — one row at a time, so only ever one of these holds an index.
+  const [noteAt, setNoteAt] = useState<number | null>(null);
+  const [noteText, setNoteText] = useState("");
+  const [minAt, setMinAt] = useState<number | null>(null);
   const submitDraft = () => {
     const title = draft.trim();
     if (!title) return;
-    onAdd(title, draftPrio);
+    onAdd(title, draftPrio, draftDate || undefined);
     setDraft("");
     setDraftPrio("med");
+    setDraftDate("");
   };
   const commitRename = () => {
     if (editing == null) return;
@@ -6848,38 +7431,69 @@ function DailyTasksCard({
     if (title) onRename(editing, title);
     setEditing(null);
   };
+  // Unlike the title, an emptied details box is a real answer: it clears the
+  // line rather than keeping whatever Eliora had written there.
+  const commitNote = () => {
+    if (noteAt == null) return;
+    onSetWhy(noteAt, noteText);
+    setNoteAt(null);
+  };
   // The add-your-own row: shown both when the list is empty and under a list.
+  // Google's own add row: a plus where the tick box sits, then a line to type
+  // on, with the day and priority as chips so the row reads like the tasks
+  // above it rather than like a form.
   const addRow = (
     <div style={styles.taskAddRow}>
-      <button
-        style={{ ...styles.prioBadge, ...styles[`prio_${draftPrio}`] }}
-        onClick={() =>
-          setDraftPrio(
-            PRIORITY_ORDER[(PRIORITY_ORDER.indexOf(draftPrio) + 1) % 3],
-          )
-        }
-        title={`Priority: ${PRIORITY_LABEL[draftPrio]} — tap to change`}
-        aria-label={`New task priority ${PRIORITY_LABEL[draftPrio]}, tap to change`}
-      >
-        {PRIORITY_LABEL[draftPrio]}
-      </button>
-      <input
-        style={styles.taskAddInput}
-        value={draft}
-        placeholder="Add your own task…"
-        aria-label="New task"
-        onChange={(e) => setDraft(e.target.value)}
-        onKeyDown={(e) => {
-          if (e.key === "Enter") submitDraft();
-        }}
-      />
-      <button
-        style={styles.budgetSplitBtn}
-        disabled={!draft.trim()}
-        onClick={submitDraft}
-      >
-        ＋ Add
-      </button>
+      <span style={styles.gtAddPlus} aria-hidden>
+        ＋
+      </span>
+      <div style={styles.gtBody}>
+        <input
+          style={styles.gtAddInput}
+          value={draft}
+          placeholder="Add a task"
+          aria-label="New task"
+          onChange={(e) => setDraft(e.target.value)}
+          onKeyDown={(e) => {
+            if (e.key === "Enter") submitDraft();
+          }}
+        />
+        <div style={styles.gtChips}>
+          <label
+            style={{ ...styles.gtChip, ...styles.gtChipDue }}
+            title="Which day this is for — leave it blank for today"
+          >
+            ▤ {draftDate ? chipDay(draftDate, today) : "Today"}
+            <input
+              type="date"
+              style={styles.gtChipInput}
+              value={draftDate}
+              min={today}
+              aria-label="Day for the new task (blank means today)"
+              onChange={(e) => setDraftDate(e.target.value)}
+            />
+          </label>
+          <button
+            style={{ ...styles.gtChip, ...styles[`prio_${draftPrio}`] }}
+            onClick={() =>
+              setDraftPrio(
+                PRIORITY_ORDER[(PRIORITY_ORDER.indexOf(draftPrio) + 1) % 3],
+              )
+            }
+            title={`Priority: ${PRIORITY_LABEL[draftPrio]} — tap to change`}
+            aria-label={`New task priority ${PRIORITY_LABEL[draftPrio]}, tap to change`}
+          >
+            {PRIORITY_LABEL[draftPrio]}
+          </button>
+          <button
+            style={styles.budgetSplitBtn}
+            disabled={!draft.trim()}
+            onClick={submitDraft}
+          >
+            Add
+          </button>
+        </div>
+      </div>
     </div>
   );
   const fmtMin = (m: number) =>
@@ -6897,6 +7511,194 @@ function DailyTasksCard({
     day: "numeric",
   });
 
+  // One task row, laid out the way Google Tasks lays one out: a round tick box,
+  // the title on its own line, the details underneath in grey, and the small
+  // facts about it (day, minutes, priority, subject) as chips below that. `i` is
+  // its index in the real list (what the handlers take); `pos` and `group` are
+  // its place in whichever of the two lists it's being drawn in, which is all
+  // the ↑/↓ buttons care about. The signature is Array.map's, so both lists
+  // render with a bare `.map(renderTask)`.
+  const renderTask = (
+    { t, i }: { t: DailyTask; i: number },
+    pos: number,
+    group: { t: DailyTask; i: number }[],
+  ) => {
+    const p = taskPriority(t);
+    const next = PRIORITY_ORDER[(PRIORITY_ORDER.indexOf(p) + 1) % 3];
+    const overdue = !t.done && !!t.date && t.date < today;
+    return (
+      <div key={i} style={styles.gtRow}>
+        {/* Google's tick box: an empty circle until it's done, then filled. */}
+        <button
+          style={{
+            ...styles.gtCheck,
+            ...(t.done ? styles.gtCheckDone : {}),
+          }}
+          onClick={() => onToggle(i)}
+          aria-pressed={t.done}
+          aria-label={t.done ? "Mark not done" : "Mark done"}
+        >
+          {t.done ? "✓" : ""}
+        </button>
+        <div style={styles.gtBody}>
+          <div style={styles.gtTitleLine}>
+            {editing === i ? (
+              <input
+                autoFocus
+                style={styles.taskEditInput}
+                value={editText}
+                aria-label="Task name"
+                onChange={(e) => setEditText(e.target.value)}
+                onBlur={commitRename}
+                onKeyDown={(e) => {
+                  if (e.key === "Enter") commitRename();
+                  if (e.key === "Escape") setEditing(null);
+                }}
+              />
+            ) : (
+              <span
+                style={{
+                  ...styles.gtTitle,
+                  ...(t.done ? styles.gtTitleDone : {}),
+                }}
+                title="Click to rename"
+                onClick={() => {
+                  setEditing(i);
+                  setEditText(t.title);
+                }}
+              >
+                {t.title}
+              </span>
+            )}
+            {/* Rank this task against the others, and drop it if it's
+                not yours to do. Order here is the learner's own. */}
+            <span style={styles.taskRankBtns}>
+              <button
+                style={styles.taskRankBtn}
+                disabled={pos === 0}
+                onClick={() => onMove(i, -1)}
+                title="Move up"
+                aria-label={`Move ${t.title} up`}
+              >
+                ↑
+              </button>
+              <button
+                style={styles.taskRankBtn}
+                disabled={pos === group.length - 1}
+                onClick={() => onMove(i, 1)}
+                title="Move down"
+                aria-label={`Move ${t.title} down`}
+              >
+                ↓
+              </button>
+              <button
+                style={styles.taskRankBtn}
+                onClick={() => onDelete(i)}
+                title="Remove this task"
+                aria-label={`Remove ${t.title}`}
+              >
+                ✕
+              </button>
+            </span>
+          </div>
+          {/* The details line. Starts as Eliora's reason for the task and is
+              the learner's to rewrite from there — click it and type. */}
+          {noteAt === i ? (
+            <textarea
+              autoFocus
+              rows={2}
+              style={styles.gtDetailInput}
+              value={noteText}
+              placeholder="Details"
+              aria-label={`Details for “${t.title}”`}
+              onChange={(e) => setNoteText(e.target.value)}
+              onBlur={commitNote}
+              onKeyDown={(e) => {
+                if (e.key === "Enter" && !e.shiftKey) {
+                  e.preventDefault();
+                  commitNote();
+                }
+                if (e.key === "Escape") setNoteAt(null);
+              }}
+            />
+          ) : (
+            <div
+              style={{
+                ...styles.gtDetail,
+                ...(t.why ? {} : styles.gtDetailEmpty),
+              }}
+              title="Click to write details"
+              onClick={() => {
+                setNoteAt(i);
+                setNoteText(t.why ?? "");
+              }}
+            >
+              {t.why || "Add details"}
+            </div>
+          )}
+          <div style={styles.gtChips}>
+            {/* The day, as a chip you tap to open the picker — clearing it (or
+                picking today) brings the task back onto today's list and
+                today's schedule. Overdue days go red, as they do in Tasks. */}
+            <label
+              style={{
+                ...styles.gtChip,
+                ...styles.gtChipDue,
+                ...(overdue ? styles.gtChipOverdue : {}),
+              }}
+              title="Which day this is for — clear it for today"
+            >
+              ▤ {t.date ? chipDay(t.date, today) : "Today"}
+              <input
+                type="date"
+                style={styles.gtChipInput}
+                value={t.date ?? ""}
+                min={today}
+                aria-label={`Day for “${t.title}”`}
+                onChange={(e) => onSetDate(i, e.target.value)}
+              />
+            </label>
+            {/* Minutes to budget — a chip until you click into it. */}
+            {minAt === i ? (
+              <input
+                autoFocus
+                type="number"
+                min={0}
+                step={5}
+                style={styles.timeInput}
+                value={t.estMin ?? ""}
+                placeholder="min"
+                aria-label={`Minutes to budget for “${t.title}”`}
+                onBlur={() => setMinAt(null)}
+                onKeyDown={(e) => {
+                  if (e.key === "Enter" || e.key === "Escape") setMinAt(null);
+                }}
+                onChange={(e) => onSetMin(i, parseInt(e.target.value, 10) || 0)}
+              />
+            ) : (
+              <button
+                style={styles.gtChip}
+                onClick={() => setMinAt(i)}
+                title="Minutes to budget for this task"
+              >
+                ◷ {t.estMin ? fmtMin(t.estMin) : "Set time"}
+              </button>
+            )}
+            <button
+              style={{ ...styles.gtChip, ...styles[`prio_${p}`] }}
+              onClick={() => onSetPriority(i, next)}
+              title={`Priority: ${PRIORITY_LABEL[p]} — tap to change`}
+              aria-label={`Priority ${PRIORITY_LABEL[p]}, tap to set ${PRIORITY_LABEL[next]}`}
+            >
+              {PRIORITY_LABEL[p]}
+            </button>
+            {t.subject && <span style={styles.gtChip}>{t.subject}</span>}
+          </div>
+        </div>
+      </div>
+    );
+  };
+
   return (
     <div style={styles.card}>
       <div style={styles.cardHead}>
@@ -6908,7 +7710,10 @@ function DailyTasksCard({
         </span>
       </div>
 
-      {!tasks.length ? (
+      {/* Nothing for today AND nothing parked ahead — only then is the card
+          genuinely empty. A day with no tasks of its own but something waiting
+          on Friday still has a list worth showing. */}
+      {!tasks.length && !later.length ? (
         loading ? (
           <p style={styles.assignEmpty}>Putting together today&apos;s tasks…</p>
         ) : (
@@ -6929,8 +7734,19 @@ function DailyTasksCard({
         )
       ) : (
         <>
-          <div style={styles.taskCheer}>{taskCheer(doneCount, tasks.length, doneCount)}</div>
-          {totalMin > 0 && (
+          {/* The cheer and the time budget are about today, so they sit out a
+              day whose only tasks are still ahead of it. */}
+          {!tasks.length ? (
+            <p style={styles.assignEmpty}>
+              Nothing set for today — what&apos;s below is waiting on its own
+              day.
+            </p>
+          ) : (
+            <div style={styles.taskCheer}>
+              {taskCheer(doneCount, tasks.length, doneCount)}
+            </div>
+          )}
+          {tasks.length > 0 && totalMin > 0 && (
             <div style={styles.taskBudget}>
               ⏳ Time budget: <b>{fmtMin(totalMin)}</b>
               {budgetMin > 0 ? (
@@ -6951,154 +7767,56 @@ function DailyTasksCard({
           )}
 
           {/* Divide a fixed block of time across today's tasks by what each needs. */}
-          <div style={styles.budgetSplit}>
-            <span style={styles.budgetSplitLabel}>Split</span>
-            <input
-              type="number"
-              min={5}
-              step={5}
-              style={styles.timeInput}
-              value={blockMin || ""}
-              aria-label="Minutes to split across tasks"
-              onChange={(e) =>
-                setBlockMin(Math.max(0, parseInt(e.target.value, 10) || 0))
-              }
-            />
-            <span style={styles.budgetSplitLabel}>
-              min by what each needs
-              {budgetMin > 0 ? " (from your schedule)" : ""}
-            </span>
-            <button
-              style={styles.budgetSplitBtn}
-              disabled={blockMin < 5}
-              onClick={() => onBudget(blockMin)}
-              title="Give each task the minutes it needs — trimmed evenly (High least) if the time runs short — then block them out on today's schedule, High-priority work first"
-            >
-              ⚖️ Budget it
-            </button>
-            <button
-              style={styles.budgetSplitBtn}
-              disabled={tasks.length < 2}
-              onClick={onSortByPriority}
-              title="Re-sort the list High → Low (you can still move tasks after)"
-            >
-              ⇅ By priority
-            </button>
-          </div>
+          {tasks.length > 0 && (
+            <div style={styles.budgetSplit}>
+              <span style={styles.budgetSplitLabel}>Split</span>
+              <input
+                type="number"
+                min={5}
+                step={5}
+                style={styles.timeInput}
+                value={blockMin || ""}
+                aria-label="Minutes to split across tasks"
+                onChange={(e) =>
+                  setBlockMin(Math.max(0, parseInt(e.target.value, 10) || 0))
+                }
+              />
+              <span style={styles.budgetSplitLabel}>
+                min by what each needs
+                {budgetMin > 0 ? " (from your schedule)" : ""}
+              </span>
+              <button
+                style={styles.budgetSplitBtn}
+                disabled={blockMin < 5}
+                onClick={() => onBudget(blockMin)}
+                title="Give each task the minutes it needs — trimmed evenly (High least) if the time runs short — then block them out on today's schedule, High-priority work first"
+              >
+                ⚖️ Budget it
+              </button>
+              <button
+                style={styles.budgetSplitBtn}
+                disabled={tasks.length < 2}
+                onClick={onSortByPriority}
+                title="Re-sort the list High → Low (you can still move tasks after)"
+              >
+                ⇅ By priority
+              </button>
+            </div>
+          )}
 
-          {ordered.map(({ t, i }) => {
-            const p = taskPriority(t);
-            const next =
-              PRIORITY_ORDER[(PRIORITY_ORDER.indexOf(p) + 1) % 3];
-            return (
-              <div key={i} style={styles.assignItem}>
-                <button
-                  style={{
-                    ...styles.assignCheck,
-                    ...(t.done ? styles.assignCheckDone : {}),
-                  }}
-                  onClick={() => onToggle(i)}
-                  aria-label={t.done ? "Mark not done" : "Mark done"}
-                >
-                  {t.done ? "✓" : ""}
-                </button>
-                <div style={{ flex: 1 }}>
-                  <div style={styles.taskTitleRow}>
-                    <button
-                      style={{ ...styles.prioBadge, ...styles[`prio_${p}`] }}
-                      onClick={() => onSetPriority(i, next)}
-                      title={`Priority: ${PRIORITY_LABEL[p]} — tap to change`}
-                      aria-label={`Priority ${PRIORITY_LABEL[p]}, tap to set ${PRIORITY_LABEL[next]}`}
-                    >
-                      {PRIORITY_LABEL[p]}
-                    </button>
-                    {editing === i ? (
-                      <input
-                        autoFocus
-                        style={styles.taskEditInput}
-                        value={editText}
-                        aria-label="Task name"
-                        onChange={(e) => setEditText(e.target.value)}
-                        onBlur={commitRename}
-                        onKeyDown={(e) => {
-                          if (e.key === "Enter") commitRename();
-                          if (e.key === "Escape") setEditing(null);
-                        }}
-                      />
-                    ) : (
-                      <span
-                        style={{
-                          ...(t.done
-                            ? styles.assignTitleDone
-                            : styles.assignTitle),
-                          cursor: "text",
-                        }}
-                        title="Click to rename"
-                        onClick={() => {
-                          setEditing(i);
-                          setEditText(t.title);
-                        }}
-                      >
-                        {t.title}
-                      </span>
-                    )}
-                    {/* Rank this task against the others, and drop it if it's
-                        not yours to do. Order here is the learner's own. */}
-                    <span style={styles.taskRankBtns}>
-                      <button
-                        style={styles.taskRankBtn}
-                        disabled={i === 0}
-                        onClick={() => onMove(i, -1)}
-                        title="Move up"
-                        aria-label={`Move ${t.title} up`}
-                      >
-                        ↑
-                      </button>
-                      <button
-                        style={styles.taskRankBtn}
-                        disabled={i === tasks.length - 1}
-                        onClick={() => onMove(i, 1)}
-                        title="Move down"
-                        aria-label={`Move ${t.title} down`}
-                      >
-                        ↓
-                      </button>
-                      <button
-                        style={styles.taskRankBtn}
-                        onClick={() => onDelete(i)}
-                        title="Remove this task"
-                        aria-label={`Remove ${t.title}`}
-                      >
-                        ✕
-                      </button>
-                    </span>
-                  </div>
-                  {(t.subject || t.why) && (
-                    <div style={styles.assignMeta}>
-                      {t.subject}
-                      {t.subject && t.why ? " · " : ""}
-                      {t.why}
-                    </div>
-                  )}
-                  <div style={styles.timeRow}>
-                    <input
-                      type="number"
-                      min={0}
-                      step={5}
-                      style={styles.timeInput}
-                      value={t.estMin ?? ""}
-                      placeholder="min"
-                      aria-label="Time budget in minutes"
-                      onChange={(e) =>
-                        onSetMin(i, parseInt(e.target.value, 10) || 0)
-                      }
-                    />
-                    <span style={styles.timeLabel}>min to budget</span>
-                  </div>
-                </div>
+          {ordered.map(renderTask)}
+
+          {/* Parked for a later day: on the calendar already, off today's plate.
+              Kept under today's list rather than mixed into it — a task for
+              Friday among this afternoon's reads as this afternoon's. */}
+          {later.length > 0 && (
+            <>
+              <div style={styles.taskLaterHead}>
+                📅 Coming up · {later.length}
               </div>
-            );
-          })}
+              {later.map(renderTask)}
+            </>
+          )}
           {addRow}
           <div
             style={{
@@ -7130,6 +7848,37 @@ function DailyTasksCard({
 function localISO(dt = new Date()): string {
   const p = (n: number) => String(n).padStart(2, "0");
   return `${dt.getFullYear()}-${p(dt.getMonth() + 1)}-${p(dt.getDate())}`;
+}
+// Give an ordered list of steps a day each, spread evenly over the run-up to a
+// deadline. Deliberately arithmetic rather than asked of the model: the steps
+// are its work, but the calendar they land on is just the days between now and
+// the date, and a made-up date is a date the learner didn't agree to. The last
+// step lands the day BEFORE the deadline when the window has room for it, so
+// nothing is scheduled for the morning of the exam. A short window doubles
+// steps onto the days there are — honest about the squeeze rather than
+// pretending it fits. Returns one entry per step, undefined where there's no
+// deadline to work back from (or it has already passed).
+function paceStepDates(
+  count: number,
+  targetISO?: string,
+): (string | undefined)[] {
+  const out: (string | undefined)[] = Array.from({ length: count });
+  const today = localISO();
+  if (!count || !targetISO || !/^\d{4}-\d{2}-\d{2}$/.test(targetISO))
+    return out;
+  if (targetISO <= today) return out;
+  const dayOf = (iso: string) => new Date(`${iso}T00:00:00`);
+  const span = Math.round(
+    (dayOf(targetISO).getTime() - dayOf(today).getTime()) / 86_400_000,
+  );
+  const last = span > count ? span - 1 : span;
+  for (let i = 0; i < count; i++) {
+    const offset = Math.max(1, Math.round(((i + 1) * last) / count));
+    const d = dayOf(today);
+    d.setDate(d.getDate() + offset);
+    out[i] = localISO(d);
+  }
+  return out;
 }
 // The study-progress card: real time on task. Shows total hours and active
 // days, which days of this week had study time, minutes per day over the last
@@ -11051,6 +11800,10 @@ function ScheduleGrid({
   // A block's countdown runs for exactly the work in it — the minutes the
   // schedule budgeted — falling back to a plain Pomodoro when it has none.
   const blockMinutes = (h: number) => blocks[h]?.min ?? TIMER_DEFAULT_MIN;
+  // The ticking effect only re-subscribes when the timer starts or changes
+  // block, so it can't close over a fresh `blocks` — it reads this instead.
+  const blocksRef = useRef(blocks);
+  blocksRef.current = blocks;
   // Build a fresh running-timer state for an hour block, tagging it study or not.
   const mkTimer = (h: number, mins = blockMinutes(h)) => ({
     hour: h,
@@ -11068,10 +11821,15 @@ function ScheduleGrid({
           playTimerChime();
           // Credit the completed session. Defer out of the state updater so we
           // don't call the parent's setState while updating this component.
-          if (t.study) {
-            const mins = Math.round(t.total / 60);
-            queueMicrotask(() => onStudyMinutes(mins));
-          }
+          const mins = Math.round(t.total / 60);
+          queueMicrotask(() => {
+            if (t.study) onStudyMinutes(mins);
+            // Mark the block itself done so the day bar keeps the minutes
+            // across a reload. `max` because re-running a block you already
+            // finished shouldn't count it twice.
+            const prev = blocksRef.current[t.hour]?.doneMin ?? 0;
+            if (mins > prev) onSet(t.hour, { doneMin: mins });
+          });
           return { ...t, left: 0, running: false };
         }
         return { ...t, left: t.left - 1 };
@@ -11098,6 +11856,28 @@ function ScheduleGrid({
           : { ...t, running: !t.running }
         : mkTimer(h),
     );
+
+  // The whole day as one bar: how much of the focus time you planned is behind
+  // you. Finished blocks carry their own minutes, and the block running right
+  // now is added live, so the bar climbs while you work instead of jumping at
+  // the chime. The live part is net of what that block already banked, so
+  // re-running something you finished doesn't count it twice.
+  const plannedMin = SCHEDULE_HOURS.reduce(
+    (sum, h) => sum + ((blocks[h]?.text ?? "").trim() ? blockMinutes(h) : 0),
+    0,
+  );
+  const doneMin =
+    SCHEDULE_HOURS.reduce((sum, h) => sum + (blocks[h]?.doneMin ?? 0), 0) +
+    (timer
+      ? Math.max(
+          0,
+          Math.floor((timer.total - timer.left) / 60) -
+            (blocks[timer.hour]?.doneMin ?? 0),
+        )
+      : 0);
+  const dayPct =
+    plannedMin > 0 ? Math.min(100, Math.round((doneMin / plannedMin) * 100)) : 0;
+
   return (
     <div style={styles.card}>
       <div style={styles.cardHead}>
@@ -11178,6 +11958,21 @@ function ScheduleGrid({
           const hasText = !!(b?.text ?? "").trim();
           const kind = scheduleKind(b?.kind ?? "study");
           const isNow = h === currentHour;
+          // The row itself fills up as the block goes by — a bar you read
+          // sideways instead of a number you read twice. A running block
+          // tracks its countdown; a block already seen through stays full.
+          const running = timer?.hour === h ? timer : null;
+          const rowPct = running
+            ? running.total > 0
+              ? Math.min(
+                  100,
+                  ((running.total - running.left) / running.total) * 100,
+                )
+              : 0
+            : b?.doneMin
+              ? 100
+              : 0;
+          const rowBase = isNow ? "var(--accent-soft)" : "var(--surface)";
           return (
             <div
               key={h}
@@ -11187,6 +11982,11 @@ function ScheduleGrid({
                 borderLeft: `4px solid ${
                   hasText ? kind.color : "var(--border)"
                 }`,
+                background: rowPct
+                  ? `linear-gradient(to right, ${kind.color}26 ${rowPct.toFixed(
+                      1,
+                    )}%, ${rowBase} ${rowPct.toFixed(1)}%)`
+                  : rowBase,
               }}
             >
               <span style={styles.schedTime}>
@@ -11261,13 +12061,19 @@ function ScheduleGrid({
                     >
                       {timer.left <= 0 ? "↺" : timer.running ? "⏸" : "▶"}
                     </button>
+                    {/* The shape first, the digits after it. */}
+                    <TimeTimerDisc
+                      left={timer.left}
+                      total={timer.total}
+                      color={kind.color}
+                    />
                     <span
                       style={{
                         ...styles.schedTimerTime,
                         ...(timer.left <= 0 ? styles.schedTimerDone : {}),
                       }}
                     >
-                      {timer.left <= 0 ? "done ✓" : fmtTimer(timer.left)}
+                      {timer.left <= 0 ? "done" : fmtTimer(timer.left)}
                     </span>
                     <button
                       style={styles.schedTimerClear}
@@ -11279,19 +12085,45 @@ function ScheduleGrid({
                     </button>
                   </div>
                 ) : (
-                  <button
-                    style={styles.schedTimerStart}
-                    onClick={() => startTimer(h)}
-                    title={`Start this block's ${blockMinutes(h)}-min countdown`}
-                    aria-label={`Start a ${blockMinutes(h)}-minute focus timer for this block`}
-                  >
-                    ⏱
-                  </button>
+                  <>
+                    {/* A block seen through keeps its tick after the timer is
+                        cleared, so the day reads as a row of finished things. */}
+                    {!!b?.doneMin && (
+                      <span
+                        style={styles.schedDoneTick}
+                        title={`${b.doneMin} min done`}
+                        aria-label={`${b.doneMin} minutes done`}
+                      >
+                        ✓
+                      </span>
+                    )}
+                    <button
+                      style={styles.schedTimerStart}
+                      onClick={() => startTimer(h)}
+                      title={`Start this block's ${blockMinutes(h)}-min countdown`}
+                      aria-label={`Start a ${blockMinutes(h)}-minute focus timer for this block`}
+                    >
+                      ⏱
+                    </button>
+                  </>
                 ))}
             </div>
           );
         })}
       </div>
+      {plannedMin > 0 && (
+        <div style={styles.schedDayBar}>
+          <div style={styles.schedDayBarHead}>
+            <span>Focus time today</span>
+            <span style={styles.schedDayBarCount}>
+              {doneMin} of {plannedMin} min · {dayPct}%
+            </span>
+          </div>
+          <div style={{ ...styles.progressTrack, margin: "6px 0 0" }}>
+            <div style={{ ...styles.progressFill, width: `${dayPct}%` }} />
+          </div>
+        </div>
+      )}
       {filled > 0 && (
         <div style={{ marginTop: 12, textAlign: "right" }}>
           <button style={styles.linkBtn} onClick={onClear}>
@@ -11770,6 +12602,10 @@ function PlanPanel({
 // SMART goals show up on the calendar in their own colour, so a goal's target
 // date sits next to the exams and deadlines it has to fit around.
 const GOAL_COLOR = "#a8548c";
+// The steps underneath a goal or a date — a lighter relative of the goal
+// colour, so a step reads as leading up to something rather than being the
+// thing itself.
+const STEP_COLOR = "#c98ab8";
 
 function MonthGrid({
   events,
@@ -11786,6 +12622,10 @@ function MonthGrid({
 }) {
   const now = new Date();
   const [view, setView] = useState({ y: now.getFullYear(), m: now.getMonth() });
+  // Tapping a day opens what's on it. The dots say "something is here"; the
+  // labels used to live in a hover tooltip, which is no help on a phone — so a
+  // click spells the day out underneath the grid instead.
+  const [openDay, setOpenDay] = useState<string | null>(null);
   const pad = (n: number) => String(n).padStart(2, "0");
   const isoFor = (d: number) => `${view.y}-${pad(view.m + 1)}-${pad(d)}`;
   const todayIso = `${now.getFullYear()}-${pad(now.getMonth() + 1)}-${pad(
@@ -11828,20 +12668,58 @@ function MonthGrid({
         color: GOAL_COLOR,
         label: `🌟 goal: ${g.specific}${g.done ? " ✓" : ""}`,
       });
-  // Daily to-do list (purple) — one dot per task on the day it's scheduled for.
+  // The steps underneath both (light magenta): a goal's checklist and a date's
+  // prep list are the actual work, so they belong on the days they're due — not
+  // buried inside the thing they lead up to.
+  for (const g of goals)
+    for (const t of g.tasks ?? [])
+      if (t.due)
+        (dotsByDate[t.due] ||= []).push({
+          color: STEP_COLOR,
+          label: `🪜 ${g.specific}: ${t.title}${t.done ? " ✓" : ""}`,
+        });
+  for (const e of events)
+    for (const t of e.tasks ?? [])
+      if (t.due)
+        (dotsByDate[t.due] ||= []).push({
+          color: STEP_COLOR,
+          label: `🪜 ${e.title}: ${t.title}${t.done ? " ✓" : ""}`,
+        });
+  // Shredded assignment steps sit alongside goal and prep steps — same colour,
+  // same rung icon, because to the learner they're the same kind of thing: a
+  // piece of something bigger, due today.
+  for (const a of assignments)
+    for (const t of a.steps ?? [])
+      if (t.due)
+        (dotsByDate[t.due] ||= []).push({
+          color: STEP_COLOR,
+          label: `🪜 ${a.title}: ${t.title}${t.done ? " ✓" : ""}`,
+        });
+  // Daily to-do list (purple) — one dot per task on the day it's for, which is
+  // the list's own day unless the task carries a date of its own.
   if (dailyTasks?.date)
-    for (const t of dailyTasks.tasks)
-      (dotsByDate[dailyTasks.date] ||= []).push({
+    for (const t of dailyTasks.tasks) {
+      const day = taskDay(t, dailyTasks.date);
+      (dotsByDate[day] ||= []).push({
         color: "#6b5bd6",
         label: `📝 ${t.title}${t.done ? " ✓" : ""}`,
       });
+    }
+  const hasSteps =
+    goals.some((g) => g.tasks?.some((t) => t.due)) ||
+    events.some((e) => e.tasks?.some((t) => t.due)) ||
+    assignments.some((a) => a.steps?.some((t) => t.due));
   const cells: (number | null)[] = [];
   for (let i = 0; i < startWeekday; i++) cells.push(null);
   for (let d = 1; d <= daysInMonth; d++) cells.push(d);
   const shift = (delta: number) => {
     const dt = new Date(view.y, view.m + delta, 1);
     setView({ y: dt.getFullYear(), m: dt.getMonth() });
+    // The open day belongs to the month you were looking at, so leaving that
+    // month closes it rather than stranding a panel about a day off-screen.
+    setOpenDay(null);
   };
+  const openDots = openDay ? (dotsByDate[openDay] ?? []) : [];
 
   return (
     <div style={styles.calGridWrap}>
@@ -11876,18 +12754,22 @@ function MonthGrid({
           const iso = isoFor(d);
           const dots = dotsByDate[iso] || [];
           const isToday = iso === todayIso;
+          const isOpen = iso === openDay;
           return (
             <button
               key={iso}
-              onClick={() => onPickDate(iso)}
+              // Tap to open the day, tap the open day again to close it.
+              onClick={() => setOpenDay((d) => (d === iso ? null : iso))}
+              aria-expanded={isOpen}
               title={
                 dots.length
                   ? dots.map((x) => x.label).join(", ")
-                  : `Add a date on ${iso}`
+                  : `What's on ${iso}`
               }
               style={{
                 ...styles.calCell,
                 ...(isToday ? styles.calCellToday : {}),
+                ...(isOpen ? styles.calCellOpen : {}),
               }}
             >
               <span>{d}</span>
@@ -11905,8 +12787,41 @@ function MonthGrid({
           );
         })}
       </div>
+      {openDay && (
+        <div style={styles.calDayBox}>
+          <div style={styles.calDayHead}>
+            <span style={styles.calDayTitle}>
+              {formatDate(openDay)}
+              {openDay === todayIso ? " · Today" : ""}
+            </span>
+            <button
+              style={styles.calDayClose}
+              onClick={() => setOpenDay(null)}
+              aria-label="Close day"
+            >
+              ×
+            </button>
+          </div>
+          {openDots.length === 0 ? (
+            <p style={styles.calDayEmpty}>Nothing on this day yet.</p>
+          ) : (
+            openDots.map((x, i) => (
+              <div key={i} style={styles.schedItem}>
+                <span style={{ ...styles.schedTick, background: x.color }} />
+                <span>{x.label}</span>
+              </div>
+            ))
+          )}
+          {/* Still one tap from adding something here — that's what the day
+              cell used to do on its own. */}
+          <button style={styles.calDayAdd} onClick={() => onPickDate(openDay)}>
+            + Add a date on this day
+          </button>
+        </div>
+      )}
       {(assignments.some((a) => a.planDate && !a.done) ||
         (dailyTasks?.tasks.length ?? 0) > 0 ||
+        hasSteps ||
         goals.some((g) => g.timeBound)) && (
         <div style={styles.calLegend}>
           <span style={styles.calLegendItem}>
@@ -11923,6 +12838,12 @@ function MonthGrid({
           {goals.some((g) => g.timeBound) && (
             <span style={styles.calLegendItem}>
               <span style={{ ...styles.calDot, background: GOAL_COLOR }} /> goals
+            </span>
+          )}
+          {hasSteps && (
+            <span style={styles.calLegendItem}>
+              <span style={{ ...styles.calDot, background: STEP_COLOR }} />{" "}
+              steps
             </span>
           )}
         </div>
@@ -11943,6 +12864,10 @@ function CalendarPanel({
   onRemove,
   onBreakDown,
   onToggleTask,
+  onSetTaskDue,
+  onSetTaskDetail,
+  onToggleDailyTask,
+  onSetDailyTaskDate,
   onOpenGoals,
   breakingEventId,
 }: {
@@ -11957,6 +12882,13 @@ function CalendarPanel({
   onRemove: (id: string) => void;
   onBreakDown: (e: StudyEvent) => void;
   onToggleTask: (eventId: string, index: number) => void;
+  onSetTaskDue: (eventId: string, index: number, due: string) => void;
+  onSetTaskDetail: (eventId: string, index: number, detail: string) => void;
+  // The to-do list is editable from out here too: tick a task off on the day it
+  // sits on, or pick a different day and watch it move. Both take the task's
+  // index into `dailyTasks.tasks`, which is what the handlers address.
+  onToggleDailyTask?: (index: number) => void;
+  onSetDailyTaskDate?: (index: number, date: string) => void;
   onOpenGoals?: () => void;
   breakingEventId: string | null;
 }) {
@@ -11983,8 +12915,20 @@ function CalendarPanel({
     {
       work: Assignment[];
       events: StudyEvent[];
-      tasks: DailyTask[];
+      // Each to-do carries its index into `dailyTasks.tasks`, because that's
+      // what the toggle/move handlers take — the day view regroups the rows, so
+      // their position here says nothing about where they live in the list.
+      tasks: { i: number; task: DailyTask }[];
       goals: SmartGoal[];
+      // A step from a goal's checklist, a date's prep list, or an assignment
+      // the Task Shredder broke up — carrying the name of the thing it leads up
+      // to so the row still means something out here. Shredded steps also bring
+      // a time estimate; goal and event steps don't, hence the optional.
+      steps: {
+        key: string;
+        toward: string;
+        task: GoalTask & { estMin?: number };
+      }[];
       blocks: WeekBlock[];
       min: number;
     }
@@ -11995,6 +12939,7 @@ function CalendarPanel({
       events: [],
       tasks: [],
       goals: [],
+      steps: [],
       blocks: [],
       min: 0,
     });
@@ -12034,16 +12979,37 @@ function CalendarPanel({
       g.timeBound <= horizonISO
     )
       bucket(g.timeBound).goals.push(g);
-  // Today's to-do list lands on its own day too, so the schedule shows the day's
-  // tasks alongside deadlines and planned work — not just as dots on the grid.
-  if (
-    dailyTasks?.date &&
-    dailyTasks.date >= todayISO &&
-    dailyTasks.date <= horizonISO
-  )
-    for (const t of dailyTasks.tasks) {
-      const b = bucket(dailyTasks.date);
-      b.tasks.push(t);
+  // The steps under a goal or a date. A deadline on the calendar tells you when
+  // you're out of time; the steps tell you what to do about it, so they get
+  // their own rows on the days they're due.
+  const addStep = (
+    toward: string,
+    key: string,
+    tasks?: (GoalTask & { estMin?: number })[],
+  ) => {
+    for (const [i, t] of (tasks ?? []).entries())
+      if (!t.done && t.due && t.due >= todayISO && t.due <= horizonISO) {
+        const b = bucket(t.due);
+        b.steps.push({ key: `${key}-${i}`, toward, task: t });
+        // A shredded step is real work with a real estimate, so it counts
+        // toward the day's total the way a planned work session does.
+        b.min += t.estMin ?? 0;
+      }
+  };
+  for (const g of goals) if (!g.done) addStep(g.specific, g.id, g.tasks);
+  for (const e of events) addStep(e.title, e.id, e.tasks);
+  // Steps the Task Shredder cut out of an assignment. The assignment's own
+  // planDate already puts "work on this" on a day; these say what the work
+  // actually is, one row per step.
+  for (const a of assignments) if (!a.done) addStep(a.title, a.id, a.steps);
+  // To-dos land on the day each one is for — the list's own day for most of
+  // them, a day further out for any the learner parked ahead.
+  if (dailyTasks?.date)
+    for (const [i, t] of dailyTasks.tasks.entries()) {
+      const day = taskDay(t, dailyTasks.date);
+      if (day < todayISO || day > horizonISO) continue;
+      const b = bucket(day);
+      b.tasks.push({ i, task: t });
       b.min += t.estMin ?? 0;
     }
   const scheduleDays = Object.keys(schedule).sort();
@@ -12191,21 +13157,56 @@ function CalendarPanel({
                     </span>
                   </div>
                 ))}
-                {day.tasks.map((t, i) => (
+                {day.steps.map((s) => (
+                  <div key={`step-${s.key}`} style={styles.schedItem}>
+                    <span
+                      style={{ ...styles.schedTick, background: STEP_COLOR }}
+                    />
+                    <span>
+                      🪜 {s.task.title}
+                      {s.task.estMin ? ` · ${fmtMin(s.task.estMin)}` : ""}
+                      <span style={styles.schedToward}> · {s.toward}</span>
+                    </span>
+                  </div>
+                ))}
+                {day.tasks.map(({ i, task: t }) => (
                   <div key={`task-${i}`} style={styles.schedItem}>
                     <span
                       style={{ ...styles.schedTick, background: "#6b5bd6" }}
                     />
-                    <span
-                      style={{
-                        textDecoration: t.done ? "line-through" : "none",
-                        color: t.done ? "var(--muted)" : undefined,
-                      }}
+                    {/* Tick it off right here — no need to go back to the
+                        to-do card to say a day's work is done. */}
+                    <button
+                      style={styles.schedTaskToggle}
+                      disabled={!onToggleDailyTask}
+                      onClick={() => onToggleDailyTask?.(i)}
+                      aria-pressed={t.done}
+                      title={t.done ? "Mark as not done" : "Mark as done"}
                     >
-                      📝 {t.title}
-                      {t.estMin ? ` · ${fmtMin(t.estMin)}` : ""}
-                      {t.done ? " ✓" : ""}
-                    </span>
+                      <span
+                        style={{
+                          textDecoration: t.done ? "line-through" : "none",
+                          color: t.done ? "var(--muted)" : undefined,
+                        }}
+                      >
+                        📝 {t.title}
+                        {t.estMin ? ` · ${fmtMin(t.estMin)}` : ""}
+                        {t.done ? " ✓" : ""}
+                      </span>
+                    </button>
+                    {/* And move it to another day. Blank (or today) puts it
+                        back on today's list. */}
+                    {onSetDailyTaskDate && (
+                      <input
+                        type="date"
+                        style={styles.stepDate}
+                        value={t.date ?? ""}
+                        min={todayISO}
+                        aria-label={`Day for “${t.title}”`}
+                        title="The day to do this — blank means today"
+                        onChange={(ev) => onSetDailyTaskDate(i, ev.target.value)}
+                      />
+                    )}
                   </div>
                 ))}
               </div>
@@ -12247,36 +13248,20 @@ function CalendarPanel({
                 <div style={styles.goalTasks}>
                   <div style={styles.goalTasksHead}>
                     Prep steps · {e.tasks.filter((t) => t.done).length}/
-                    {e.tasks.length}
+                    {e.tasks.length} · on your calendar
                   </div>
                   {e.tasks.map((t, i) => (
-                    <div key={i} style={styles.goalTaskRow}>
-                      <button
-                        style={{ ...styles.goalTaskToggle, flex: 1 }}
-                        onClick={() => onToggleTask(e.id, i)}
-                      >
-                        <span
-                          style={{
-                            ...styles.checkbox,
-                            borderColor: "var(--accent)",
-                            background: t.done ? "var(--accent)" : "transparent",
-                            color: t.done ? "#fff" : "transparent",
-                          }}
-                        >
-                          ✓
-                        </span>
-                        <span
-                          style={{
-                            textDecoration: t.done ? "line-through" : "none",
-                            color: t.done
-                              ? "var(--muted)"
-                              : "var(--assistant-text)",
-                          }}
-                        >
-                          {t.title}
-                        </span>
-                      </button>
-                    </div>
+                    <ChecklistRow
+                      key={i}
+                      task={t}
+                      index={i}
+                      ownerId={e.id}
+                      // Prep can't be scheduled after the exam itself.
+                      maxDate={e.date}
+                      onToggle={onToggleTask}
+                      onSetDue={onSetTaskDue}
+                      onSetDetail={onSetTaskDetail}
+                    />
                   ))}
                 </div>
               )}
@@ -12486,7 +13471,7 @@ function ProjectGrader({ profile }: { profile: LearnerProfile }) {
   }
 
   return (
-    <div style={styles.tabPanel}>
+    <div style={styles.studySection}>
       <div style={styles.modalHead}>
         <h2 style={styles.modalTitle}>Grade a project</h2>
       </div>
@@ -12634,6 +13619,11 @@ function PresentationPractice() {
   const [activeTakeId, setActiveTakeId] = useState<string | null>(null);
   const [script, setScript] = useState("");
   const [showScript, setShowScript] = useState(false);
+  const [feedbackByTake, setFeedbackByTake] = useState<
+    Record<string, PresentationFeedback>
+  >({});
+  const [feedbackLoading, setFeedbackLoading] = useState<string | null>(null);
+  const [feedbackError, setFeedbackError] = useState<string | null>(null);
 
   // Mirror `takes` into a ref so the unmount cleanup (which runs with an empty
   // dep list) can revoke the latest object URLs, not just the initial empties.
@@ -12742,6 +13732,43 @@ function PresentationPractice() {
       return prev.filter((t) => t.id !== id);
     });
     setActiveTakeId((cur) => (cur === id ? null : cur));
+    setFeedbackByTake((prev) => {
+      if (!(id in prev)) return prev;
+      const next = { ...prev };
+      delete next[id];
+      return next;
+    });
+  }
+
+  // Send this take's audio to the server for AI delivery feedback — the one
+  // moment this feature leaves the device, since transcription + critique has
+  // to happen server-side.
+  async function getFeedback(take: PracticeTake) {
+    setFeedbackLoading(take.id);
+    setFeedbackError(null);
+    try {
+      const blob = await fetch(take.url).then((r) => r.blob());
+      const ext = blob.type.includes("mp4") ? "mp4" : "webm";
+      const form = new FormData();
+      form.append("take", blob, `take.${ext}`);
+      form.append("durationSec", String(take.durationSec));
+      if (script.trim()) form.append("script", script.trim());
+      const res = await fetch("/api/presentation-feedback", {
+        method: "POST",
+        body: form,
+      });
+      const data = (await res.json()) as {
+        feedback?: PresentationFeedback;
+        error?: string;
+      };
+      if (data.feedback)
+        setFeedbackByTake((prev) => ({ ...prev, [take.id]: data.feedback! }));
+      else setFeedbackError(data.error || "Couldn't get feedback — try again.");
+    } catch {
+      setFeedbackError("Couldn't reach the server. Please try again.");
+    } finally {
+      setFeedbackLoading(null);
+    }
   }
 
   // Re-init the live preview when toggling audio-only while the camera is on.
@@ -12768,7 +13795,7 @@ function PresentationPractice() {
 
   if (!supported) {
     return (
-      <div style={styles.tabPanel}>
+      <div style={styles.studySection}>
         <div style={styles.modalHead}>
           <h2 style={styles.modalTitle}>Practice a presentation</h2>
         </div>
@@ -12781,13 +13808,14 @@ function PresentationPractice() {
   }
 
   return (
-    <div style={styles.tabPanel}>
+    <div style={styles.studySection}>
       <div style={styles.modalHead}>
         <h2 style={styles.modalTitle}>Practice a presentation</h2>
       </div>
       <p style={styles.calEmpty}>
         Record yourself rehearsing, then watch it back to see how you come
-        across. Everything stays on your device — nothing is uploaded.
+        across. Recording stays on your device — nothing is uploaded unless
+        you ask for AI feedback on a take.
       </p>
 
       <div style={styles.practiceStage}>
@@ -12912,12 +13940,36 @@ function PresentationPractice() {
               ⬇ Download
             </a>
             <button
+              onClick={() => getFeedback(activeTake)}
+              disabled={feedbackLoading === activeTake.id}
+              style={styles.secondaryBtn}
+            >
+              {feedbackLoading === activeTake.id
+                ? "Listening…"
+                : "🎯 Get AI feedback"}
+            </button>
+            <button
               onClick={() => deleteTake(activeTake.id)}
               style={styles.secondaryBtn}
             >
               Delete take
             </button>
           </div>
+          {feedbackLoading === activeTake.id && (
+            <p style={styles.calEmpty}>
+              Transcribing and reviewing your delivery…
+            </p>
+          )}
+          {feedbackError && feedbackLoading !== activeTake.id && (
+            <p style={{ color: "#c0392b", fontSize: 13, marginTop: 8 }}>
+              {feedbackError}
+            </p>
+          )}
+          {feedbackByTake[activeTake.id] && (
+            <PresentationFeedbackCard
+              feedback={feedbackByTake[activeTake.id]}
+            />
+          )}
         </div>
       )}
 
@@ -12954,6 +14006,57 @@ function PresentationPractice() {
           ))}
         </ul>
       </div>
+    </div>
+  );
+}
+
+// Renders one take's AI feedback: WPM, filler words, strengths, improvements,
+// and (when a script was given) how well the take tracked it.
+function PresentationFeedbackCard({ feedback }: { feedback: PresentationFeedback }) {
+  return (
+    <div style={styles.result}>
+      <div style={styles.qaHead}>AI feedback</div>
+      <p style={styles.resultText}>{feedback.summary}</p>
+      <div style={{ display: "flex", gap: 8, flexWrap: "wrap", margin: "6px 0" }}>
+        <span style={styles.practiceTakeChip}>
+          {feedback.wordsPerMinute} words/min
+        </span>
+        {feedback.fillerWords.slice(0, 4).map((f) => (
+          <span key={f.word} style={styles.practiceTakeChip}>
+            &ldquo;{f.word}&rdquo; ×{f.count}
+          </span>
+        ))}
+      </div>
+      {feedback.strengths.length > 0 && (
+        <>
+          <div style={styles.outputLabel}>Strengths</div>
+          <ul style={{ margin: 0, paddingLeft: 18 }}>
+            {feedback.strengths.map((s, i) => (
+              <li key={i} style={styles.resultText}>
+                {s}
+              </li>
+            ))}
+          </ul>
+        </>
+      )}
+      {feedback.improvements.length > 0 && (
+        <>
+          <div style={styles.outputLabel}>Try next take</div>
+          <ul style={{ margin: 0, paddingLeft: 18 }}>
+            {feedback.improvements.map((s, i) => (
+              <li key={i} style={styles.resultText}>
+                {s}
+              </li>
+            ))}
+          </ul>
+        </>
+      )}
+      {feedback.scriptAlignment && (
+        <>
+          <div style={styles.outputLabel}>Vs. your script</div>
+          <p style={styles.resultText}>{feedback.scriptAlignment}</p>
+        </>
+      )}
     </div>
   );
 }
@@ -13774,6 +14877,62 @@ function Summarizer({
   // the "Quiz" output, which is built from the raw source material).
   const [noteQuiz, setNoteQuiz] = useState<QuizQuestion[] | null>(null);
   const [makingQuiz, setMakingQuiz] = useState(false);
+  // Assignment tied to a video, used to steer the slide deck built from its
+  // notes — pasted text and/or an uploaded file, either is optional.
+  const [assignmentText, setAssignmentText] = useState("");
+  const [assignmentFile, setAssignmentFile] = useState<{
+    name: string;
+    base64?: string;
+    mediaType?: string;
+  } | null>(null);
+  const [slidesLesson, setSlidesLesson] = useState<Lesson | null>(null);
+  const [slidesBusy, setSlidesBusy] = useState(false);
+  const [slidesError, setSlidesError] = useState("");
+
+  function onPickAssignmentFile(f: File) {
+    const reader = new FileReader();
+    reader.onload = () => {
+      const dataUrl = String(reader.result ?? "");
+      const base64 = dataUrl.split(",")[1] ?? "";
+      setAssignmentFile({ name: f.name, base64, mediaType: f.type });
+    };
+    reader.readAsDataURL(f);
+  }
+
+  // Builds a slide deck (via the same lesson builder the course map uses)
+  // from the video notes plus whatever assignment was pasted/uploaded.
+  async function createSlides() {
+    if (!result || slidesBusy) return;
+    setSlidesBusy(true);
+    setSlidesError("");
+    try {
+      const parts = [`Video notes:\n${result}`];
+      if (assignmentText.trim())
+        parts.push(`Assignment for this video:\n${assignmentText.trim()}`);
+      const res = await fetch("/api/lesson", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          text: parts.join("\n\n"),
+          ...(assignmentFile?.base64
+            ? {
+                fileBase64: assignmentFile.base64,
+                fileMediaType: assignmentFile.mediaType,
+                fileName: assignmentFile.name,
+              }
+            : {}),
+          profile,
+        }),
+      });
+      const data = await res.json();
+      if (data.lesson?.steps?.length) setSlidesLesson(data.lesson);
+      else setSlidesError(data.error || "Couldn't build slides — try again.");
+    } catch {
+      setSlidesError("Sorry, something went wrong. Please try again.");
+    } finally {
+      setSlidesBusy(false);
+    }
+  }
 
   function onPickFile(f: File) {
     const isText =
@@ -13925,160 +15084,186 @@ function Summarizer({
     }
   }
 
+  if (slidesLesson) {
+    return (
+      <LessonSlideshow
+        lesson={slidesLesson}
+        onMissed={() => {}}
+        onExit={() => setSlidesLesson(null)}
+        onFinished={() => setSlidesLesson(null)}
+      />
+    );
+  }
+
   return (
     <div style={styles.tabPanel}>
-        {onClose && (
-          <div style={styles.modalHead}>
-            <h2 style={styles.modalTitle}>Summarize notes</h2>
-            <button style={styles.linkBtn} onClick={onClose}>
-              Close
-            </button>
-          </div>
-        )}
-
-        <div style={styles.tabs}>
-          {(["text", "video", "doc"] as const).map((t) => (
-            <button
-              key={t}
-              onClick={() => setTab(t)}
-              style={{
-                ...styles.tab,
-                ...(tab === t ? styles.tabActive : {}),
-              }}
-            >
-              {t === "text" ? "Notes / text" : t === "video" ? "Video" : "Doc"}
-            </button>
-          ))}
+      {onClose && (
+        <div style={styles.modalHead}>
+          <h2 style={styles.modalTitle}>Summarize notes</h2>
+          <button style={styles.linkBtn} onClick={onClose}>
+            Close
+          </button>
         </div>
+      )}
 
-        {tab === "text" && (
-          <textarea
-            style={styles.modalTextarea}
-            value={text}
-            onChange={(e) => setText(e.target.value)}
-            placeholder="Paste your notes or any text here…"
-            rows={6}
+      <div style={styles.tabs}>
+        {(["text", "video", "doc"] as const).map((t) => (
+          <button
+            key={t}
+            onClick={() => setTab(t)}
+            style={{
+              ...styles.tab,
+              ...(tab === t ? styles.tabActive : {}),
+            }}
+          >
+            {t === "text" ? "Notes / text" : t === "video" ? "Video" : "Doc"}
+          </button>
+        ))}
+      </div>
+
+      {tab === "text" && (
+        <textarea
+          style={styles.modalTextarea}
+          value={text}
+          onChange={(e) => setText(e.target.value)}
+          placeholder="Paste your notes or any text here…"
+          rows={6}
+        />
+      )}
+      {tab === "video" && (
+        <div>
+          <input
+            style={styles.formInput}
+            value={url}
+            onChange={(e) => setUrl(e.target.value)}
+            placeholder="Paste a YouTube link…"
           />
-        )}
-        {tab === "video" && (
-          <div>
-            <input
-              style={styles.formInput}
-              value={url}
-              onChange={(e) => setUrl(e.target.value)}
-              placeholder="Paste a YouTube link…"
-            />
-            <p style={styles.calEmpty}>
-              I'll try to fetch the captions. YouTube often blocks this — if it
-              fails, open the video's transcript (“…more” → “Show transcript”),
-              copy it, and paste it into the “Notes / text” tab.
-            </p>
-          </div>
-        )}
-        {tab === "doc" && (
-          <div>
-            <input
-              type="file"
-              accept=".txt,.md,.pdf,image/*"
-              onChange={(e) => e.target.files?.[0] && onPickFile(e.target.files[0])}
-            />
-            {file && <p style={styles.calEmpty}>Selected: {file.name}</p>}
-            <p style={styles.calEmpty}>PDF, image, or text file.</p>
-          </div>
-        )}
-
-        <div style={styles.outputLabel}>Make from this material:</div>
-        <div style={styles.outputRow}>
-          {(
-            Object.entries(SUMMARIZER_OUTPUTS) as [
-              keyof typeof SUMMARIZER_OUTPUTS,
-              string,
-            ][]
-          ).map(([k, label]) => (
-            <button
-              key={k}
-              onClick={() => setOutput(k)}
-              style={{ ...styles.outChip, ...(output === k ? styles.outChipActive : {}) }}
-            >
-              {label}
-            </button>
-          ))}
+          <p style={styles.calEmpty}>
+            I'll try to fetch the captions. YouTube often blocks this — if it
+            fails, open the video's transcript (“…more” → “Show transcript”),
+            copy it, and paste it into the “Notes / text” tab.
+          </p>
         </div>
+      )}
+      {tab === "doc" && (
+        <div>
+          <input
+            type="file"
+            accept=".txt,.md,.pdf,image/*"
+            onChange={(e) =>
+              e.target.files?.[0] && onPickFile(e.target.files[0])
+            }
+          />
+          {file && <p style={styles.calEmpty}>Selected: {file.name}</p>}
+          <p style={styles.calEmpty}>PDF, image, or text file.</p>
+        </div>
+      )}
 
-        {output === "flashcards" && (
-          <>
-            <div style={styles.outputLabel}>Flashcard style:</div>
-            <div style={styles.outputRow}>
-              {FLASHCARD_STYLES.map((s) => (
-                <button
-                  key={s.key}
-                  onClick={() => setFlashStyle(s.key)}
-                  title={`${s.front} → ${s.back}`}
-                  style={{
-                    ...styles.outChip,
-                    ...(flashStyle === s.key ? styles.outChipActive : {}),
-                  }}
-                >
-                  {s.emoji} {s.label}
-                </button>
-              ))}
-            </div>
-          </>
-        )}
+      <div style={styles.outputLabel}>Make from this material:</div>
+      <div style={styles.outputRow}>
+        {(
+          Object.entries(SUMMARIZER_OUTPUTS) as [
+            keyof typeof SUMMARIZER_OUTPUTS,
+            string,
+          ][]
+        ).map(([k, label]) => (
+          <button
+            key={k}
+            onClick={() => setOutput(k)}
+            style={{
+              ...styles.outChip,
+              ...(output === k ? styles.outChipActive : {}),
+            }}
+          >
+            {label}
+          </button>
+        ))}
+      </div>
 
-        <button onClick={run} disabled={!canRun || busy} style={styles.primaryBtn}>
-          {busy
-            ? "Working…"
-            : output === "summary"
-              ? "Summarize"
-              : output === "studyguide"
-                ? "Make study guide"
-                : output === "modules"
-                  ? "Break into modules"
-                  : output === "videonotes"
-                    ? "Take video notes"
-                    : output === "flashcards"
-                      ? "Make flashcards"
-                      : "Make quiz"}
-        </button>
-
-        {(cards || quiz) && (
-          <div style={styles.result}>
-            {cards ? (
-              cards.length ? (
-                <FlashcardDeck cards={cards} onMissed={() => {}} />
-              ) : (
-                <div style={styles.resultText}>No flashcards — try more material.</div>
-              )
-            ) : quiz?.length ? (
-              <QuizView quiz={quiz} onMissed={() => {}} onStudyGuide={onStudyGuide} />
-            ) : (
-              <div style={styles.resultText}>No quiz — try more material.</div>
-            )}
-            <div style={styles.formActions}>
+      {output === "flashcards" && (
+        <>
+          <div style={styles.outputLabel}>Flashcard style:</div>
+          <div style={styles.outputRow}>
+            {FLASHCARD_STYLES.map((s) => (
               <button
-                style={styles.primaryBtn}
-                onClick={() => {
-                  if (cards?.length)
-                    onAddToChat({
-                      content: "Here are flashcards from your material:",
-                      flashcards: cards,
-                    });
-                  else if (quiz?.length)
-                    onAddToChat({
-                      content: "Here's a quiz from your material:",
-                      quiz,
-                    });
-                  onClose?.();
+                key={s.key}
+                onClick={() => setFlashStyle(s.key)}
+                title={`${s.front} → ${s.back}`}
+                style={{
+                  ...styles.outChip,
+                  ...(flashStyle === s.key ? styles.outChipActive : {}),
                 }}
               >
-                Add to chat
+                {s.emoji} {s.label}
               </button>
-            </div>
+            ))}
           </div>
-        )}
+        </>
+      )}
 
-        {/* Written notes get a workspace rather than a block of text: the notes
+      <button
+        onClick={run}
+        disabled={!canRun || busy}
+        style={styles.primaryBtn}
+      >
+        {busy
+          ? "Working…"
+          : output === "summary"
+            ? "Summarize"
+            : output === "studyguide"
+              ? "Make study guide"
+              : output === "modules"
+                ? "Break into modules"
+                : output === "videonotes"
+                  ? "Take video notes"
+                  : output === "flashcards"
+                    ? "Make flashcards"
+                    : "Make quiz"}
+      </button>
+
+      {(cards || quiz) && (
+        <div style={styles.result}>
+          {cards ? (
+            cards.length ? (
+              <FlashcardDeck cards={cards} onMissed={() => {}} />
+            ) : (
+              <div style={styles.resultText}>
+                No flashcards — try more material.
+              </div>
+            )
+          ) : quiz?.length ? (
+            <QuizView
+              quiz={quiz}
+              onMissed={() => {}}
+              onStudyGuide={onStudyGuide}
+            />
+          ) : (
+            <div style={styles.resultText}>No quiz — try more material.</div>
+          )}
+          <div style={styles.formActions}>
+            <button
+              style={styles.primaryBtn}
+              onClick={() => {
+                if (cards?.length)
+                  onAddToChat({
+                    content: "Here are flashcards from your material:",
+                    flashcards: cards,
+                  });
+                else if (quiz?.length)
+                  onAddToChat({
+                    content: "Here's a quiz from your material:",
+                    quiz,
+                  });
+                onClose?.();
+              }}
+            >
+              Add to chat
+            </button>
+          </div>
+        </div>
+      )}
+
+      {/* Written notes get a workspace rather than a block of text: the notes
             themselves read as a document, with the chat about them alongside. */}
         {!cards && !quiz && result && (
           <div className="eliora-note-ws">
@@ -14086,145 +15271,189 @@ function Summarizer({
               <div style={styles.noteDocHead}>
                 {/* Labelled by what was made, not by the first line — that
                     line is already the document's own opening heading. */}
-                <div style={styles.noteDocTitle}>{SUMMARIZER_OUTPUTS[output]}</div>
-                <div style={styles.noteDocActions}>
+              <div style={styles.noteDocTitle}>
+                {SUMMARIZER_OUTPUTS[output]}
+              </div>
+              <div style={styles.noteDocActions}>
+                <button
+                  style={styles.secondaryBtn}
+                  onClick={() => navigator.clipboard?.writeText(result)}
+                >
+                  Copy
+                </button>
+                {!busy && (
                   <button
                     style={styles.secondaryBtn}
-                    onClick={() => navigator.clipboard?.writeText(result)}
+                    onClick={() => printAsPdf(noteTitle(result), result)}
                   >
-                    Copy
+                    📄 Save as PDF
                   </button>
-                  {!busy && (
-                    <button
-                      style={styles.secondaryBtn}
-                      onClick={() => printAsPdf(noteTitle(result), result)}
-                    >
-                      📄 Save as PDF
-                    </button>
-                  )}
-                  <ShareButton
-                    payload={{
-                      v: 1,
-                      kind: "note",
-                      title: noteTitle(result),
-                      text: result,
-                    }}
-                    label="Share"
-                  />
-                  {!busy && (
-                    <button
-                      style={styles.secondaryBtn}
-                      onClick={makeQuestions}
-                      disabled={makingQuiz}
-                    >
-                      {makingQuiz ? "Writing questions…" : "📋 Make questions"}
-                    </button>
-                  )}
+                )}
+                <ShareButton
+                  payload={{
+                    v: 1,
+                    kind: "note",
+                    title: noteTitle(result),
+                    text: result,
+                  }}
+                  label="Share"
+                />
+                {!busy && (
                   <button
-                    style={styles.primaryBtn}
-                    onClick={() => {
-                      onAddToChat({ content: result });
-                      onClose?.();
-                    }}
+                    style={styles.secondaryBtn}
+                    onClick={makeQuestions}
+                    disabled={makingQuiz}
                   >
-                    Add to chat
+                    {makingQuiz ? "Writing questions…" : "📋 Make questions"}
                   </button>
-                </div>
+                )}
+                <button
+                  style={styles.primaryBtn}
+                  onClick={() => {
+                    onAddToChat({ content: result });
+                    onClose?.();
+                  }}
+                >
+                  Add to chat
+                </button>
               </div>
-              <div style={styles.noteDocBody}>
-                {renderDocMarkdown(result, "var(--accent)")}
-              </div>
+            </div>
+            <div style={styles.noteDocBody}>
+              {renderDocMarkdown(result, "var(--accent)")}
+            </div>
 
-              {/* Practice questions written from the notes above. */}
-              {noteQuiz && (
-                <div style={{ ...styles.qaBox, padding: "12px 22px 22px" }}>
-                  <div style={styles.qaHead}>📋 Questions from these notes</div>
-                  {noteQuiz.length ? (
-                    <QuizView
-                      quiz={noteQuiz}
-                      onMissed={() => {}}
-                      onStudyGuide={onStudyGuide}
-                    />
-                  ) : (
-                    <div style={styles.resultText}>
-                      I couldn&apos;t write questions from these notes — try a
-                      longer summary or study guide.
+            {/* Practice questions written from the notes above. */}
+            {noteQuiz && (
+              <div style={{ ...styles.qaBox, padding: "12px 22px 22px" }}>
+                <div style={styles.qaHead}>📋 Questions from these notes</div>
+                {noteQuiz.length ? (
+                  <QuizView
+                    quiz={noteQuiz}
+                    onMissed={() => {}}
+                    onStudyGuide={onStudyGuide}
+                  />
+                ) : (
+                  <div style={styles.resultText}>
+                    I couldn&apos;t write questions from these notes — try a
+                    longer summary or study guide.
+                  </div>
+                )}
+              </div>
+            )}
+
+            {/* Turn these notes into slides, optionally steered by the
+                assignment they were taken for. */}
+            {output === "videonotes" && (
+              <div style={{ ...styles.qaBox, padding: "12px 22px 22px" }}>
+                <div style={styles.qaHead}>🖼️ Turn these notes into slides</div>
+                <p style={styles.calEmpty}>
+                  Paste or upload the assignment for this video (optional) so
+                  the slides focus on what it's asking for.
+                </p>
+                <textarea
+                  style={styles.modalTextarea}
+                  value={assignmentText}
+                  onChange={(e) => setAssignmentText(e.target.value)}
+                  placeholder="Paste the assignment text…"
+                  rows={3}
+                />
+                <input
+                  type="file"
+                  accept=".txt,.md,.pdf,image/*"
+                  onChange={(e) =>
+                    e.target.files?.[0] &&
+                    onPickAssignmentFile(e.target.files[0])
+                  }
+                />
+                {assignmentFile && (
+                  <p style={styles.calEmpty}>
+                    Assignment file: {assignmentFile.name}
+                  </p>
+                )}
+                {slidesError && (
+                  <p style={styles.calEmpty}>{slidesError}</p>
+                )}
+                <button
+                  style={styles.secondaryBtn}
+                  onClick={createSlides}
+                  disabled={slidesBusy}
+                >
+                  {slidesBusy ? "Building slides…" : "🖼️ Create slides"}
+                </button>
+              </div>
+            )}
+          </section>
+
+          {/* Follow-up Q&A grounded in the notes on the left. */}
+          <aside className="eliora-note-chat" style={styles.noteChat}>
+            <div style={styles.noteChatHead}>
+              <span style={styles.noteChatAvatar} aria-hidden="true">
+                💬
+              </span>
+              <div style={styles.noteChatTitle}>Chat with these notes</div>
+            </div>
+            <div style={styles.noteChatBody}>
+              <div style={styles.noteGreet}>
+                Hi! Ask me anything about these notes — I answer from
+                what&apos;s written here, not from somewhere else.
+              </div>
+              {qa.map((m, i) => (
+                <div
+                  key={i}
+                  style={m.role === "user" ? styles.qaUser : styles.qaBot}
+                >
+                  {m.role === "user" ? (
+                    m.content
+                  ) : m.content ? (
+                    <div style={styles.resultMd}>
+                      {renderMarkdown(m.content, "var(--accent)", "chat")}
                     </div>
+                  ) : (
+                    "Thinking…"
                   )}
                 </div>
-              )}
-            </section>
-
-            {/* Follow-up Q&A grounded in the notes on the left. */}
-            <aside className="eliora-note-chat" style={styles.noteChat}>
-              <div style={styles.noteChatHead}>
-                <span style={styles.noteChatAvatar} aria-hidden="true">
-                  💬
-                </span>
-                <div style={styles.noteChatTitle}>Chat with these notes</div>
-              </div>
-              <div style={styles.noteChatBody}>
-                <div style={styles.noteGreet}>
-                  Hi! Ask me anything about these notes — I answer from what&apos;s
-                  written here, not from somewhere else.
-                </div>
-                {qa.map((m, i) => (
-                  <div
-                    key={i}
-                    style={m.role === "user" ? styles.qaUser : styles.qaBot}
+              ))}
+            </div>
+            <div style={styles.noteChatFoot}>
+              <div style={styles.outputRow}>
+                {NOTE_CHAT_PROMPTS.map((p) => (
+                  <button
+                    key={p}
+                    style={styles.outChip}
+                    disabled={busy || asking}
+                    onClick={() => ask(p)}
                   >
-                    {m.role === "user" ? (
-                      m.content
-                    ) : m.content ? (
-                      <div style={styles.resultMd}>
-                        {renderMarkdown(m.content, "var(--accent)")}
-                      </div>
-                    ) : (
-                      "Thinking…"
-                    )}
-                  </div>
+                    {p}
+                  </button>
                 ))}
               </div>
-              <div style={styles.noteChatFoot}>
-                <div style={styles.outputRow}>
-                  {NOTE_CHAT_PROMPTS.map((p) => (
-                    <button
-                      key={p}
-                      style={styles.outChip}
-                      disabled={busy || asking}
-                      onClick={() => ask(p)}
-                    >
-                      {p}
-                    </button>
-                  ))}
-                </div>
-                <div style={styles.qaInputRow}>
-                  <input
-                    style={styles.formInput}
-                    value={question}
-                    onChange={(e) => setQuestion(e.target.value)}
-                    onKeyDown={(e) => {
-                      if (e.key === "Enter") ask();
-                    }}
-                    disabled={busy}
-                    placeholder={
-                      busy
-                        ? "Still writing your notes…"
-                        : "Type your question here"
-                    }
-                  />
-                  <button
-                    style={styles.primaryBtn}
-                    onClick={() => ask()}
-                    disabled={busy || asking || !question.trim()}
-                  >
-                    {asking ? "…" : "Ask"}
-                  </button>
-                </div>
+              <div style={styles.qaInputRow}>
+                <input
+                  style={styles.formInput}
+                  value={question}
+                  onChange={(e) => setQuestion(e.target.value)}
+                  onKeyDown={(e) => {
+                    if (e.key === "Enter") ask();
+                  }}
+                  disabled={busy}
+                  placeholder={
+                    busy
+                      ? "Still writing your notes…"
+                      : "Type your question here"
+                  }
+                />
+                <button
+                  style={styles.primaryBtn}
+                  onClick={() => ask()}
+                  disabled={busy || asking || !question.trim()}
+                >
+                  {asking ? "…" : "Ask"}
+                </button>
               </div>
-            </aside>
-          </div>
-        )}
+            </div>
+          </aside>
+        </div>
+      )}
     </div>
   );
 }
@@ -15733,6 +16962,8 @@ function FlashcardDeck({
   onMistake,
   title,
 }: {
+  // Just the two sides and a style — so this viewer takes the summarizer's
+  // inline cards and a saved deck's cards alike.
   cards: Flashcard[];
   onMissed: (topic: string) => void;
   onMistake?: (card: Flashcard) => void;
@@ -15939,11 +17170,7 @@ function QuizView({
 // material. Wrong answers still feed the mistake tracker and can spin up a
 // targeted study guide, exactly like a quiz built from notes.
 type QuizDifficulty =
-  | "kindergarten"
-  | "elementary"
-  | "middle"
-  | "high"
-  | "college";
+  "kindergarten" | "elementary" | "middle" | "high" | "college";
 
 const QUIZ_DIFFICULTIES: { key: QuizDifficulty; label: string }[] = [
   { key: "kindergarten", label: "Kindergarten" },
@@ -15952,6 +17179,697 @@ const QUIZ_DIFFICULTIES: { key: QuizDifficulty; label: string }[] = [
   { key: "high", label: "High school" },
   { key: "college", label: "College" },
 ];
+
+// ---------------------------------------------------------------------------
+// Flashcards — the Quizlet-shaped study tool.
+//
+// Three screens in one card: the deck shelf, the editor, and the study round.
+//
+// The editor is the point. Eliora only ever DRAFTS a deck, and she gets things
+// wrong — so every card is editable in place, an AI card that's been touched is
+// re-labelled "edited", and the learner can add their own cards alongside hers.
+// A deck the learner has corrected is worth more than one they haven't read.
+//
+// Decks live in localStorage under the learner's namespace, same local-first
+// approach as the plan and the notebook.
+// ---------------------------------------------------------------------------
+
+function newCardId(): string {
+  return `c${Date.now().toString(36)}${Math.random().toString(36).slice(2, 6)}`;
+}
+
+// Read a file the same way LessonStudio does, so an upload can ground a deck.
+async function fileToBase64(file: File): Promise<string> {
+  const bytes = new Uint8Array(await file.arrayBuffer());
+  let binary = "";
+  for (let i = 0; i < bytes.length; i += 1) binary += String.fromCharCode(bytes[i]);
+  return window.btoa(binary);
+}
+
+function FlashcardsStudio({
+  profile,
+  subjects,
+  missed,
+  ns,
+  seed,
+  onSeedUsed,
+  onMissed,
+}: {
+  profile: LearnerProfile | null;
+  subjects: string[];
+  missed: string[];
+  ns: string;
+  seed?: string; // a topic sent over from the suggestions panel
+  onSeedUsed?: () => void;
+  onMissed: (topic: string) => void;
+}) {
+  const [decks, setDecks] = useState<SavedDeck[]>([]);
+  const [loaded, setLoaded] = useState(false);
+  const [openId, setOpenId] = useState<string | null>(null);
+  const [studying, setStudying] = useState(false);
+
+  // Draft form
+  const [topic, setTopic] = useState("");
+  const [text, setText] = useState("");
+  const [file, setFile] = useState<File | null>(null);
+  // No style picked means "vary it per card", which is what the deck prompt
+  // does with an absent style — so "Mixed" is undefined, not a style of its own.
+  const [style, setStyle] = useState<FlashcardStyle | undefined>(undefined);
+  const [difficulty, setDifficulty] = useState<QuizDifficulty>("high");
+  const [count, setCount] = useState(12);
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState("");
+
+  const key = `eliora-decks::${ns}`;
+
+  useEffect(() => {
+    try {
+      const raw = localStorage.getItem(key);
+      const saved = raw ? (JSON.parse(raw) as SavedDeck[]) : null;
+      if (Array.isArray(saved)) setDecks(saved);
+      else setDecks([]);
+    } catch {
+      setDecks([]);
+    }
+    setLoaded(true);
+    // Switching accounts has to swap the shelf, not merge it.
+  }, [key]);
+
+  useEffect(() => {
+    if (!loaded) return;
+    try {
+      localStorage.setItem(key, JSON.stringify(decks));
+    } catch {
+      /* storage full or blocked — the deck still works this session */
+    }
+  }, [decks, loaded, key]);
+
+  // A suggestion tapped elsewhere in the Study tab drops its topic into the
+  // form (and closes any open deck) rather than generating behind their back.
+  useEffect(() => {
+    if (!seed) return;
+    setTopic(seed);
+    setOpenId(null);
+    setStudying(false);
+    onSeedUsed?.();
+  }, [seed, onSeedUsed]);
+
+  const deck = decks.find((d) => d.id === openId) ?? null;
+
+  function patchDeck(id: string, fn: (d: SavedDeck) => SavedDeck) {
+    setDecks((prev) =>
+      prev.map((d) => (d.id === id ? { ...fn(d), updatedAt: Date.now() } : d)),
+    );
+  }
+
+  const suggestions = Array.from(
+    new Set([...subjects, ...missed].map((s) => s.trim()).filter(Boolean)),
+  ).slice(0, 8);
+
+  // Draft a deck, or (when `into` is given) draft more cards onto an open one.
+  async function generate(into?: SavedDeck) {
+    if (busy) return;
+    const cleanTopic = topic.trim();
+    const cleanText = text.trim();
+    if (!into && !cleanTopic && !cleanText && !file) return;
+    setBusy(true);
+    setErr("");
+    try {
+      const body: Record<string, unknown> = {
+        count,
+        style,
+        difficulty,
+        focus: missed.slice(0, 8),
+        profile: profile ?? undefined,
+      };
+      if (into) {
+        // "More like these": keep the deck's own framing, and tell her what's
+        // already in it so she doesn't hand back the same cards reworded.
+        body.topic = into.title;
+        body.style = into.style ?? style;
+        body.difficulty = into.difficulty ?? difficulty;
+        body.existing = into.cards.map((c) => c.front);
+      } else {
+        if (cleanTopic) body.topic = cleanTopic;
+        if (cleanText) body.material = cleanText;
+        if (file) {
+          body.fileBase64 = await fileToBase64(file);
+          body.fileMediaType = file.type || "text/plain";
+          body.fileName = file.name;
+        }
+      }
+
+      const res = await fetch("/api/flashcards", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+      });
+      const data = await res.json();
+      if (data.error || !Array.isArray(data.cards) || !data.cards.length) {
+        setErr(data.error || "I couldn't make cards from that. Try again.");
+        return;
+      }
+      const cards = data.cards as DeckCard[];
+
+      if (into) {
+        patchDeck(into.id, (d) => ({ ...d, cards: [...d.cards, ...cards] }));
+        return;
+      }
+      const now = Date.now();
+      const fresh: SavedDeck = {
+        id: `d${now.toString(36)}`,
+        title: cleanTopic || file?.name || "Untitled deck",
+        cards,
+        createdAt: now,
+        updatedAt: now,
+        style,
+        difficulty,
+        fromMaterial: cleanText || file ? file?.name || "pasted notes" : undefined,
+      };
+      setDecks((prev) => [fresh, ...prev]);
+      setOpenId(fresh.id);
+      setTopic("");
+      setText("");
+      setFile(null);
+    } catch {
+      setErr("Something went wrong. Please try again.");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  // --- Study round ---------------------------------------------------------
+  if (deck && studying) {
+    return (
+      <StudyRound
+        deck={deck}
+        onExit={() => setStudying(false)}
+        onMissed={onMissed}
+        onFinish={(known, learning) =>
+          patchDeck(deck.id, (d) => ({ ...d, known, learning }))
+        }
+      />
+    );
+  }
+
+  // --- Deck editor ---------------------------------------------------------
+  if (deck) {
+    const aiCount = deck.cards.filter((c) => c.source === "ai" && !c.edited).length;
+    return (
+      <div style={styles.card}>
+        <div style={styles.cardHead}>
+          <span style={styles.cardClass}>🃏 Flashcards</span>
+          <button style={styles.linkBtn} onClick={() => setOpenId(null)}>
+            All decks
+          </button>
+        </div>
+
+        <input
+          style={{ ...styles.assignInput, marginTop: 10, fontWeight: 700 }}
+          value={deck.title}
+          onChange={(e) =>
+            patchDeck(deck.id, (d) => ({ ...d, title: e.target.value }))
+          }
+          placeholder="Deck name"
+        />
+
+        <div style={styles.fcNote}>
+          {aiCount > 0
+            ? `Eliora drafted these — read them before you drill them. Fix anything
+               she got wrong and it stops counting as hers.`
+            : "Your deck, your wording. Edit any card, or add your own."}
+        </div>
+
+        <div style={styles.fcActions}>
+          <button
+            style={styles.fcBtn}
+            disabled={!deck.cards.length}
+            onClick={() => setStudying(true)}
+          >
+            ▶️ Study {deck.cards.length} card{deck.cards.length === 1 ? "" : "s"}
+          </button>
+          <button
+            style={styles.fcBtnGhost}
+            onClick={() =>
+              patchDeck(deck.id, (d) => ({
+                ...d,
+                cards: [
+                  ...d.cards,
+                  { id: newCardId(), front: "", back: "", source: "you" },
+                ],
+              }))
+            }
+          >
+            ＋ Add a card
+          </button>
+          <button
+            style={styles.fcBtnGhost}
+            disabled={busy}
+            onClick={() => generate(deck)}
+          >
+            {busy ? "Writing…" : "✦ More like these"}
+          </button>
+        </div>
+        {err && <div style={styles.lessonErr}>{err}</div>}
+
+        <div style={{ marginTop: 12 }}>
+          {deck.cards.map((c, i) => (
+            <div key={c.id} style={styles.fcEditRow}>
+              <div style={styles.fcEditHead}>
+                <span style={styles.fcNum}>{i + 1}</span>
+                <span
+                  style={{
+                    ...styles.fcBadge,
+                    ...(c.source === "you" || c.edited ? styles.fcBadgeYou : {}),
+                  }}
+                >
+                  {c.source === "you" ? "✍️ You" : c.edited ? "✦ Edited" : "✦ AI"}
+                </span>
+                {c.topic && <span style={styles.fcTopic}>{c.topic}</span>}
+                <span style={{ flex: 1 }} />
+                <button
+                  style={styles.fcIconBtn}
+                  title={c.starred ? "Unstar" : "Star this card"}
+                  onClick={() =>
+                    patchDeck(deck.id, (d) => ({
+                      ...d,
+                      cards: d.cards.map((x) =>
+                        x.id === c.id ? { ...x, starred: !x.starred } : x,
+                      ),
+                    }))
+                  }
+                >
+                  {c.starred ? "★" : "☆"}
+                </button>
+                <button
+                  style={styles.fcIconBtn}
+                  title="Delete this card"
+                  onClick={() =>
+                    patchDeck(deck.id, (d) => ({
+                      ...d,
+                      cards: d.cards.filter((x) => x.id !== c.id),
+                    }))
+                  }
+                >
+                  ✕
+                </button>
+              </div>
+              <textarea
+                style={styles.fcEditFront}
+                value={c.front}
+                rows={2}
+                placeholder="Front — the term or question"
+                onChange={(e) =>
+                  patchDeck(deck.id, (d) => ({
+                    ...d,
+                    cards: d.cards.map((x) =>
+                      x.id === c.id
+                        ? { ...x, front: e.target.value, edited: x.source === "ai" }
+                        : x,
+                    ),
+                  }))
+                }
+              />
+              <textarea
+                style={styles.fcEditBack}
+                value={c.back}
+                rows={2}
+                placeholder="Back — the definition or answer"
+                onChange={(e) =>
+                  patchDeck(deck.id, (d) => ({
+                    ...d,
+                    cards: d.cards.map((x) =>
+                      x.id === c.id
+                        ? { ...x, back: e.target.value, edited: x.source === "ai" }
+                        : x,
+                    ),
+                  }))
+                }
+              />
+            </div>
+          ))}
+          {!deck.cards.length && (
+            <div style={styles.assignEmpty}>
+              This deck is empty. Add a card, or ask Eliora for more.
+            </div>
+          )}
+        </div>
+      </div>
+    );
+  }
+
+  // --- Deck shelf + draft form --------------------------------------------
+  return (
+    <div style={styles.card}>
+      <div style={styles.cardHead}>
+        <span style={styles.cardClass}>🃏 Flashcards</span>
+      </div>
+      <div style={styles.lessonHint}>
+        Name a topic or paste your own material — Eliora drafts the deck, you
+        clean it up, then you flip through it.
+      </div>
+
+      <div style={styles.assignAddRow}>
+        <input
+          style={styles.assignInput}
+          value={topic}
+          placeholder="Cards on… (e.g. cell organelles, Spanish past tense)"
+          onChange={(e) => setTopic(e.target.value)}
+          onKeyDown={(e) => {
+            if (e.key === "Enter") generate();
+          }}
+          disabled={busy}
+        />
+        <button
+          style={styles.assignAddBtn}
+          onClick={() => generate()}
+          disabled={busy || (!topic.trim() && !text.trim() && !file)}
+        >
+          {busy ? "Writing…" : "Make deck"}
+        </button>
+      </div>
+
+      {suggestions.length > 0 && (
+        <div style={{ ...styles.folderRow, marginTop: 6 }}>
+          {suggestions.map((s) => (
+            <button
+              key={s}
+              style={styles.folder}
+              onClick={() => setTopic(s)}
+              disabled={busy}
+            >
+              {missed.includes(s) ? "🎯 " : "📁 "}
+              {s}
+            </button>
+          ))}
+        </div>
+      )}
+
+      <textarea
+        style={styles.lessonInput}
+        placeholder="…or paste the notes / chapter you want cards from"
+        value={text}
+        onChange={(e) => setText(e.target.value)}
+        rows={3}
+        disabled={busy}
+      />
+      <input
+        type="file"
+        accept="application/pdf,image/*,text/plain"
+        style={styles.lessonFile}
+        onChange={(e) => setFile(e.target.files?.[0] ?? null)}
+      />
+
+      <div style={{ marginTop: 14 }}>
+        <div style={styles.quizQ}>Card style</div>
+        <div style={{ ...styles.folderRow, marginTop: 4 }}>
+          <button
+            onClick={() => setStyle(undefined)}
+            disabled={busy}
+            style={{
+              ...styles.folder,
+              ...(style === undefined
+                ? { background: "var(--assistant-bubble)", fontWeight: 700 }
+                : {}),
+            }}
+          >
+            🎲 Mixed
+          </button>
+          {FLASHCARD_STYLES.map((s) => (
+            <button
+              key={s.key}
+              onClick={() => setStyle(s.key)}
+              disabled={busy}
+              style={{
+                ...styles.folder,
+                ...(style === s.key
+                  ? { background: "var(--assistant-bubble)", fontWeight: 700 }
+                  : {}),
+              }}
+            >
+              {s.emoji} {s.label}
+            </button>
+          ))}
+        </div>
+      </div>
+
+      <div style={{ marginTop: 14 }}>
+        <div style={styles.quizQ}>How hard?</div>
+        <div style={{ ...styles.folderRow, marginTop: 4 }}>
+          {QUIZ_DIFFICULTIES.map((d) => (
+            <button
+              key={d.key}
+              onClick={() => setDifficulty(d.key)}
+              disabled={busy}
+              style={{
+                ...styles.folder,
+                ...(difficulty === d.key
+                  ? { background: "var(--assistant-bubble)", fontWeight: 700 }
+                  : {}),
+              }}
+            >
+              {d.label}
+            </button>
+          ))}
+        </div>
+      </div>
+
+      <div style={{ marginTop: 14 }}>
+        <div style={styles.quizQ}>How many cards?</div>
+        <div style={{ ...styles.folderRow, marginTop: 4 }}>
+          {[8, 12, 20, 30].map((n) => (
+            <button
+              key={n}
+              onClick={() => setCount(n)}
+              disabled={busy}
+              style={{
+                ...styles.folder,
+                ...(count === n
+                  ? { background: "var(--assistant-bubble)", fontWeight: 700 }
+                  : {}),
+              }}
+            >
+              {n}
+            </button>
+          ))}
+        </div>
+      </div>
+
+      {err && <div style={styles.lessonErr}>{err}</div>}
+
+      {decks.length > 0 && (
+        <div style={{ marginTop: 18 }}>
+          <div style={styles.quizQ}>Your decks</div>
+          {decks.map((d) => {
+            const left = d.learning?.length ?? 0;
+            return (
+              <div key={d.id} style={styles.fcDeckRow}>
+                <button
+                  style={styles.fcDeckOpen}
+                  onClick={() => setOpenId(d.id)}
+                  title="Open and edit this deck"
+                >
+                  <div style={styles.fcDeckTitle}>{d.title}</div>
+                  <div style={styles.fcDeckMeta}>
+                    {d.cards.length} card{d.cards.length === 1 ? "" : "s"}
+                    {d.fromMaterial ? ` · from ${d.fromMaterial}` : ""}
+                    {left ? ` · ${left} still learning` : ""}
+                  </div>
+                </button>
+                <button
+                  style={styles.fcBtn}
+                  disabled={!d.cards.length}
+                  onClick={() => {
+                    setOpenId(d.id);
+                    setStudying(true);
+                  }}
+                >
+                  ▶️
+                </button>
+                <button
+                  style={styles.fcIconBtn}
+                  title="Delete this deck"
+                  onClick={() =>
+                    setDecks((prev) => prev.filter((x) => x.id !== d.id))
+                  }
+                >
+                  ✕
+                </button>
+              </div>
+            );
+          })}
+        </div>
+      )}
+    </div>
+  );
+}
+
+// One pass through a deck: flip the card, say whether you knew it, move on.
+//
+// "Still learning" is the useful half — those cards come back in the next round
+// and get logged as weak areas, so the rest of Eliora (quizzes, study guides)
+// knows what to aim at.
+function StudyRound({
+  deck,
+  onExit,
+  onMissed,
+  onFinish,
+}: {
+  deck: SavedDeck;
+  onExit: () => void;
+  onMissed: (topic: string) => void;
+  onFinish: (known: string[], learning: string[]) => void;
+}) {
+  // A round is a frozen list of ids: editing the deck mid-round shouldn't
+  // shuffle the cards out from under the learner.
+  const [round, setRound] = useState<string[]>(() =>
+    deck.cards.filter((c) => c.front.trim()).map((c) => c.id),
+  );
+  const [i, setI] = useState(0);
+  const [flipped, setFlipped] = useState(false);
+  const [known, setKnown] = useState<string[]>([]);
+  const [learning, setLearning] = useState<string[]>([]);
+
+  const byId = new Map(deck.cards.map((c) => [c.id, c]));
+  const card = byId.get(round[i]);
+  const done = i >= round.length;
+
+  function mark(gotIt: boolean) {
+    if (!card) return;
+    const nextKnown = gotIt ? [...known, card.id] : known;
+    const nextLearning = gotIt ? learning : [...learning, card.id];
+    setKnown(nextKnown);
+    setLearning(nextLearning);
+    if (!gotIt) {
+      // Feed the weak-area tracker the sub-concept, falling back to the front.
+      const topic = (card.topic || card.front).trim();
+      if (topic) onMissed(topic);
+    }
+    setFlipped(false);
+    setI((n) => n + 1);
+    // Last card: hand the round's tally back so "still learning" survives a
+    // reload and shows on the deck shelf.
+    if (i + 1 >= round.length) onFinish(nextKnown, nextLearning);
+  }
+
+  function startRound(ids: string[]) {
+    setRound(ids);
+    setI(0);
+    setFlipped(false);
+    setKnown([]);
+    setLearning([]);
+  }
+
+  if (done) {
+    const total = known.length + learning.length;
+    return (
+      <div style={styles.card}>
+        <div style={styles.cardHead}>
+          <span style={styles.cardClass}>🃏 {deck.title}</span>
+          <button style={styles.linkBtn} onClick={onExit}>
+            Edit deck
+          </button>
+        </div>
+        <div style={styles.fcScore}>
+          {known.length} / {total} known
+        </div>
+        <div style={styles.lessonHint}>
+          {learning.length
+            ? `${learning.length} card${learning.length === 1 ? "" : "s"} to go
+               again — they're saved as weak areas too.`
+            : "Every card, first try. That deck is done."}
+        </div>
+        <div style={styles.fcActions}>
+          {learning.length > 0 && (
+            <button style={styles.fcBtn} onClick={() => startRound(learning)}>
+              🔁 Just the {learning.length} I&apos;m still learning
+            </button>
+          )}
+          <button
+            style={styles.fcBtnGhost}
+            onClick={() =>
+              startRound(deck.cards.filter((c) => c.front.trim()).map((c) => c.id))
+            }
+          >
+            ↻ Whole deck again
+          </button>
+          <button style={styles.fcBtnGhost} onClick={onExit}>
+            Done
+          </button>
+        </div>
+      </div>
+    );
+  }
+
+  if (!card) {
+    return (
+      <div style={styles.card}>
+        <div style={styles.assignEmpty}>Nothing to study yet.</div>
+        <button style={styles.fcBtnGhost} onClick={onExit}>
+          Back to the deck
+        </button>
+      </div>
+    );
+  }
+
+  const meta = flashcardStyleMeta(card.style);
+
+  return (
+    <div style={styles.card}>
+      <div style={styles.cardHead}>
+        <span style={styles.cardClass}>🃏 {deck.title}</span>
+        <button style={styles.linkBtn} onClick={onExit}>
+          Edit deck
+        </button>
+      </div>
+
+      <div style={styles.fcBar}>
+        <div
+          style={{
+            ...styles.fcBarFill,
+            width: `${Math.round((i / round.length) * 100)}%`,
+          }}
+        />
+      </div>
+      <div style={styles.fcCount}>
+        {i + 1} of {round.length} · {known.length} known · {learning.length} still
+        learning
+      </div>
+
+      <button
+        style={styles.fcFace}
+        onClick={() => setFlipped((f) => !f)}
+        title="Tap to flip"
+      >
+        {/* Name each side the way its style does — a cloze card's front is a
+            "Fill in the blank", not a "Term". */}
+        <div style={styles.fcSide}>{flipped ? meta.back : meta.front}</div>
+        <div style={styles.fcFaceText}>{flipped ? card.back : card.front}</div>
+        {!flipped && card.hint && (
+          <div style={styles.fcHint}>💡 {card.hint}</div>
+        )}
+        <div style={styles.fcTapHint}>Tap to flip</div>
+      </button>
+
+      {flipped ? (
+        <div style={styles.fcActions}>
+          <button style={styles.fcBtnBad} onClick={() => mark(false)}>
+            Still learning
+          </button>
+          <button style={styles.fcBtnGood} onClick={() => mark(true)}>
+            Got it
+          </button>
+        </div>
+      ) : (
+        <div style={styles.fcActions}>
+          <button style={styles.fcBtn} onClick={() => setFlipped(true)}>
+            Show the answer
+          </button>
+        </div>
+      )}
+    </div>
+  );
+}
 
 function PracticeQuiz({
   profile,
@@ -16667,6 +18585,625 @@ function DraftReviewer({
   );
 }
 
+// One "paste it or upload it" slot. The rubric grader needs three of these —
+// the marking sheet, the work, and an earlier draft — and a rubric arrives as a
+// photo of a handout at least as often as it arrives as text.
+function RubricSlot({
+  label,
+  hint,
+  placeholder,
+  minHeight = 90,
+  text,
+  onText,
+  doc,
+  onDoc,
+}: {
+  label: string;
+  hint?: string;
+  placeholder: string;
+  minHeight?: number;
+  text: string;
+  onText: (v: string) => void;
+  doc: RubricUpload | null;
+  onDoc: (d: RubricUpload | null) => void;
+}) {
+  function onFile(files: FileList | null) {
+    const file = files?.[0];
+    if (!file) return;
+    const r = new FileReader();
+    r.onload = () => {
+      const s = String(r.result);
+      onDoc({
+        base64: s.slice(s.indexOf(",") + 1),
+        mediaType: file.type || "text/plain",
+        name: file.name,
+      });
+    };
+    r.readAsDataURL(file);
+  }
+
+  return (
+    <div style={{ marginTop: 10 }}>
+      <label style={styles.classSurveyLabel}>
+        {label}
+        {hint && (
+          <span style={{ color: "var(--muted)", fontWeight: 400 }}> {hint}</span>
+        )}
+        <textarea
+          style={{ ...styles.fypTextarea, minHeight, marginTop: 6 }}
+          value={text}
+          placeholder={placeholder}
+          onChange={(e) => onText(e.target.value)}
+        />
+      </label>
+      <input
+        type="file"
+        accept=".pdf,.txt,.md,.docx,image/*,application/pdf"
+        style={styles.fypFileInput}
+        onChange={(e) => onFile(e.target.files)}
+      />
+      {doc && (
+        <div style={styles.fypDocList}>
+          <span style={styles.fypDocChip}>
+            📄 {doc.name}
+            <button
+              style={styles.fypDocRemove}
+              onClick={() => onDoc(null)}
+              aria-label="Remove file"
+            >
+              ×
+            </button>
+          </span>
+        </div>
+      )}
+    </div>
+  );
+}
+
+// The rubric grader. The draft reviewer next door marks against whatever the
+// teacher asked for; this one takes the actual marking sheet and turns it into
+// arithmetic — every criterion, the evidence in their own words, and the edits
+// ranked by the points each one buys back. Hand it two drafts and it also says
+// what the revision was worth.
+function RubricGrader({
+  subjects,
+  profile,
+  onAsk,
+}: {
+  subjects: string[];
+  profile: LearnerProfile | null;
+  onAsk?: (message: string) => void;
+}) {
+  const [rubric, setRubric] = useState("");
+  const [assignment, setAssignment] = useState("");
+  const [prevDraft, setPrevDraft] = useState("");
+  const [rubricDoc, setRubricDoc] = useState<RubricUpload | null>(null);
+  const [workDoc, setWorkDoc] = useState<RubricUpload | null>(null);
+  const [prevDoc, setPrevDoc] = useState<RubricUpload | null>(null);
+  const [subject, setSubject] = useState("");
+  const [level, setLevel] = useState("");
+  const [showPrev, setShowPrev] = useState(false);
+  const [loading, setLoading] = useState(false);
+  const [grade, setGrade] = useState<RubricGrade | null>(null);
+  const [askFor, setAskFor] = useState("");
+  const [err, setErr] = useState("");
+  const [showBreakdown, setShowBreakdown] = useState(true);
+
+  const hasRubric = !!rubric.trim() || !!rubricDoc;
+  const hasWork = assignment.trim().length >= 40 || !!workDoc;
+  const canSubmit = hasRubric && hasWork && !loading;
+
+  async function run() {
+    if (!canSubmit) return;
+    setLoading(true);
+    setErr("");
+    setAskFor("");
+    try {
+      const res = await fetch("/api/rubric-grade", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          assignment: assignment.trim(),
+          rubric: rubric.trim() || undefined,
+          previousDraft: showPrev ? prevDraft.trim() || undefined : undefined,
+          subject: subject.trim() || undefined,
+          gradeLevel: level.trim() || undefined,
+          assignmentFile: workDoc ?? undefined,
+          rubricFile: rubricDoc ?? undefined,
+          previousFile: showPrev ? (prevDoc ?? undefined) : undefined,
+          profile: profile ?? undefined,
+        }),
+      });
+      const data = (await res.json()) as {
+        grade?: RubricGrade | null;
+        askFor?: string;
+        error?: string;
+      };
+      if (data.grade) {
+        setGrade(data.grade);
+        setAskFor("");
+      } else if (data.askFor) {
+        setAskFor(data.askFor);
+        setGrade(null);
+      } else setErr(data.error || "Couldn't grade that — try again.");
+    } catch {
+      setErr("Couldn't reach the server. Please try again.");
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  // Hand the marking to chat when an edit needs talking through — still
+  // coaching, so the request spells out that Eliora is not to write it for them.
+  function talkItThrough() {
+    if (!grade || !onAsk) return;
+    onAsk(
+      `I got ${grade.score}/${grade.outOf} (${grade.letter}) on my assignment${
+        subject.trim() ? ` (${subject.trim()})` : ""
+      } and I want to get the marks back.\n\nHere are the edits you ranked:\n${grade.revisions
+        .map(
+          (r, i) =>
+            `${i + 1}. ${r.what}${r.criterion ? ` — ${r.criterion}` : ""}${
+              r.points != null ? ` (worth ~${r.points} pts)` : ""
+            }`,
+        )
+        .join(
+          "\n",
+        )}\n\nStart with the first one and walk me through it by asking me questions. Don't write any of it for me — I need to do the writing myself.`,
+    );
+  }
+
+  // A score is easier to act on when the bar agrees with the letter, so the
+  // fill is banded the same way the grade ladder is.
+  const band = (pct: number) =>
+    pct >= 80 ? styles.rgBarGood : pct >= 60 ? styles.rgBarOk : styles.rgBarBad;
+
+  const cmp = grade?.comparison;
+  const sideBySide = grade?.criteria.filter((c) => c.was != null) ?? [];
+
+  return (
+    <div style={styles.card}>
+      <div style={styles.cardHead}>
+        <span style={styles.cardClass}>📊 Grade me against the rubric</span>
+      </div>
+      <p style={styles.prioBlurb}>
+        Give me the marking sheet and your work. I'll score every criterion on
+        it — nothing else — show you where each mark went, and rank the edits by
+        how many points they buy back.
+      </p>
+
+      <RubricSlot
+        label="The rubric"
+        hint="(required — paste it, or upload a photo/PDF of the sheet)"
+        placeholder="Paste every criterion, what each is worth, and the performance levels…"
+        text={rubric}
+        onText={setRubric}
+        doc={rubricDoc}
+        onDoc={setRubricDoc}
+      />
+
+      <RubricSlot
+        label="Your assignment"
+        hint="(required)"
+        placeholder="Paste the work you want graded…"
+        minHeight={130}
+        text={assignment}
+        onText={setAssignment}
+        doc={workDoc}
+        onDoc={setWorkDoc}
+      />
+
+      <div style={{ marginTop: 10 }}>
+        <button style={styles.linkBtn} onClick={() => setShowPrev((s) => !s)}>
+          {showPrev
+            ? "− Drop the earlier draft"
+            : "＋ Compare against an earlier draft"}
+        </button>
+      </div>
+      {showPrev && (
+        <RubricSlot
+          label="Your earlier draft"
+          hint="(optional — I'll grade the new one and tell you what the revision bought)"
+          placeholder="Paste the version you wrote before…"
+          text={prevDraft}
+          onText={setPrevDraft}
+          doc={prevDoc}
+          onDoc={setPrevDoc}
+        />
+      )}
+
+      <div style={styles.assignMetaRow}>
+        <input
+          style={styles.assignSelect}
+          list="rubric-subjects"
+          value={subject}
+          placeholder="Subject (optional)"
+          onChange={(e) => setSubject(e.target.value)}
+        />
+        <datalist id="rubric-subjects">
+          {subjects.map((s) => (
+            <option key={s} value={s} />
+          ))}
+        </datalist>
+        <input
+          style={styles.assignSelect}
+          value={level}
+          placeholder="Grade level (e.g. 10th grade)"
+          onChange={(e) => setLevel(e.target.value)}
+        />
+      </div>
+
+      <button
+        style={{
+          ...styles.studyToolBtn,
+          width: "100%",
+          marginTop: 12,
+          ...(canSubmit ? {} : styles.prioBtnOff),
+        }}
+        onClick={run}
+        disabled={!canSubmit}
+      >
+        {loading
+          ? "Grading…"
+          : !hasRubric
+            ? "📊 Add the rubric to grade"
+            : "📊 Grade against the rubric"}
+      </button>
+
+      {err && <p style={styles.prioErr}>{err}</p>}
+      {askFor && <p style={styles.revAskFor}>🙋 {askFor}</p>}
+
+      {grade && (
+        <div style={{ marginTop: 14 }}>
+          {/* 📊 Overall score */}
+          <div style={styles.revGradeRow}>
+            <span style={{ ...styles.revGrade, fontSize: 24 }}>
+              {grade.score}
+              <span style={styles.rgOutOf}>/{grade.outOf}</span>
+            </span>
+            <div style={{ flex: 1 }}>
+              <div style={styles.revGradeLabel}>
+                {grade.percent}% · predicted {grade.letter}
+              </div>
+              {grade.headline && (
+                <div style={styles.revGradeWhy}>{grade.headline}</div>
+              )}
+            </div>
+          </div>
+
+          <div style={styles.rgBar}>
+            <div
+              style={{
+                ...styles.rgBarFill,
+                ...band(grade.percent),
+                width: `${Math.max(2, Math.min(100, grade.percent))}%`,
+              }}
+            />
+          </div>
+
+          {cmp && (
+            <div
+              style={{
+                ...styles.revDelta,
+                ...(cmp.pointsGained > 0
+                  ? styles.revDeltaUp
+                  : cmp.pointsGained < 0
+                    ? styles.revDeltaDown
+                    : styles.revDeltaFlat),
+              }}
+            >
+              {cmp.previousScore != null
+                ? cmp.pointsGained > 0
+                  ? `▲ Up ${cmp.pointsGained} ${
+                      cmp.pointsGained === 1 ? "point" : "points"
+                    } from ${cmp.previousScore}/${cmp.previousOutOf} — the revision worked.`
+                  : cmp.pointsGained < 0
+                    ? `▼ Down ${Math.abs(cmp.pointsGained)} from ${cmp.previousScore}/${cmp.previousOutOf} — check what you cut.`
+                    : `→ Still ${cmp.previousScore}/${cmp.previousOutOf}. The edits below are the ones that move it.`
+                : "↔ Compared against your earlier draft."}
+              {cmp.summary && <div style={styles.revDeltaReqs}>{cmp.summary}</div>}
+            </div>
+          )}
+
+          {/* Rubric breakdown */}
+          <div style={styles.revSection}>
+            <button
+              style={styles.linkBtn}
+              onClick={() => setShowBreakdown((s) => !s)}
+            >
+              {showBreakdown
+                ? "Hide the rubric breakdown"
+                : `Rubric breakdown (${grade.criteria.length})`}
+            </button>
+            {showBreakdown && (
+              <div style={styles.rgTableWrap}>
+                <table style={styles.rgTable}>
+                  <thead>
+                    <tr>
+                      <th style={styles.rgTh}>Criterion</th>
+                      <th style={{ ...styles.rgTh, ...styles.rgThNum }}>Score</th>
+                      <th style={{ ...styles.rgTh, ...styles.rgThNum }}>Max</th>
+                      <th style={styles.rgTh}>Feedback</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {grade.criteria.map((c, i) => (
+                      <tr key={i}>
+                        <td style={styles.rgTd}>
+                          <div style={styles.rgCriterion}>{c.criterion}</div>
+                          {c.level && <div style={styles.rgLevel}>{c.level}</div>}
+                        </td>
+                        <td
+                          style={{
+                            ...styles.rgTd,
+                            ...styles.rgTdNum,
+                            // Full marks read as green, a zero as a warning —
+                            // the number is what they scan for first.
+                            ...(c.points >= c.outOf
+                              ? styles.revMet
+                              : c.points <= 0
+                                ? styles.revMissing
+                                : styles.revPartial),
+                          }}
+                        >
+                          {c.points}
+                        </td>
+                        <td style={{ ...styles.rgTd, ...styles.rgTdNum }}>
+                          {c.outOf}
+                        </td>
+                        <td style={styles.rgTd}>
+                          <div style={styles.revNote}>{c.why}</div>
+                          {c.evidence && (
+                            <div style={styles.rgEvidence}>“{c.evidence}”</div>
+                          )}
+                          {c.toFullMarks && c.points < c.outOf && (
+                            <div style={styles.rgToFull}>
+                              For full marks: {c.toFullMarks}
+                            </div>
+                          )}
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                  <tfoot>
+                    <tr>
+                      <td style={{ ...styles.rgTd, ...styles.rgTotal }}>Total</td>
+                      <td
+                        style={{
+                          ...styles.rgTd,
+                          ...styles.rgTdNum,
+                          ...styles.rgTotal,
+                        }}
+                      >
+                        {grade.score}
+                      </td>
+                      <td
+                        style={{
+                          ...styles.rgTd,
+                          ...styles.rgTdNum,
+                          ...styles.rgTotal,
+                        }}
+                      >
+                        {grade.outOf}
+                      </td>
+                      <td style={{ ...styles.rgTd, ...styles.rgTotal }}>
+                        {grade.percent}% · {grade.letter}
+                      </td>
+                    </tr>
+                  </tfoot>
+                </table>
+              </div>
+            )}
+          </div>
+
+          {grade.strengths.length > 0 && (
+            <div style={styles.revSection}>
+              <div style={styles.revSectionHead}>
+                ✅ Strengths
+                <span style={styles.revSectionHint}>
+                  {" "}
+                  — don't touch these when you revise
+                </span>
+              </div>
+              {grade.strengths.map((s, i) => (
+                <div key={i} style={styles.revStrength}>
+                  {s}
+                </div>
+              ))}
+            </div>
+          )}
+
+          {grade.weaknesses.length > 0 && (
+            <div style={styles.revSection}>
+              <div style={styles.revSectionHead}>
+                ⚠️ Areas to improve
+                <span style={styles.revSectionHint}> — where the marks went</span>
+              </div>
+              {grade.weaknesses.map((w, i) => (
+                <div key={i} style={styles.revStrength}>
+                  {w}
+                </div>
+              ))}
+            </div>
+          )}
+
+          {/* Draft 1 vs Draft 2 */}
+          {cmp && (
+            <div style={styles.revSection}>
+              <div style={styles.revSectionHead}>
+                🔀 Draft 1 vs Draft 2
+                <span style={styles.revSectionHint}> — what the revision did</span>
+              </div>
+
+              {sideBySide.length > 0 && (
+                <div style={styles.rgTableWrap}>
+                  <table style={styles.rgTable}>
+                    <thead>
+                      <tr>
+                        <th style={styles.rgTh}>Criterion</th>
+                        <th style={{ ...styles.rgTh, ...styles.rgThNum }}>
+                          Draft 1
+                        </th>
+                        <th style={{ ...styles.rgTh, ...styles.rgThNum }}>
+                          Draft 2
+                        </th>
+                        <th style={{ ...styles.rgTh, ...styles.rgThNum }}>
+                          Change
+                        </th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {sideBySide.map((c, i) => {
+                        const move = c.points - (c.was ?? 0);
+                        return (
+                          <tr key={i}>
+                            <td style={styles.rgTd}>
+                              <div style={styles.rgCriterion}>{c.criterion}</div>
+                            </td>
+                            <td style={{ ...styles.rgTd, ...styles.rgTdNum }}>
+                              {c.was}/{c.outOf}
+                            </td>
+                            <td style={{ ...styles.rgTd, ...styles.rgTdNum }}>
+                              {c.points}/{c.outOf}
+                            </td>
+                            <td
+                              style={{
+                                ...styles.rgTd,
+                                ...styles.rgTdNum,
+                                ...(move > 0
+                                  ? styles.revMet
+                                  : move < 0
+                                    ? styles.revMissing
+                                    : styles.revNote),
+                              }}
+                            >
+                              {move > 0 ? `▲ +${move}` : move < 0 ? `▼ ${move}` : "—"}
+                            </td>
+                          </tr>
+                        );
+                      })}
+                    </tbody>
+                  </table>
+                </div>
+              )}
+
+              {cmp.improved.length > 0 && (
+                <div style={styles.rgChangeGroup}>
+                  <div style={styles.rgChangeHead}>▲ What improved</div>
+                  {cmp.improved.map((c, i) => (
+                    <div key={i} style={styles.revFix}>
+                      <span style={{ ...styles.revFixNum, ...styles.rgNumUp }}>
+                        {c.points != null ? `+${c.points}` : "▲"}
+                      </span>
+                      <div style={{ flex: 1 }}>
+                        {c.criterion && (
+                          <div style={styles.revFixWhere}>{c.criterion}</div>
+                        )}
+                        <div style={styles.revFixWhat}>{c.what}</div>
+                        {c.why && <div style={styles.revFixWhy}>{c.why}</div>}
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              )}
+
+              {cmp.regressed.length > 0 && (
+                <div style={styles.rgChangeGroup}>
+                  <div style={{ ...styles.rgChangeHead, ...styles.revMissing }}>
+                    ▼ What got worse
+                  </div>
+                  {cmp.regressed.map((c, i) => (
+                    <div key={i} style={styles.revFix}>
+                      <span style={{ ...styles.revFixNum, ...styles.rgNumDown }}>
+                        {c.points != null ? `−${Math.abs(c.points)}` : "▼"}
+                      </span>
+                      <div style={{ flex: 1 }}>
+                        {c.criterion && (
+                          <div style={styles.revFixWhere}>{c.criterion}</div>
+                        )}
+                        <div style={styles.revFixWhat}>{c.what}</div>
+                        {c.why && <div style={styles.revFixWhy}>{c.why}</div>}
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              )}
+
+              {cmp.rewritten.length > 0 && (
+                <div style={styles.rgChangeGroup}>
+                  <div style={styles.rgChangeHead}>✎ Rewritten sections</div>
+                  <div style={styles.fypDocList}>
+                    {cmp.rewritten.map((s, i) => (
+                      <span key={i} style={styles.fypDocChip}>
+                        {s}
+                      </span>
+                    ))}
+                  </div>
+                </div>
+              )}
+
+              {cmp.nextEdits.length > 0 && (
+                <div style={styles.rgChangeGroup}>
+                  <div style={styles.rgChangeHead}>→ Do these next</div>
+                  {cmp.nextEdits.map((s, i) => (
+                    <div key={i} style={styles.revStrength}>
+                      {s}
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
+          )}
+
+          {/* Revision suggestions, ranked by the points they buy back */}
+          {grade.revisions.length > 0 && (
+            <div style={styles.revSection}>
+              <div style={styles.revSectionHead}>
+                🎯 Priority edits
+                <span style={styles.revSectionHint}>
+                  {" "}
+                  — most points back first
+                </span>
+              </div>
+              {grade.revisions.map((r, i) => (
+                <div key={i} style={styles.revFix}>
+                  <span style={styles.revFixNum}>{i + 1}</span>
+                  <div style={{ flex: 1 }}>
+                    <div style={styles.rgRevHead}>
+                      {r.criterion && (
+                        <span style={styles.revFixWhere}>{r.criterion}</span>
+                      )}
+                      {r.points != null && (
+                        <span style={styles.rgPointsBack}>
+                          +{r.points} {r.points === 1 ? "pt" : "pts"}
+                        </span>
+                      )}
+                    </div>
+                    <div style={styles.revFixWhat}>{r.what}</div>
+                    {r.why && <div style={styles.revFixWhy}>{r.why}</div>}
+                  </div>
+                </div>
+              ))}
+            </div>
+          )}
+
+          {grade.note && <p style={styles.prioNote}>{grade.note}</p>}
+
+          {onAsk && grade.revisions.length > 0 && (
+            <button style={styles.linkBtn} onClick={talkItThrough}>
+              Talk me through edit #1 →
+            </button>
+          )}
+          <div style={styles.prioApplyHint}>
+            Revise your work above, paste the old version into “earlier draft”,
+            and re-grade to see the points move.
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
 // The help desk — three doors into "help me right now": homework help (guided,
 // hints not answers), test prep (a plan across the days actually left), and
 // learning a topic from zero. All three hit /api/help and come back as the same
@@ -16959,6 +19496,313 @@ function HelpDesk({
   );
 }
 
+// Mirrors StudyAdvice / StudyMethod in @eliora/shared.
+type StudyHorizon = "now" | "tonight" | "week" | "longhaul";
+type StudyMethod = {
+  name: string;
+  fit: string;
+  minutes?: number;
+  steps: string[];
+  starter?: string;
+  trap?: string;
+};
+type StudyAdvice = {
+  title: string;
+  summary: string;
+  methods: StudyMethod[];
+  session?: { minutes: number; blocks: string[] };
+  stopDoing?: string[];
+  nextStep?: string;
+  note?: string;
+};
+
+// How to study — the question underneath the help desk. Not "explain this to
+// me" but "what should I actually be DOING with this material". Everyone
+// defaults to rereading and highlighting, which feels like studying and doesn't
+// stick; this names the techniques that do, picked for the material, the time
+// left and the way this particular learner keeps failing.
+//
+// The thing that makes it usable is "starter": the first rep written out against
+// their own material, so there's nothing to set up before starting.
+function StudyMethods({
+  subjects,
+  profile,
+  onAsk,
+}: {
+  subjects: string[];
+  profile: LearnerProfile | null;
+  onAsk?: (message: string) => void;
+}) {
+  const [ask, setAsk] = useState("");
+  const [subject, setSubject] = useState("");
+  const [horizon, setHorizon] = useState<StudyHorizon>("tonight");
+  const [blockers, setBlockers] = useState<string[]>([]);
+  const [doc, setDoc] = useState<{
+    base64: string;
+    mediaType: string;
+    name: string;
+  } | null>(null);
+  const [loading, setLoading] = useState(false);
+  const [advice, setAdvice] = useState<StudyAdvice | null>(null);
+  const [err, setErr] = useState("");
+  // The trap stays folded away — it only means something once you've read how
+  // the method is meant to go.
+  const [openTraps, setOpenTraps] = useState<number[]>([]);
+
+  const meta = STUDY_HORIZONS.find((h) => h.id === horizon) ?? STUDY_HORIZONS[0];
+  const canSubmit = (ask.trim().length >= 3 || !!doc) && !loading;
+
+  function toggleBlocker(b: string) {
+    setBlockers((p) => (p.includes(b) ? p.filter((x) => x !== b) : [...p, b]));
+  }
+
+  function onFile(files: FileList | null) {
+    const file = files?.[0];
+    if (!file) return;
+    const r = new FileReader();
+    r.onload = () => {
+      const s = String(r.result);
+      setDoc({
+        base64: s.slice(s.indexOf(",") + 1),
+        mediaType: file.type || "text/plain",
+        name: file.name,
+      });
+    };
+    r.readAsDataURL(file);
+  }
+
+  async function getAdvice() {
+    if (!canSubmit) return;
+    setLoading(true);
+    setErr("");
+    setAdvice(null);
+    setOpenTraps([]);
+    try {
+      const res = await fetch("/api/study-methods", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          ask: ask.trim(),
+          subject: subject.trim() || undefined,
+          horizon,
+          blockers,
+          fileBase64: doc?.base64,
+          fileMediaType: doc?.mediaType,
+          fileName: doc?.name,
+          profile: profile ?? undefined,
+        }),
+      });
+      const data = (await res.json()) as {
+        advice?: StudyAdvice;
+        error?: string;
+      };
+      if (data.advice) setAdvice(data.advice);
+      else setErr(data.error || "Couldn't work that out — try again.");
+    } catch {
+      setErr("Couldn't reach the server. Please try again.");
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  // Hand the top method's first rep to chat, so she runs the round with them
+  // instead of leaving it as an instruction they have to obey alone.
+  function runIt(m: StudyMethod) {
+    if (!onAsk) return;
+    onAsk(
+      `I'm studying ${ask.trim() || advice?.title || "this"} and I want to try ${
+        m.name
+      }.\n\n${
+        m.starter
+          ? `You said to start with: ${m.starter}`
+          : `The steps you gave me: ${m.steps.join("; ")}`
+      }\n\nRun it with me now — ask me the first thing, wait for my answer, then tell me what I missed. Don't give me the answers up front.`,
+    );
+  }
+
+  return (
+    <div style={styles.card}>
+      <div style={styles.cardHead}>
+        <span style={styles.cardClass}>🧠 How should I study this?</span>
+      </div>
+      <div style={{ ...styles.horizonRow, marginTop: 4 }}>
+        {STUDY_HORIZONS.map((h) => (
+          <button
+            key={h.id}
+            style={{
+              ...styles.horizonBtn,
+              ...(horizon === h.id ? styles.horizonBtnActive : {}),
+            }}
+            onClick={() => setHorizon(h.id)}
+          >
+            <span>
+              {h.emoji} {h.label}
+            </span>
+          </button>
+        ))}
+      </div>
+      <span style={styles.horizonDesc}>{meta.blurb}</span>
+      <textarea
+        style={{ ...styles.fypTextarea, marginTop: 8 }}
+        value={ask}
+        placeholder="What are you studying? — e.g. “Chem unit on equilibrium — 40 pages of notes and a problem set”"
+        onChange={(e) => setAsk(e.target.value)}
+      />
+      <div style={styles.assignMetaRow}>
+        <input
+          style={styles.assignSelect}
+          list="study-method-subjects"
+          value={subject}
+          placeholder="Subject (optional)"
+          onChange={(e) => setSubject(e.target.value)}
+        />
+        <datalist id="study-method-subjects">
+          {subjects.map((s) => (
+            <option key={s} value={s} />
+          ))}
+        </datalist>
+      </div>
+      <div style={styles.mcGroup}>
+        <span style={styles.mcLabel}>What keeps going wrong? (optional)</span>
+        <div style={styles.mcChips}>
+          {STUDY_BLOCKERS.map((b) => {
+            const on = blockers.includes(b);
+            return (
+              <button
+                key={b}
+                type="button"
+                aria-pressed={on}
+                style={{ ...styles.mcChip, ...(on ? styles.mcChipOn : {}) }}
+                onClick={() => toggleBlocker(b)}
+              >
+                {b}
+              </button>
+            );
+          })}
+        </div>
+      </div>
+      <label style={styles.classSurveyLabel}>
+        Or show me the material{" "}
+        <span style={{ color: "var(--muted)", fontWeight: 400 }}>
+          (notes, syllabus, PDF, or a photo)
+        </span>
+        <input
+          type="file"
+          accept=".pdf,.txt,.md,image/*,application/pdf"
+          style={styles.fypFileInput}
+          onChange={(e) => onFile(e.target.files)}
+        />
+      </label>
+      {doc && (
+        <div style={styles.fypDocList}>
+          <span style={styles.fypDocChip}>
+            📄 {doc.name}
+            <button
+              style={styles.fypDocRemove}
+              onClick={() => setDoc(null)}
+              aria-label="Remove file"
+            >
+              ×
+            </button>
+          </span>
+        </div>
+      )}
+      <button
+        style={{
+          ...styles.studyToolBtn,
+          width: "100%",
+          marginTop: 12,
+          ...(canSubmit ? {} : { opacity: 0.5, cursor: "default" }),
+        }}
+        disabled={!canSubmit}
+        onClick={getAdvice}
+      >
+        {loading ? "Working out what fits…" : "🧠 Show me how to study this"}
+      </button>
+      {err && (
+        <p style={{ color: "#c0392b", fontSize: 13, marginTop: 8 }}>{err}</p>
+      )}
+      {advice && (
+        <div style={styles.afbResult}>
+          <div style={styles.helpTitle}>{advice.title}</div>
+          {advice.summary && <p style={styles.afbOverall}>{advice.summary}</p>}
+          {advice.methods.map((m, i) => {
+            const open = openTraps.includes(i);
+            return (
+              <div key={i} style={styles.helpStep}>
+                <div style={styles.helpStepHead}>
+                  <span style={styles.helpStepNum}>{i + 1}</span>
+                  <span style={styles.helpStepTitle}>
+                    {m.name}
+                    {m.minutes ? ` · ${m.minutes} min` : ""}
+                  </span>
+                </div>
+                <div style={styles.helpStepBody}>
+                  {renderMarkdown(m.fit, "var(--accent)")}
+                  {m.steps.map((s, j) => (
+                    <div key={j} style={styles.afbLi}>
+                      • {s}
+                    </div>
+                  ))}
+                </div>
+                {m.starter && (
+                  <div style={styles.helpExample}>
+                    ▶️ <strong>Start with this:</strong> {m.starter}
+                  </div>
+                )}
+                {m.trap && open && (
+                  <div style={styles.helpHint}>⚠️ {m.trap}</div>
+                )}
+                <div style={styles.smPillRow}>
+                  {m.trap && !open && (
+                    <button
+                      style={styles.helpHintBtn}
+                      onClick={() => setOpenTraps((p) => [...p, i])}
+                    >
+                      ⚠️ How people get this wrong
+                    </button>
+                  )}
+                  {onAsk && (
+                    <button style={styles.smRunBtn} onClick={() => runIt(m)}>
+                      💬 Do a round with Eliora
+                    </button>
+                  )}
+                </div>
+              </div>
+            );
+          })}
+          {advice.session && advice.session.blocks.length > 0 && (
+            <>
+              <div style={styles.afbSecHead}>
+                ⏱️ One study block · {advice.session.minutes} min
+              </div>
+              {advice.session.blocks.map((b, i) => (
+                <div key={i} style={styles.afbLi}>
+                  • {b}
+                </div>
+              ))}
+            </>
+          )}
+          {advice.stopDoing && advice.stopDoing.length > 0 && (
+            <>
+              <div style={styles.afbSecHead}>🚫 Stop doing</div>
+              {advice.stopDoing.map((s, i) => (
+                <div key={i} style={styles.afbLi}>
+                  • {s}
+                </div>
+              ))}
+            </>
+          )}
+          {advice.nextStep && (
+            <div style={styles.afbNext}>🎯 Start here: {advice.nextStep}</div>
+          )}
+          {advice.note && <p style={styles.helpNote}>{advice.note}</p>}
+        </div>
+      )}
+    </div>
+  );
+}
+
 // A small 🔊 for a single phrase — the full SpeakButton is a whole-message
 // control, and a phrase list needs one per row without eating the layout.
 function SayBtn({
@@ -17153,6 +19997,323 @@ function SessionRecapCard({
   );
 }
 
+// A live voice call with the tutor — you talk, she answers out loud, back and
+// forth in real time, no typing and no waiting for a turn to render. This
+// rides on OpenAI's Realtime API over WebRTC: the browser gets a short-lived
+// token from /api/tutor/live (the real API key never leaves the server), then
+// opens a peer connection straight to OpenAI carrying your mic up and her
+// voice back. The avatar is animated, not an actual camera — it pulses with
+// however loud she's talking, which is enough to feel like a call rather than
+// a phone-tree voice with nothing behind it.
+type LiveCallStatus = "idle" | "connecting" | "live" | "ending" | "error";
+type LiveCaption = { who: "you" | "tutor"; text: string };
+
+function LiveTutorCall({
+  tutor,
+  track,
+  subject,
+  level,
+  goal,
+  onClose,
+}: {
+  tutor: ElioraTutor;
+  track: TutorTrack;
+  subject: string;
+  level: TutorLevel;
+  goal?: string;
+  onClose: () => void;
+}) {
+  const [status, setStatus] = useState<LiveCallStatus>("connecting");
+  const [err, setErr] = useState("");
+  const [muted, setMuted] = useState(false);
+  const [captions, setCaptions] = useState<LiveCaption[]>([]);
+  const pcRef = useRef<RTCPeerConnection | null>(null);
+  const streamRef = useRef<MediaStream | null>(null);
+  const audioElRef = useRef<HTMLAudioElement | null>(null);
+  const avatarRef = useRef<HTMLDivElement | null>(null);
+  const rafRef = useRef<number | null>(null);
+  const audioCtxRef = useRef<AudioContext | null>(null);
+  const partialRef = useRef<{ who: "you" | "tutor"; text: string } | null>(null);
+
+  function pushCaption(who: "you" | "tutor", text: string) {
+    if (!text.trim()) return;
+    setCaptions((prev) => [...prev.slice(-5), { who, text: text.trim() }]);
+  }
+
+  function onServerEvent(raw: string) {
+    let ev: { type?: string; transcript?: string; delta?: string };
+    try {
+      ev = JSON.parse(raw);
+    } catch {
+      return;
+    }
+    if (ev.type === "response.audio_transcript.done" && ev.transcript) {
+      pushCaption("tutor", ev.transcript);
+    } else if (
+      ev.type === "conversation.item.input_audio_transcription.completed" &&
+      ev.transcript
+    ) {
+      pushCaption("you", ev.transcript);
+    }
+  }
+
+  // The avatar's pulse — read the remote audio's volume every frame and push
+  // it straight onto the element's own transform, not through React state.
+  // Sixty state updates a second would be a lot of re-renders for a circle
+  // that just needs to breathe with her voice.
+  function watchVolume(stream: MediaStream) {
+    const ctx = new AudioContext();
+    audioCtxRef.current = ctx;
+    const source = ctx.createMediaStreamSource(stream);
+    const analyser = ctx.createAnalyser();
+    analyser.fftSize = 256;
+    source.connect(analyser);
+    const data = new Uint8Array(analyser.frequencyBinCount);
+    const tick = () => {
+      analyser.getByteFrequencyData(data);
+      const avg = data.reduce((a, b) => a + b, 0) / data.length;
+      const scale = 1 + Math.min(avg / 90, 1) * 0.22;
+      if (avatarRef.current) {
+        avatarRef.current.style.transform = `scale(${scale})`;
+      }
+      rafRef.current = requestAnimationFrame(tick);
+    };
+    tick();
+  }
+
+  function teardown() {
+    if (rafRef.current) cancelAnimationFrame(rafRef.current);
+    audioCtxRef.current?.close().catch(() => {});
+    streamRef.current?.getTracks().forEach((t) => t.stop());
+    pcRef.current?.close();
+    pcRef.current = null;
+    streamRef.current = null;
+  }
+
+  useEffect(() => {
+    let cancelled = false;
+    async function connect() {
+      try {
+        const res = await fetch("/api/tutor/live", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ tutor: tutor.id, track, subject, level, goal }),
+        });
+        const data = (await res.json()) as {
+          clientSecret?: string;
+          model?: string;
+          error?: string;
+        };
+        if (cancelled) return;
+        if (!data.clientSecret || !data.model) {
+          setErr(data.error || "Couldn't start the live call.");
+          setStatus("error");
+          return;
+        }
+
+        const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+        if (cancelled) {
+          stream.getTracks().forEach((t) => t.stop());
+          return;
+        }
+        streamRef.current = stream;
+
+        const pc = new RTCPeerConnection();
+        pcRef.current = pc;
+        pc.ontrack = (e) => {
+          const [remote] = e.streams;
+          if (audioElRef.current) audioElRef.current.srcObject = remote;
+          watchVolume(remote);
+        };
+        pc.onconnectionstatechange = () => {
+          if (["failed", "disconnected", "closed"].includes(pc.connectionState)) {
+            setStatus((s) => (s === "live" ? "error" : s));
+          }
+        };
+        stream.getTracks().forEach((t) => pc.addTrack(t, stream));
+        const dc = pc.createDataChannel("oai-events");
+        dc.addEventListener("message", (e) => onServerEvent(e.data));
+
+        const offer = await pc.createOffer();
+        await pc.setLocalDescription(offer);
+        const sdpRes = await fetch(
+          `https://api.openai.com/v1/realtime/calls?model=${data.model}`,
+          {
+            method: "POST",
+            body: offer.sdp,
+            headers: {
+              Authorization: `Bearer ${data.clientSecret}`,
+              "Content-Type": "application/sdp",
+            },
+          },
+        );
+        if (!sdpRes.ok) throw new Error("sdp exchange failed");
+        const answerSdp = await sdpRes.text();
+        if (cancelled) return;
+        await pc.setRemoteDescription({ type: "answer", sdp: answerSdp });
+        setStatus("live");
+      } catch {
+        if (!cancelled) {
+          setErr("Couldn't connect the call. Please try again.");
+          setStatus("error");
+        }
+      }
+    }
+    void connect();
+    return () => {
+      cancelled = true;
+      teardown();
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  function toggleMute() {
+    const track = streamRef.current?.getAudioTracks()[0];
+    if (!track) return;
+    track.enabled = !track.enabled;
+    setMuted(!track.enabled);
+  }
+
+  function hangUp() {
+    setStatus("ending");
+    teardown();
+    onClose();
+  }
+
+  return (
+    <div style={liveStyles.overlay}>
+      <audio ref={audioElRef} autoPlay />
+      <div style={liveStyles.panel}>
+        <button style={liveStyles.close} onClick={hangUp} aria-label="End call">
+          ✕
+        </button>
+        <div ref={avatarRef} style={liveStyles.avatar}>
+          {tutor.emoji}
+        </div>
+        <div style={liveStyles.name}>{tutor.name}</div>
+        <div style={liveStyles.status}>
+          {status === "connecting" && "Connecting…"}
+          {status === "live" && `Live · ${subject || tutor.subject}`}
+          {status === "error" && (err || "Call ended.")}
+          {status === "ending" && "Ending…"}
+        </div>
+        <div style={liveStyles.captions}>
+          {captions.map((c, i) => (
+            <div
+              key={i}
+              style={{
+                ...liveStyles.caption,
+                ...(c.who === "you" ? liveStyles.captionYou : {}),
+              }}
+            >
+              {c.who === "you" ? "You: " : `${tutor.name}: `}
+              {c.text}
+            </div>
+          ))}
+        </div>
+        <div style={liveStyles.controls}>
+          <button
+            style={{
+              ...liveStyles.controlBtn,
+              ...(muted ? liveStyles.controlBtnActive : {}),
+            }}
+            onClick={toggleMute}
+            disabled={status !== "live"}
+          >
+            {muted ? "🔇 Unmute" : "🎙️ Mute"}
+          </button>
+          <button style={liveStyles.hangUp} onClick={hangUp}>
+            📞 End call
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+const liveStyles: Record<string, React.CSSProperties> = {
+  overlay: {
+    position: "fixed",
+    inset: 0,
+    background: "rgba(10, 8, 20, 0.86)",
+    zIndex: 1000,
+    display: "flex",
+    alignItems: "center",
+    justifyContent: "center",
+  },
+  panel: {
+    position: "relative",
+    display: "flex",
+    flexDirection: "column",
+    alignItems: "center",
+    gap: 10,
+    padding: "32px 24px",
+    width: "min(420px, 92vw)",
+  },
+  close: {
+    position: "absolute",
+    top: -8,
+    right: -8,
+    background: "rgba(255,255,255,0.12)",
+    color: "#fff",
+    border: "none",
+    borderRadius: "50%",
+    width: 32,
+    height: 32,
+    cursor: "pointer",
+    fontSize: 14,
+  },
+  avatar: {
+    width: 140,
+    height: 140,
+    borderRadius: "50%",
+    background: "var(--brand-gradient, var(--accent))",
+    display: "flex",
+    alignItems: "center",
+    justifyContent: "center",
+    fontSize: 62,
+    transition: "transform 60ms linear",
+    boxShadow: "0 0 60px rgba(196, 162, 255, 0.35)",
+  },
+  name: { color: "#fff", fontSize: 20, fontWeight: 700, marginTop: 4 },
+  status: { color: "rgba(255,255,255,0.7)", fontSize: 13 },
+  captions: {
+    display: "flex",
+    flexDirection: "column",
+    gap: 6,
+    minHeight: 90,
+    width: "100%",
+    marginTop: 8,
+  },
+  caption: {
+    color: "rgba(255,255,255,0.85)",
+    fontSize: 13,
+    textAlign: "center",
+  },
+  captionYou: { color: "rgba(196, 162, 255, 0.95)" },
+  controls: { display: "flex", gap: 12, marginTop: 12 },
+  controlBtn: {
+    background: "rgba(255,255,255,0.12)",
+    color: "#fff",
+    border: "none",
+    borderRadius: 999,
+    padding: "10px 18px",
+    fontSize: 14,
+    cursor: "pointer",
+  },
+  controlBtnActive: { background: "rgba(232, 87, 160, 0.35)" },
+  hangUp: {
+    background: "#e0435e",
+    color: "#fff",
+    border: "none",
+    borderRadius: 999,
+    padding: "10px 18px",
+    fontSize: 14,
+    cursor: "pointer",
+    fontWeight: 600,
+  },
+};
+
 // The AI tutor — a session with whichever tutor you picked, on whatever you're
 // working on. Three doors, and the first one is an actual tutoring session: you
 // say how long you've got, she opens (greeting, a plan for those minutes, and
@@ -17266,6 +20427,11 @@ function AiTutor({
   // beat she's on, and — once it's over — where they got to.
   const [planMinutes, setPlanMinutes] = useState(TUTOR_SESSION_DEFAULT_MINUTES);
   const [goal, setGoal] = useState("");
+  // Paste a video and she teaches from it. `videoUrl` is only sent on the
+  // opening turn — the server fetches and condenses it once, and echoes back
+  // `material`, which is what actually gets resent on every later turn.
+  const [videoUrl, setVideoUrl] = useState("");
+  const [material, setMaterial] = useState("");
   const [plan, setPlan] = useState<SessionBeat[]>([]);
   const [onBeat, setOnBeat] = useState(0);
   const [startedAt, setStartedAt] = useState<number | null>(null);
@@ -17274,6 +20440,7 @@ function AiTutor({
   // The line you just said, held on screen while she thinks. In a session your
   // turn has already happened — waiting for her shouldn't look like nothing did.
   const [pending, setPending] = useState("");
+  const [showLive, setShowLive] = useState(false);
 
   const isLang = track === "language";
   const modes = TUTOR_MODES[track];
@@ -17315,6 +20482,7 @@ function AiTutor({
     setEndedAt(null);
     setRecap(null);
     setPending("");
+    setMaterial("");
   }
 
   function pickMode(next: TutorMode) {
@@ -17331,6 +20499,7 @@ function AiTutor({
     setTrack(next);
     setSubject("");
     setText("");
+    setVideoUrl("");
     reset();
   }
 
@@ -17376,6 +20545,10 @@ function AiTutor({
           minutes: fresh ? 0 : minutes,
           planMinutes,
           goal: goal.trim() || undefined,
+          // Only hand over the link on the opening turn — once she's fetched
+          // and condensed it, `material` carries it on every later turn.
+          videoUrl: fresh ? videoUrl.trim() || undefined : undefined,
+          material: material || undefined,
         }),
       });
       const data = (await res.json()) as {
@@ -17388,6 +20561,7 @@ function AiTutor({
         return;
       }
       const a = data.answer;
+      if (a.material) setMaterial(a.material);
       if (mode === "converse") {
         setThread((prev) => [...prev, { you: said, answer: a }]);
         // Every correction is a real mistake worth revisiting later.
@@ -17552,27 +20726,57 @@ function AiTutor({
               onChange={(e) => setGoal(e.target.value)}
             />
           </div>
-          <button
-            style={{
-              ...styles.studyToolBtn,
-              width: "100%",
-              marginTop: 10,
-              ...(subject.trim() && !loading
-                ? {}
-                : { opacity: 0.5, cursor: "default" }),
-            }}
-            disabled={!subject.trim() || loading}
-            onClick={startSession}
-          >
-            {loading
-              ? `${persona.name} is getting started…`
-              : !subject.trim()
-                ? isLang
-                  ? "Pick a language first"
-                  : "Pick a subject first"
-                : `▶️ Start the session`}
-          </button>
+          <input
+            style={{ ...styles.assignSelect, width: "100%", marginTop: 8 }}
+            value={videoUrl}
+            placeholder="📺 Paste a video link to teach this session from it (optional)"
+            onChange={(e) => setVideoUrl(e.target.value)}
+          />
+          <div style={{ display: "flex", gap: 8, marginTop: 10 }}>
+            <button
+              style={{
+                ...styles.studyToolBtn,
+                flex: 1,
+                ...(subject.trim() && !loading
+                  ? {}
+                  : { opacity: 0.5, cursor: "default" }),
+              }}
+              disabled={!subject.trim() || loading}
+              onClick={startSession}
+            >
+              {loading
+                ? videoUrl.trim() && !material
+                  ? `${persona.name} is watching the video…`
+                  : `${persona.name} is getting started…`
+                : !subject.trim()
+                  ? isLang
+                    ? "Pick a language first"
+                    : "Pick a subject first"
+                  : `▶️ Start the session`}
+            </button>
+            <button
+              style={{
+                ...styles.planRebuildBtn,
+                ...(subject.trim() ? {} : { opacity: 0.5, cursor: "default" }),
+              }}
+              disabled={!subject.trim()}
+              title="Talk to her live — a real voice call, no typing"
+              onClick={() => setShowLive(true)}
+            >
+              📹 Go live
+            </button>
+          </div>
         </div>
+      )}
+      {showLive && (
+        <LiveTutorCall
+          tutor={persona}
+          track={track}
+          subject={subject.trim()}
+          level={level}
+          goal={goal.trim() || undefined}
+          onClose={() => setShowLive(false)}
+        />
       )}
 
       {/* The session in progress: who you're with, how long you've been at it,
@@ -17596,6 +20800,11 @@ function AiTutor({
                   : `${minutes} / ${planMinutes} min`}
             </span>
           </div>
+          {material && (
+            <span style={{ color: "var(--muted)", fontSize: 12 }}>
+              📺 Teaching from the video you pasted in
+            </span>
+          )}
           <SessionBoard plan={plan} onBeat={onBeat} done={!!endedAt} />
         </div>
       )}
@@ -18660,7 +21869,7 @@ function SmartNotes({ profile }: { profile: LearnerProfile | null }) {
                   m.content
                 ) : m.content ? (
                   <div style={styles.resultMd}>
-                    {renderMarkdown(m.content, "var(--accent)")}
+                    {renderMarkdown(m.content, "var(--accent)", "chat")}
                   </div>
                 ) : (
                   "Thinking…"
@@ -19822,99 +23031,189 @@ function NotesWorkspace({ ns }: { ns: string }) {
               />
             ) : (
               <>
-            <GoogleDocsSync
-              note={active}
-              onLink={(docId) => patch(active.id, { docId })}
-            />
-            {/* Concept color toolbar */}
-            <div style={{ display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap" }}>
-              <span style={{ fontSize: 12.5, color: "var(--muted)", fontWeight: 600 }}>
-                Color-code:
-              </span>
-              {NOTE_COLOR_ORDER.map(colorBtn)}
-              <button
-                onClick={() => wrapSelection("**", "**")}
-                title="Bold"
-                style={{ padding: "3px 10px", borderRadius: 8, border: "1px solid var(--border)", background: "transparent", fontWeight: 800, cursor: "pointer", color: "var(--assistant-text)" }}
-              >
-                B
-              </button>
-              <VoiceCapture onAppend={appendToActiveBody} />
-              <span style={{ fontSize: 12, color: "var(--muted)" }}>
-                Tip: link notes with [[Note title]]
-              </span>
-            </div>
-
-            {active.template === "cornell" ? (
-              <div>
-                <div style={{ display: "flex", gap: 10, flexWrap: "wrap" }}>
-                  <div style={{ flex: "1 1 140px", minWidth: 130 }}>
-                    <div style={{ fontSize: 12.5, fontWeight: 800, color: "var(--accent)", textTransform: "uppercase", marginBottom: 4 }}>
-                      Cues / questions
-                    </div>
-                    <textarea
-                      value={active.cue}
-                      onChange={(e) => patch(active.id, { cue: e.target.value })}
-                      placeholder="Key questions, cues, keywords…"
-                      style={{ ...taStyle, minHeight: 440 }}
-                    />
-                  </div>
-                  <div style={{ flex: "2 1 260px", minWidth: 220 }}>
-                    <div style={{ fontSize: 12.5, fontWeight: 800, color: "var(--accent)", textTransform: "uppercase", marginBottom: 4 }}>
-                      Notes
-                    </div>
-                    <textarea
-                      ref={bodyRef}
-                      value={active.body}
-                      onChange={(e) => patch(active.id, { body: e.target.value })}
-                      placeholder="Main notes from class or reading…"
-                      style={{ ...taStyle, minHeight: 440 }}
-                    />
-                  </div>
+                <GoogleDocsSync
+                  note={active}
+                  onLink={(docId) => patch(active.id, { docId })}
+                />
+                {/* Concept color toolbar */}
+                <div
+                  style={{
+                    display: "flex",
+                    alignItems: "center",
+                    gap: 8,
+                    flexWrap: "wrap",
+                  }}
+                >
+                  <span
+                    style={{
+                      fontSize: 12.5,
+                      color: "var(--muted)",
+                      fontWeight: 600,
+                    }}
+                  >
+                    Color-code:
+                  </span>
+                  {NOTE_COLOR_ORDER.map(colorBtn)}
+                  <button
+                    onClick={() => wrapSelection("**", "**")}
+                    title="Bold"
+                    style={{
+                      padding: "3px 10px",
+                      borderRadius: 8,
+                      border: "1px solid var(--border)",
+                      background: "transparent",
+                      fontWeight: 800,
+                      cursor: "pointer",
+                      color: "var(--assistant-text)",
+                    }}
+                  >
+                    B
+                  </button>
+                  <VoiceCapture onAppend={appendToActiveBody} />
+                  <span style={{ fontSize: 12, color: "var(--muted)" }}>
+                    Tip: link notes with [[Note title]]
+                  </span>
                 </div>
-                <div style={{ marginTop: 10 }}>
-                  <div style={{ fontSize: 12.5, fontWeight: 800, color: "var(--accent)", textTransform: "uppercase", marginBottom: 4 }}>
-                    Summary
+
+                {active.template === "cornell" ? (
+                  <div>
+                    <div style={{ display: "flex", gap: 10, flexWrap: "wrap" }}>
+                      <div style={{ flex: "1 1 140px", minWidth: 130 }}>
+                        <div
+                          style={{
+                            fontSize: 12.5,
+                            fontWeight: 800,
+                            color: "var(--accent)",
+                            textTransform: "uppercase",
+                            marginBottom: 4,
+                          }}
+                        >
+                          Cues / questions
+                        </div>
+                        <textarea
+                          value={active.cue}
+                          onChange={(e) =>
+                            patch(active.id, { cue: e.target.value })
+                          }
+                          placeholder="Key questions, cues, keywords…"
+                          style={{ ...taStyle, minHeight: 440 }}
+                        />
+                      </div>
+                      <div style={{ flex: "2 1 260px", minWidth: 220 }}>
+                        <div
+                          style={{
+                            fontSize: 12.5,
+                            fontWeight: 800,
+                            color: "var(--accent)",
+                            textTransform: "uppercase",
+                            marginBottom: 4,
+                          }}
+                        >
+                          Notes
+                        </div>
+                        <textarea
+                          ref={bodyRef}
+                          value={active.body}
+                          onChange={(e) =>
+                            patch(active.id, { body: e.target.value })
+                          }
+                          placeholder="Main notes from class or reading…"
+                          style={{ ...taStyle, minHeight: 440 }}
+                        />
+                      </div>
+                    </div>
+                    <div style={{ marginTop: 10 }}>
+                      <div
+                        style={{
+                          fontSize: 12.5,
+                          fontWeight: 800,
+                          color: "var(--accent)",
+                          textTransform: "uppercase",
+                          marginBottom: 4,
+                        }}
+                      >
+                        Summary
+                      </div>
+                      <textarea
+                        value={active.summary}
+                        onChange={(e) =>
+                          patch(active.id, { summary: e.target.value })
+                        }
+                        placeholder="Sum it up in a sentence or two…"
+                        style={{ ...taStyle, minHeight: 110 }}
+                      />
+                    </div>
                   </div>
+                ) : (
                   <textarea
-                    value={active.summary}
-                    onChange={(e) => patch(active.id, { summary: e.target.value })}
-                    placeholder="Sum it up in a sentence or two…"
-                    style={{ ...taStyle, minHeight: 110 }}
+                    ref={bodyRef}
+                    value={active.body}
+                    onChange={(e) => patch(active.id, { body: e.target.value })}
+                    placeholder="Write your notes… use ## headings, - bullets, and [[links]] to other notes."
+                    style={{ ...taStyle, minHeight: 460 }}
                   />
-                </div>
-              </div>
-            ) : (
-              <textarea
-                ref={bodyRef}
-                value={active.body}
-                onChange={(e) => patch(active.id, { body: e.target.value })}
-                placeholder="Write your notes… use ## headings, - bullets, and [[links]] to other notes."
-                style={{ ...taStyle, minHeight: 460 }}
-              />
-            )}
+                )}
 
-            {/* Live preview */}
-            {(active.body.trim() || active.cue.trim() || active.summary.trim()) && (
-              <div style={{ border: "1px solid var(--border)", borderRadius: 12, padding: 14, background: "var(--assistant-bubble)" }}>
-                <div style={{ fontSize: 12, fontWeight: 800, color: "var(--muted)", textTransform: "uppercase", marginBottom: 8 }}>
-                  Preview
-                </div>
-                {active.template === "cornell" && active.cue.trim() && (
-                  <div style={{ marginBottom: 8 }}>
-                    <div style={{ fontWeight: 800, color: "var(--accent)", fontSize: 13 }}>Cues</div>
-                    {renderNoteMarkdown(active.cue, openByTitle)}
+                {/* Live preview */}
+                {(active.body.trim() ||
+                  active.cue.trim() ||
+                  active.summary.trim()) && (
+                  <div
+                    style={{
+                      border: "1px solid var(--border)",
+                      borderRadius: 12,
+                      padding: 14,
+                      background: "var(--assistant-bubble)",
+                    }}
+                  >
+                    <div
+                      style={{
+                        fontSize: 12,
+                        fontWeight: 800,
+                        color: "var(--muted)",
+                        textTransform: "uppercase",
+                        marginBottom: 8,
+                      }}
+                    >
+                      Preview
+                    </div>
+                    {active.template === "cornell" && active.cue.trim() && (
+                      <div style={{ marginBottom: 8 }}>
+                        <div
+                          style={{
+                            fontWeight: 800,
+                            color: "var(--accent)",
+                            fontSize: 13,
+                          }}
+                        >
+                          Cues
+                        </div>
+                        {renderNoteMarkdown(active.cue, openByTitle)}
+                      </div>
+                    )}
+                    {renderNoteMarkdown(active.body, openByTitle)}
+                    {active.template === "cornell" && active.summary.trim() && (
+                      <div
+                        style={{
+                          marginTop: 8,
+                          paddingTop: 8,
+                          borderTop: "1px solid var(--border)",
+                        }}
+                      >
+                        <div
+                          style={{
+                            fontWeight: 800,
+                            color: "var(--accent)",
+                            fontSize: 13,
+                          }}
+                        >
+                          Summary
+                        </div>
+                        {renderNoteMarkdown(active.summary, openByTitle)}
+                      </div>
+                    )}
                   </div>
                 )}
-                {renderNoteMarkdown(active.body, openByTitle)}
-                {active.template === "cornell" && active.summary.trim() && (
-                  <div style={{ marginTop: 8, paddingTop: 8, borderTop: "1px solid var(--border)" }}>
-                    <div style={{ fontWeight: 800, color: "var(--accent)", fontSize: 13 }}>Summary</div>
-                    {renderNoteMarkdown(active.summary, openByTitle)}
-                  </div>
-                )}
-              </div>
-            )}
 
             <StickyBoard
               stickies={active.stickies}
@@ -22805,6 +26104,8 @@ function ElioraApp() {
   }, [tutorId]);
   // The learner's own textbook/handout digests, and the state of a pending read.
   const [materials, setMaterials] = useState<StudyMaterial[]>([]);
+  // A topic handed to the flashcard builder from the suggestions panel.
+  const [flashSeed, setFlashSeed] = useState<string | undefined>();
   const [materialBusy, setMaterialBusy] = useState<string | null>(null);
   const [materialError, setMaterialError] = useState("");
   // Today's tasks: a fresh short list regenerated once per day (keyed on date).
@@ -22839,64 +26140,6 @@ function ElioraApp() {
   const [timerRequest, setTimerRequest] = useState<{ hour: number } | null>(
     null,
   );
-  // Badge ids the learner has already been rewarded for (so we grant the bonus
-  // XP only once, and never retroactively for badges earned before this shipped).
-  const [claimedBadges, setClaimedBadges] = useState<string[]>([]);
-  const [badgeCelebration, setBadgeCelebration] = useState<BadgeDef | null>(null);
-  const totalXp = Object.values(progress).reduce((a, b) => a + b, 0);
-  // XP still available to spend on custom rewards (earned minus already spent).
-  const availableXp = Math.max(0, totalXp - spentXp);
-  // Award XP; +20% consistency bonus if the learner was also active yesterday.
-  const award = (baseXp: number, label = "") => {
-    const y = new Date();
-    y.setDate(y.getDate() - 1);
-    const onStreak = (progress[localISO(y)] || 0) > 0;
-    const xp = Math.round(onStreak ? baseXp * 1.2 : baseXp);
-    const t = localISO();
-    setProgress((p) => ({ ...p, [t]: (p[t] || 0) + xp }));
-    setXpToast(
-      `+${xp} XP${onStreak ? " · 🔥 streak bonus" : ""}${label ? ` · ${label}` : ""}`,
-    );
-  };
-  // Auto-hide the XP toast.
-  useEffect(() => {
-    if (!xpToast) return;
-    const id = setTimeout(() => setXpToast(null), 2600);
-    return () => clearTimeout(id);
-  }, [xpToast]);
-  // Learner-created rewards: add, redeem (spend available XP), and remove.
-  const addCustomReward = (emoji: string, title: string, cost: number) => {
-    setCustomRewards((prev) => [
-      ...prev,
-      {
-        id: `r${Date.now().toString(36)}${Math.random().toString(36).slice(2, 8)}`,
-        emoji,
-        title,
-        cost,
-        redeemed: 0,
-      },
-    ]);
-  };
-  const redeemCustomReward = (id: string, note?: string) => {
-    const r = customRewards.find((x) => x.id === id);
-    if (!r || totalXp - spentXp < r.cost) return; // can't afford it
-    setSpentXp((s) => s + r.cost);
-    const entry = note?.trim();
-    setCustomRewards((prev) =>
-      prev.map((x) =>
-        x.id === id
-          ? {
-              ...x,
-              redeemed: x.redeemed + 1,
-              log: entry ? [...(x.log ?? []), entry] : x.log,
-            }
-          : x,
-      ),
-    );
-    setXpToast(`🎉 Redeemed ${r.emoji} ${r.title} · −${r.cost} XP`);
-  };
-  const removeCustomReward = (id: string) =>
-    setCustomRewards((prev) => prev.filter((x) => x.id !== id));
   const [fourYearPlan, setFourYearPlan] = useState<FourYearPlan | null>(null);
   const [generatingFyp, setGeneratingFyp] = useState(false);
   // End-of-semester reflections, keyed by year label.
@@ -22950,14 +26193,12 @@ function ElioraApp() {
   // Sub-sections within the Plan tab, so it's not one overwhelming scroll.
   // "overview" is the main landing page that summarizes everything.
   const [planSection, setPlanSection] = useState<
-    | "overview"
-    | "monthly"
-    | "week"
-    | "goals"
-    | "tasks"
-    | "steps"
-    | "fyp"
+    "overview" | "monthly" | "week" | "goals" | "tasks" | "steps" | "fyp"
   >("overview");
+  // Sub-sections within the Study tab, so it's not one long stacked scroll.
+  const [studySection, setStudySection] = useState<
+    "practice" | "plans" | "tools" | "community"
+  >("practice");
   const [sidebarOpen, setSidebarOpen] = useState(false);
   const [viewportW, setViewportW] = useState(1024);
   useEffect(() => {
@@ -23177,7 +26418,9 @@ function ElioraApp() {
   // Today's daily tasks: nudge until they're all checked off. The id is
   // date-scoped so a dismissal only silences it for the day.
   if (dailyTasks?.date === localISO()) {
-    const left = dailyTasks.tasks.filter((t) => !t.done).length;
+    const left = dailyTasks.tasks.filter(
+      (t) => !t.done && !isLaterDay(t, dailyTasks.date),
+    ).length;
     if (left > 0)
       reminders.push({
         id: `daily-${dailyTasks.date}`,
@@ -23185,23 +26428,6 @@ function ElioraApp() {
         text: `${left} daily task${left === 1 ? "" : "s"} left today`,
         kind: "home", // the 🌞 Today's tasks card lives on the Home tab
       });
-  }
-  // Streak at risk: they earned XP yesterday but nothing yet today.
-  {
-    const yd = new Date();
-    yd.setDate(yd.getDate() - 1);
-    if (
-      (progress[localISO(yd)] || 0) > 0 &&
-      (progress[localISO()] || 0) === 0
-    ) {
-      const streak = computeStreak(progress);
-      reminders.push({
-        id: `streak-${localISO()}`,
-        icon: "🔥",
-        text: `Keep your ${streak}-day streak alive — earn some XP today`,
-        kind: "progress",
-      });
-    }
   }
   const shownReminders = reminders.filter((r) => !dismissed.includes(r.id));
   const reminderSig = shownReminders.map((r) => r.id).join("|");
@@ -23398,32 +26624,9 @@ function ElioraApp() {
 
       if (localStorage.getItem(TIME_MGMT_KEY) === "1") setTimeMgmt(true);
 
-      const rawProg = localStorage.getItem(PROGRESS_KEY);
-      const savedProg = rawProg ? JSON.parse(rawProg) : null;
-      if (savedProg && typeof savedProg === "object") setProgress(savedProg);
-
       const rawStudy = localStorage.getItem(STUDY_KEY);
       const savedStudy = rawStudy ? JSON.parse(rawStudy) : null;
       if (savedStudy && typeof savedStudy === "object") setStudyLog(savedStudy);
-
-      // Claimed badges: if we've stored them before, restore. Otherwise this is
-      // the first run since badge rewards shipped — backfill every ALREADY-earned
-      // badge as claimed (no retroactive payout for progress made before now).
-      const rawBadges = localStorage.getItem(BADGES_KEY);
-      if (rawBadges) {
-        const parsed = JSON.parse(rawBadges);
-        if (Array.isArray(parsed)) setClaimedBadges(parsed as string[]);
-      } else {
-        const already =
-          savedProg && typeof savedProg === "object"
-            ? earnedBadgeIds(savedProg, savedGoals ?? [])
-            : [];
-        setClaimedBadges(already);
-        localStorage.setItem(BADGES_KEY, JSON.stringify(already));
-      }
-
-      const savedRoom = localStorage.getItem(ROOM_KEY);
-      if (savedRoom) setEquippedRoom(savedRoom);
 
       const rawMaterial = localStorage.getItem(MATERIAL_KEY);
       if (rawMaterial) {
@@ -23436,15 +26639,6 @@ function ElioraApp() {
       // to the default instead of silently sending an unknown id.
       if (savedTutor && ELIORA_TUTORS.some((t) => t.id === savedTutor))
         setTutorId(savedTutor);
-
-      const rawRewards = localStorage.getItem(CUSTOM_REWARDS_KEY);
-      if (rawRewards) {
-        const parsed = JSON.parse(rawRewards);
-        if (Array.isArray(parsed)) setCustomRewards(parsed as CustomReward[]);
-      }
-      const rawSpent = localStorage.getItem(SPENT_KEY);
-      const savedSpent = rawSpent ? parseInt(rawSpent, 10) : 0;
-      if (Number.isFinite(savedSpent) && savedSpent > 0) setSpentXp(savedSpent);
 
       const rawA11y = localStorage.getItem(A11Y_KEY);
       if (rawA11y) {
@@ -23808,10 +27002,20 @@ function ElioraApp() {
       const data = (await res.json()) as { tasks?: string[]; error?: string };
       const titles = (data.tasks ?? []).filter((t) => t.trim());
       if (titles.length) {
+        // Spread the prep across the run-up so it lands on the calendar as days
+        // of work, not one undated pile sitting under the exam.
+        const dues = paceStepDates(titles.length, e.date);
         setEvents((prev) =>
           prev.map((x) =>
             x.id === e.id
-              ? { ...x, tasks: titles.map((title) => ({ title, done: false })) }
+              ? {
+                  ...x,
+                  tasks: titles.map((title, i) => ({
+                    title,
+                    done: false,
+                    due: dues[i],
+                  })),
+                }
               : x,
           ),
         );
@@ -23823,8 +27027,6 @@ function ElioraApp() {
     }
   }
   function toggleEventTask(eventId: string, index: number) {
-    const et = events.find((x) => x.id === eventId)?.tasks?.[index];
-    if (et && !et.done) award(10); // checking off a prep step earns XP
     setEvents((prev) =>
       prev.map((e) => {
         if (e.id !== eventId) return e;
@@ -23836,6 +27038,38 @@ function ElioraApp() {
           setReviewFor({ title: e.title });
         return { ...e, tasks };
       }),
+    );
+  }
+  // Move a prep step to another day (or clear the day, taking it off the
+  // calendar without deleting the step).
+  function setEventTaskDue(eventId: string, index: number, due: string) {
+    setEvents((prev) =>
+      prev.map((e) =>
+        e.id === eventId
+          ? {
+              ...e,
+              tasks: (e.tasks ?? []).map((t, i) =>
+                i === index ? { ...t, due: due || undefined } : t,
+              ),
+            }
+          : e,
+      ),
+    );
+  }
+  // The notes line under a prep step. Emptying it clears the line.
+  function setEventTaskDetail(eventId: string, index: number, detail: string) {
+    const clean = detail.trim();
+    setEvents((prev) =>
+      prev.map((e) =>
+        e.id === eventId
+          ? {
+              ...e,
+              tasks: (e.tasks ?? []).map((t, i) =>
+                i === index ? { ...t, detail: clean || undefined } : t,
+              ),
+            }
+          : e,
+      ),
     );
   }
 
@@ -23916,15 +27150,7 @@ function ElioraApp() {
   }
   function toggleAssignment(id: string) {
     const a = assignments.find((x) => x.id === id);
-    if (a && !a.done) {
-      // Hard tasks (essays, test prep, projects…) are worth 100+; others 60.
-      const hard =
-        /essay|exam|test|prep|project|paper|research|final|midterm|study guide/i.test(
-          a.title,
-        );
-      award(hard ? 100 : 60, hard ? "hard task!" : "task done");
-      setReviewFor({ title: a.title });
-    }
+    if (a && !a.done) setReviewFor({ title: a.title });
     setAssignments((prev) =>
       prev.map((x) => (x.id === id ? { ...x, done: !x.done } : x)),
     );
@@ -23978,6 +27204,13 @@ function ElioraApp() {
       ),
     );
   }
+  // The "Break it down" checklist lives on the assignment, so the steps and
+  // whatever's been ticked off survive a reload with everything else.
+  function setAssignmentSteps(id: string, steps: TaskStep[] | undefined) {
+    setAssignments((prev) =>
+      prev.map((a) => (a.id === id ? { ...a, steps: steps?.length ? steps : undefined } : a)),
+    );
+  }
   function removeAssignment(id: string) {
     setAssignments((prev) => prev.filter((a) => a.id !== id));
   }
@@ -24018,31 +27251,9 @@ function ElioraApp() {
       },
     ]);
   }
-  // Grant the reward "prize" a learner tied to a goal — claimed FOR FREE the
-  // moment the goal is achieved (hitting the goal IS the price, no XP spent). It
-  // still counts toward the reward's claim tally so it shows up as a treat won.
-  const grantGoalReward = (g: SmartGoal) => {
-    if (!g.rewardId) return;
-    const r = customRewards.find((x) => x.id === g.rewardId);
-    if (!r) return;
-    setCustomRewards((prev) =>
-      prev.map((x) =>
-        x.id === r.id ? { ...x, redeemed: x.redeemed + 1 } : x,
-      ),
-    );
-    setXpToast(`🎁 Reward unlocked: ${r.emoji} ${r.title}!`);
-  };
   // Nudge numeric progress up or down (clamped to 0..target). Auto-completes
   // the goal when it reaches the target, and reopens it if backed off.
   function stepGoal(id: string, delta: number) {
-    const g = goals.find((x) => x.id === id);
-    // Decide "just achieved" from the current closure (the setGoals updater runs
-    // later during reconciliation, so a flag set inside it isn't visible here).
-    let justAchieved = false;
-    if (g && typeof g.target === "number") {
-      const next = Math.max(0, Math.min(g.target, (g.current ?? 0) + delta));
-      justAchieved = next >= g.target && !g.done;
-    }
     setGoals((prev) =>
       prev.map((x) => {
         if (x.id !== id || typeof x.target !== "number") return x;
@@ -24053,25 +27264,10 @@ function ElioraApp() {
         return { ...x, current, done: current >= x.target };
       }),
     );
-    if (justAchieved && g) {
-      award(80, "goal achieved!"); // hitting the target is a big win too
-      grantGoalReward(g);
-    }
   }
   function toggleGoalDone(id: string) {
-    const g = goals.find((x) => x.id === id);
-    if (g && !g.done) {
-      award(80, "goal achieved!"); // achieving a goal is a big win
-      grantGoalReward(g); // and hand over the prize they tied to it
-    }
     setGoals((prev) =>
       prev.map((x) => (x.id === id ? { ...x, done: !x.done } : x)),
-    );
-  }
-  // Tie a custom reward to a goal (or clear it) — the prize for achieving it.
-  function linkGoalReward(goalId: string, rewardId: string | undefined) {
-    setGoals((prev) =>
-      prev.map((g) => (g.id === goalId ? { ...g, rewardId } : g)),
     );
   }
   function removeGoal(id: string) {
@@ -24092,10 +27288,21 @@ function ElioraApp() {
       const data = (await res.json()) as { tasks?: string[]; error?: string };
       const titles = (data.tasks ?? []).filter((t) => t.trim());
       if (titles.length) {
+        // Give each step a day between now and the goal's target date, so the
+        // checklist shows up on the calendar as work with somewhere to sit.
+        // A goal with no target date keeps an undated checklist.
+        const dues = paceStepDates(titles.length, g.timeBound);
         setGoals((prev) =>
           prev.map((x) =>
             x.id === g.id
-              ? { ...x, tasks: titles.map((title) => ({ title, done: false })) }
+              ? {
+                  ...x,
+                  tasks: titles.map((title, i) => ({
+                    title,
+                    done: false,
+                    due: dues[i],
+                  })),
+                }
               : x,
           ),
         );
@@ -24107,8 +27314,6 @@ function ElioraApp() {
     }
   }
   function toggleGoalTask(goalId: string, index: number) {
-    const t = goals.find((x) => x.id === goalId)?.tasks?.[index];
-    if (t && !t.done) award(10); // checking off a step earns XP
     setGoals((prev) =>
       prev.map((g) =>
         g.id === goalId
@@ -24116,6 +27321,38 @@ function ElioraApp() {
               ...g,
               tasks: (g.tasks ?? []).map((t, i) =>
                 i === index ? { ...t, done: !t.done } : t,
+              ),
+            }
+          : g,
+      ),
+    );
+  }
+  // Move a goal step to another day (or clear the day, taking it off the
+  // calendar without deleting the step).
+  function setGoalTaskDue(goalId: string, index: number, due: string) {
+    setGoals((prev) =>
+      prev.map((g) =>
+        g.id === goalId
+          ? {
+              ...g,
+              tasks: (g.tasks ?? []).map((t, i) =>
+                i === index ? { ...t, due: due || undefined } : t,
+              ),
+            }
+          : g,
+      ),
+    );
+  }
+  // The notes line under a goal step. Emptying it clears the line.
+  function setGoalTaskDetail(goalId: string, index: number, detail: string) {
+    const clean = detail.trim();
+    setGoals((prev) =>
+      prev.map((g) =>
+        g.id === goalId
+          ? {
+              ...g,
+              tasks: (g.tasks ?? []).map((t, i) =>
+                i === index ? { ...t, detail: clean || undefined } : t,
               ),
             }
           : g,
@@ -24493,11 +27730,14 @@ function ElioraApp() {
             (a, b) => PRIORITY_RANK[taskPriority(a)] - PRIORITY_RANK[taskPriority(b)],
           );
         // A task the learner wrote is theirs to keep — a refresh replaces only
-        // what Eliora generated, and their own list stays on top.
+        // what Eliora generated, and their own list stays on top. Anything set
+        // for a later day survives too, whoever wrote it: it was never today's
+        // to replace, and dropping it would lose a to-do before its day came.
         setDailyTasks((prev) => {
-          const mine =
-            prev?.date === today ? prev.tasks.filter((t) => t.mine) : [];
-          return { date: today, tasks: [...mine, ...fresh] };
+          const kept = (prev?.tasks ?? []).filter(
+            (t) => (prev!.date === today && t.mine) || isLaterDay(t, today),
+          );
+          return { date: today, tasks: [...kept, ...fresh] };
         });
       }
     } catch {
@@ -24525,14 +27765,13 @@ function ElioraApp() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [loaded, dailyTasks, profile, plan, goals, dailyLoading]);
 
-  // Toggle a today's-task done; award XP the first time each is completed.
+  // Toggle a today's-task done.
   const toggleDailyTask = (i: number) => {
     setDailyTasks((prev) => {
       if (!prev) return prev;
       const tasks = prev.tasks.map((t, x) =>
         x === i ? { ...t, done: !t.done } : t,
       );
-      if (!prev.tasks[i]?.done && tasks[i]?.done) award(15, "task done");
       return { ...prev, tasks };
     });
   };
@@ -24543,6 +27782,20 @@ function ElioraApp() {
       if (!prev) return prev;
       const estMin = Number.isFinite(min) && min > 0 ? Math.round(min) : undefined;
       const tasks = prev.tasks.map((t, x) => (x === i ? { ...t, estMin } : t));
+      return { ...prev, tasks };
+    });
+  };
+
+  // The details line under a task. Eliora writes the first version as the
+  // reason she put it on the list; from then on it's the learner's own notes,
+  // so an emptied box clears it rather than snapping back to her wording.
+  const setDailyTaskWhy = (i: number, why: string) => {
+    setDailyTasks((prev) => {
+      if (!prev) return prev;
+      const clean = why.trim();
+      const tasks = prev.tasks.map((t, x) =>
+        x === i ? { ...t, why: clean || undefined } : t,
+      );
       return { ...prev, tasks };
     });
   };
@@ -24560,19 +27813,40 @@ function ElioraApp() {
 
   // Add a task the learner wrote themselves. `mine` marks it so a regeneration
   // keeps it. Starting a list from scratch (no AI tasks yet) seeds today's date.
-  // The new task goes straight onto today's schedule too — placement is by
-  // priority, so a High task added late still claims the earliest free hour.
-  const addDailyTask = (title: string, priority: Priority) => {
+  // `date` is the day they picked for it — left off for today. A task for today
+  // goes straight onto today's schedule too (placement is by priority, so a High
+  // task added late still claims the earliest free hour); one for a later day
+  // waits on the calendar until that day, and doesn't take today's hours.
+  const addDailyTask = (title: string, priority: Priority, date?: string) => {
     const clean = title.trim();
     if (!clean) return;
     const today = localISO();
-    const task: DailyTask = { title: clean, priority, done: false, mine: true };
+    const day = date && date > today ? date : undefined;
+    const task: DailyTask = {
+      title: clean,
+      priority,
+      done: false,
+      mine: true,
+      date: day,
+    };
     const next: DailyTasksState =
       !dailyTasks || dailyTasks.date !== today
         ? { date: today, tasks: [task] }
         : { ...dailyTasks, tasks: [...dailyTasks.tasks, task] };
     setDailyTasks(next);
-    placeTasksOnSchedule(next.tasks);
+    if (!day) placeTasksOnSchedule(next.tasks);
+  };
+
+  // Move a task to another day. Clearing the box (or picking today) puts it
+  // back on today's list and back onto today's schedule.
+  const setDailyTaskDate = (i: number, date: string) => {
+    if (!dailyTasks) return;
+    const today = localISO();
+    const tasks = dailyTasks.tasks.map((t, x) =>
+      x === i ? { ...t, date: date && date > today ? date : undefined } : t,
+    );
+    setDailyTasks({ ...dailyTasks, tasks });
+    if (dailyTasks.date === today) placeTasksOnSchedule(tasks);
   };
 
   // Drop a task off today's list entirely.
@@ -24583,12 +27857,22 @@ function ElioraApp() {
   };
 
   // Move a task up (-1) or down (+1). The array order IS the learner's ranking.
+  // Today's tasks and the ones parked on later days are ranked separately, so a
+  // move steps OVER anything from the other list rather than swapping with it —
+  // otherwise nudging a task up in one list silently reorders the other.
   const moveDailyTask = (i: number, dir: -1 | 1) => {
     setDailyTasks((prev) => {
-      if (!prev) return prev;
-      const j = i + dir;
-      if (i < 0 || j < 0 || i >= prev.tasks.length || j >= prev.tasks.length)
-        return prev;
+      if (!prev || i < 0 || i >= prev.tasks.length) return prev;
+      const today = localISO();
+      const mine = isLaterDay(prev.tasks[i], today);
+      let j = i + dir;
+      while (
+        j >= 0 &&
+        j < prev.tasks.length &&
+        isLaterDay(prev.tasks[j], today) !== mine
+      )
+        j += dir;
+      if (j < 0 || j >= prev.tasks.length) return prev;
       const tasks = prev.tasks.slice();
       [tasks[i], tasks[j]] = [tasks[j], tasks[i]];
       return { ...prev, tasks };
@@ -24642,7 +27926,9 @@ function ElioraApp() {
     const today = localISO();
     const open = tasks
       .map((t, i) => ({ t, i }))
-      .filter(({ t }) => !t.done && t.title.trim())
+      // A task parked on a later day isn't today's work and doesn't get today's
+      // hours — it comes back into the schedule on the day it's for.
+      .filter(({ t }) => !t.done && t.title.trim() && !isLaterDay(t, today))
       .sort(
         (a, b) =>
           PRIORITY_RANK[taskPriority(a.t)] - PRIORITY_RANK[taskPriority(b.t)] ||
@@ -24709,16 +27995,6 @@ function ElioraApp() {
     if (dailyTasks.date === localISO()) placeTasksOnSchedule(tasks);
   };
 
-  // Persist progress XP log.
-  useEffect(() => {
-    if (!loaded) return;
-    try {
-      localStorage.setItem(PROGRESS_KEY, JSON.stringify(progress));
-    } catch {
-      /* ignore */
-    }
-  }, [progress, loaded]);
-
   // Persist minutes-studied log.
   useEffect(() => {
     if (!loaded) return;
@@ -24728,51 +28004,6 @@ function ElioraApp() {
       /* ignore */
     }
   }, [studyLog, loaded]);
-
-  // Persist which badges have been rewarded.
-  useEffect(() => {
-    if (!loaded) return;
-    try {
-      localStorage.setItem(BADGES_KEY, JSON.stringify(claimedBadges));
-    } catch {
-      /* ignore */
-    }
-  }, [claimedBadges, loaded]);
-
-  // Reward newly-earned badges: grant each badge's bonus XP once, then mark it
-  // claimed and pop a celebration. Adding the XP can push the learner over the
-  // next badge's threshold — the effect re-runs and rewards that one too.
-  useEffect(() => {
-    if (!loaded) return;
-    const fresh = earnedBadgeIds(progress, goals).filter(
-      (id) => !claimedBadges.includes(id),
-    );
-    if (!fresh.length) return;
-    const defs = fresh
-      .map((id) => BADGE_DEFS.find((b) => b.id === id))
-      .filter((b): b is BadgeDef => Boolean(b));
-    const totalReward = defs.reduce((s, d) => s + d.reward, 0);
-    const t = localISO();
-    setProgress((p) => ({ ...p, [t]: (p[t] || 0) + totalReward }));
-    setClaimedBadges((prev) => [...prev, ...fresh]);
-    setBadgeCelebration(defs[0]);
-    setXpToast(
-      defs.length === 1
-        ? `🎖️ ${defs[0].label} earned · +${totalReward} XP`
-        : `🎖️ ${defs.length} badges earned · +${totalReward} XP`,
-    );
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [progress, goals, claimedBadges, loaded]);
-
-  // Persist the equipped study-room reward.
-  useEffect(() => {
-    if (!loaded) return;
-    try {
-      localStorage.setItem(ROOM_KEY, equippedRoom);
-    } catch {
-      /* ignore */
-    }
-  }, [equippedRoom, loaded]);
 
   // Persist the chosen AI tutor, and point read-aloud at that tutor's voice so
   // they sound like themselves. Settings' VoicePicker writes the same key, so
@@ -24798,17 +28029,6 @@ function ElioraApp() {
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [materials, loaded]);
-
-  // Persist the learner's custom rewards + spent-XP balance.
-  useEffect(() => {
-    if (!loaded) return;
-    try {
-      localStorage.setItem(CUSTOM_REWARDS_KEY, JSON.stringify(customRewards));
-      localStorage.setItem(SPENT_KEY, String(spentXp));
-    } catch {
-      /* ignore */
-    }
-  }, [customRewards, spentXp, loaded]);
 
   // Build (or rebuild) the roadmap. With `blank`, start an empty 4-year skeleton
   // the learner fills in; otherwise ask Eliora to draft it toward the destination.
@@ -25179,7 +28399,6 @@ function ElioraApp() {
           });
         }
         setPlanSection("goals");
-        setXpToast(`🎯 Added ${fresh.length} goal${fresh.length > 1 ? "s" : ""}`);
       }
     } catch {
       /* ignore — can retry */
@@ -25879,7 +29098,6 @@ function ElioraApp() {
   }
 
   function togglePlan(i: number) {
-    if (plan[i] && !plan[i].done) award(15); // completing a plan step earns XP
     setPlan((prev) =>
       prev.map((m, idx) => (idx === i ? { ...m, done: !m.done } : m)),
     );
@@ -26124,6 +29342,7 @@ function ElioraApp() {
       let acc = "";
       const videos: Video[] = [];
       const socials: SocialRec[] = [];
+      const resources: ResourceRec[] = [];
       const examples: StudentExample[] = [];
       let flashcards: Flashcard[] | undefined;
       let quiz: QuizQuestion[] | undefined;
@@ -26137,6 +29356,7 @@ function ElioraApp() {
           items?:
             | Video[]
             | SocialRec[]
+            | ResourceRec[]
             | StudentExample[]
             | IncomingMilestone[]
             | Flashcard[]
@@ -26215,6 +29435,8 @@ function ElioraApp() {
           videos.push(...(evt.items as Video[]));
         else if (evt.type === "socials" && evt.items)
           socials.push(...(evt.items as SocialRec[]));
+        else if (evt.type === "resources" && evt.items)
+          resources.push(...(evt.items as ResourceRec[]));
         else if (evt.type === "examples" && evt.items)
           examples.push(...(evt.items as StudentExample[]));
         else if (evt.type === "flashcards")
@@ -26229,6 +29451,7 @@ function ElioraApp() {
             content: acc,
             videos: videos.length ? [...videos] : undefined,
             socials: socials.length ? [...socials] : undefined,
+            resources: resources.length ? [...resources] : undefined,
             examples: examples.length ? [...examples] : undefined,
             flashcards,
             quiz,
@@ -26605,52 +29828,6 @@ function ElioraApp() {
           />
         )}
 
-        {xpToast && (
-          <div style={styles.xpToast} className="fade-in">
-            {xpToast}
-          </div>
-        )}
-
-        {badgeCelebration && (
-          <div
-            style={styles.overlay}
-            onClick={() => setBadgeCelebration(null)}
-          >
-            <div
-              style={styles.badgeModal}
-              className="fade-in"
-              onClick={(e) => e.stopPropagation()}
-            >
-              <div style={styles.badgeCelebrateKicker}>🎉 Badge earned!</div>
-              <div
-                style={{
-                  ...styles.badgeModalMedal,
-                  background: badgeCelebration.bg,
-                }}
-              >
-                {badgeCelebration.emoji}
-              </div>
-              <div style={styles.badgeModalTitle}>{badgeCelebration.label}</div>
-              <div
-                style={{
-                  ...styles.badgeModalStatus,
-                  background: "var(--accent-soft)",
-                  color: "var(--accent)",
-                }}
-              >
-                ⭐ +{badgeCelebration.reward} XP reward
-              </div>
-              <p style={styles.badgeModalBlurb}>{badgeCelebration.blurb}</p>
-              <button
-                style={styles.goalSuggestBtn}
-                onClick={() => setBadgeCelebration(null)}
-              >
-                Awesome!
-              </button>
-            </div>
-          </div>
-        )}
-
         {incomingShare && (
           <div style={styles.overlay} onClick={() => setIncomingShare(null)}>
             <div
@@ -26763,9 +29940,11 @@ function ElioraApp() {
               onGenerate={generateDailyTasks}
               onToggle={toggleDailyTask}
               onSetMin={setDailyTaskMin}
+              onSetWhy={setDailyTaskWhy}
               onSetPriority={setDailyTaskPriority}
               onBudget={budgetDailyTime}
               onAdd={addDailyTask}
+              onSetDate={setDailyTaskDate}
               onDelete={deleteDailyTask}
               onMove={moveDailyTask}
               onRename={renameDailyTask}
@@ -26804,20 +29983,7 @@ function ElioraApp() {
               busy={busy || !!pendingKickoff}
               onStart={startTopicChat}
             />
-            <ProgressCard log={progress} study={studyLog} goals={goals} />
-            <RewardsCard
-              totalXp={totalXp}
-              equipped={equippedRoom}
-              onEquip={setEquippedRoom}
-            />
-            <MyRewardsCard
-              availableXp={availableXp}
-              rewards={customRewards}
-              goals={goals}
-              onAdd={addCustomReward}
-              onRedeem={redeemCustomReward}
-              onRemove={removeCustomReward}
-            />
+            <ProgressCard study={studyLog} />
             <div className="eliora-home-actions" style={styles.homeActions}>
               {(
                 [
@@ -26926,39 +30092,1007 @@ function ElioraApp() {
           </div>
         )}
 
-      {tab === "notebook" && (
-        <div style={{ padding: "8px 16px 24px" }}>
-          <h2 style={{ fontSize: 22, fontWeight: 800, color: "var(--accent)", margin: "6px 0 2px" }}>
-            📓 Smart Notes
-          </h2>
-          <p style={{ color: "var(--muted)", fontSize: 14, margin: "0 0 10px" }}>
-            {notesView === "notes"
-              ? "Your notes — free-form or Cornell, color-code key concepts, link notes with [[title]], and pin sticky notes."
-              : "Paste notes, a link, or a doc and turn it into a summary, study guide, topic modules, video notes, flashcards, or a quiz."}
-          </p>
-          {/* Sub-tabs: the notebook and the summarizer live side by side here. */}
-          <div style={{ ...styles.outputRow, marginBottom: 12 }}>
-            {(
-              [
-                ["notes", "📓 My notes"],
-                ["summarize", "📝 Summarize"],
-              ] as const
-            ).map(([k, label]) => (
-              <button
-                key={k}
-                onClick={() => setNotesView(k)}
-                style={{
-                  ...styles.outChip,
-                  ...(notesView === k ? styles.outChipActive : {}),
+        {tab === "notebook" && (
+          <div style={{ padding: "8px 16px 24px" }}>
+            <h2
+              style={{
+                fontSize: 22,
+                fontWeight: 800,
+                color: "var(--accent)",
+                margin: "6px 0 2px",
+              }}
+            >
+              📓 Smart Notes
+            </h2>
+            <p
+              style={{
+                color: "var(--muted)",
+                fontSize: 14,
+                margin: "0 0 10px",
+              }}
+            >
+              {notesView === "notes"
+                ? "Your notes — free-form or Cornell, color-code key concepts, link notes with [[title]], and pin sticky notes."
+                : "Paste notes, a link, or a doc and turn it into a summary, study guide, topic modules, video notes, flashcards, or a quiz."}
+            </p>
+            {/* Sub-tabs: the notebook and the summarizer live side by side here. */}
+            <div style={{ ...styles.outputRow, marginBottom: 12 }}>
+              {(
+                [
+                  ["notes", "📓 My notes"],
+                  ["summarize", "📝 Summarize"],
+                ] as const
+              ).map(([k, label]) => (
+                <button
+                  key={k}
+                  onClick={() => setNotesView(k)}
+                  style={{
+                    ...styles.outChip,
+                    ...(notesView === k ? styles.outChipActive : {}),
+                  }}
+                >
+                  {label}
+                </button>
+              ))}
+            </div>
+            {notesView === "notes" ? (
+              <NotesWorkspace ns={ns} />
+            ) : (
+              <Summarizer
+                profile={profile}
+                onAddToChat={(msg) => {
+                  setMessages((prev) => [
+                    ...prev,
+                    {
+                      role: "assistant",
+                      content: msg.content,
+                      flashcards: msg.flashcards,
+                      quiz: msg.quiz,
+                    },
+                  ]);
+                  setTab("chat");
                 }}
-              >
-                {label}
-              </button>
-            ))}
+                onStudyGuide={studyGuideFromQuiz}
+              />
+            )}
           </div>
-          {notesView === "notes" ? (
+        )}
+
+        {tab === "practice" && (
+          <PracticeQuiz
+            profile={profile}
+            subjects={subjects}
+            missed={missed}
+            onMissed={addMissed}
+            onMistake={(m) => logMistake({ ...m, source: "quiz" })}
+            onStudyGuide={studyGuideFromQuiz}
+          />
+        )}
+
+        {tab === "calendar" && (
+          <div style={styles.studyScroll}>
+            {/* Sub-tabs: the dates themselves, and the week that repeats behind
+              them. Blocks drawn in "My week" show up on every matching day. */}
+            <div style={{ ...styles.outputRow, marginBottom: 12 }}>
+              {(
+                [
+                  ["dates", "📅 Dates & today"],
+                  ["week", "🗓️ My week"],
+                ] as const
+              ).map(([k, label]) => (
+                <button
+                  key={k}
+                  onClick={() => setCalendarView(k)}
+                  style={{
+                    ...styles.outChip,
+                    ...(calendarView === k ? styles.outChipActive : {}),
+                  }}
+                >
+                  {label}
+                </button>
+              ))}
+            </div>
+            {calendarView === "week" && (
+              <ScheduleStudio
+                profile={profile}
+                schedule={weekSchedule}
+                onSchedule={setWeekSchedule}
+              />
+            )}
+            {/* Hidden rather than unmounted: a study timer may be running in
+              today's grid, and switching views shouldn't end someone's session. */}
+            <div
+              style={calendarView === "dates" ? undefined : { display: "none" }}
+            >
+              <ScheduleGrid
+                schedule={schedule}
+                onSet={setScheduleBlock}
+                onClear={clearSchedule}
+                homeHour={homeHour}
+                onSetHomeHour={setHomeHour}
+                onGenerate={() => generateStudySchedule()}
+                onSetupReady={handleScheduleSetup}
+                profile={profile}
+                generating={generatingSchedule}
+                onStudyMinutes={logStudyMinutes}
+                remindOn={remindOn}
+                onSetRemindOn={setRemindOn}
+                timerRequest={timerRequest}
+                onTimerRequestConsumed={() => setTimerRequest(null)}
+              />
+              <CalendarPanel
+                events={events}
+                assignments={assignments}
+                dailyTasks={dailyTasks}
+                goals={goals}
+                week={weekSchedule}
+                profile={profile}
+                career={fourYearPlan?.destination}
+                onAdd={addEvent}
+                onRemove={removeEvent}
+                onBreakDown={breakDownEvent}
+                onToggleTask={toggleEventTask}
+                onSetTaskDue={setEventTaskDue}
+                onSetTaskDetail={setEventTaskDetail}
+                onToggleDailyTask={toggleDailyTask}
+                onSetDailyTaskDate={setDailyTaskDate}
+                onOpenGoals={() => {
+                  setPlanSection("goals");
+                  setTab("plan");
+                }}
+                breakingEventId={breakingEventId}
+              />
+            </div>
+          </div>
+        )}
+
+        {tab === "plan" && (
+          <div style={styles.studyScroll}>
+            <div style={styles.planSectionNav}>
+              {(
+                [
+                  ["overview", "📋 Overview"],
+                  ["monthly", "📈 Monthly"],
+                  ["week", "📆 This week"],
+                  ["goals", "🌟 Goals"],
+                  ["tasks", "📌 Tasks"],
+                  ["steps", "🎯 Study plan"],
+                  ["fyp", "🗺️ 4-Year"],
+                ] as const
+              ).map(([key, label]) => (
+                <button
+                  key={key}
+                  style={{
+                    ...styles.planSectionBtn,
+                    ...(planSection === key ? styles.planSectionBtnActive : {}),
+                  }}
+                  onClick={() => setPlanSection(key)}
+                >
+                  {label}
+                </button>
+              ))}
+            </div>
+
+            {planSection === "overview" && (
+              <>
+                <ProgressCard study={studyLog} />
+                <PlanStrip
+                  plan={plan}
+                  onToggleNext={toggleNextStep}
+                  onOpen={() => setPlanSection("steps")}
+                />
+                <GoalStrip
+                  goals={goals}
+                  onOpen={() => setPlanSection("goals")}
+                />
+                {(() => {
+                  const open = assignments.filter((a) => !a.done);
+                  if (!open.length) return null;
+                  const next = [...open].sort((a, b) =>
+                    (a.due || "9999").localeCompare(b.due || "9999"),
+                  )[0];
+                  return (
+                    <div style={styles.planStrip}>
+                      <div style={styles.planStripHead}>
+                        <span style={styles.planStripLabel}>
+                          📌 Assignments · {open.length} to do
+                        </span>
+                        <button
+                          style={styles.linkBtn}
+                          onClick={() => setPlanSection("tasks")}
+                        >
+                          View
+                        </button>
+                      </div>
+                      <button
+                        style={styles.planStripNext}
+                        onClick={() => setPlanSection("tasks")}
+                      >
+                        <span style={{ flex: 1, textAlign: "left" }}>
+                          <span style={styles.planStripNextLabel}>Next: </span>
+                          {next.title}
+                        </span>
+                        {next.due && (
+                          <span style={styles.goalDue}>
+                            {countdown(next.due)}
+                          </span>
+                        )}
+                      </button>
+                    </div>
+                  );
+                })()}
+                <FourYearStrip
+                  plan={fourYearPlan}
+                  onOpen={() => setPlanSection("fyp")}
+                />
+                <button
+                  style={{ ...styles.goalSuggestBtn, width: "100%" }}
+                  onClick={() => setPlanSection("week")}
+                >
+                  🗓️ Plan my week
+                </button>
+                {plan.length === 0 &&
+                  goals.length === 0 &&
+                  assignments.length === 0 &&
+                  !fourYearPlan && (
+                    <div style={styles.card}>
+                      <p style={{ color: "var(--muted)", margin: "6px 0" }}>
+                        Your plan lives here. Use the tabs above to set a goal,
+                        add assignments, build a study plan, or map your 4-year
+                        path.
+                      </p>
+                    </div>
+                  )}
+              </>
+            )}
+
+            {planSection === "monthly" && (
+              <MonthlyReport
+                study={studyLog}
+                goals={goals}
+                assignments={assignments}
+                mistakes={mistakes}
+                fourYearPlan={fourYearPlan}
+                reports={monthlyReports}
+                busyKey={monthlyReportBusy}
+                onGenerate={generateMonthlyReport}
+              />
+            )}
+
+            {planSection === "week" && (
+              <>
+                <WeeklyLearnedRecap
+                  study={studyLog}
+                  goals={goals}
+                  assignments={assignments}
+                  mistakes={mistakes}
+                  fourYearPlan={fourYearPlan}
+                  reports={weeklyReports}
+                  busyKey={weeklyReportBusy}
+                  onGenerate={generateWeeklyReport}
+                />
+                {shownReminders.length > 0 && (
+                  <div style={styles.card}>
+                    <div style={styles.cardHead}>
+                      <span style={styles.cardClass}>🔔 Reminders</span>
+                      {notifSupported && !remindersOn && (
+                        <button
+                          style={styles.linkBtn}
+                          onClick={enableNotifications}
+                        >
+                          Turn on
+                        </button>
+                      )}
+                    </div>
+                    {shownReminders.map((r) => (
+                      <div key={r.id} style={styles.reminderRow}>
+                        <button
+                          style={styles.reminderCheck}
+                          onClick={() => checkReminder(r)}
+                          aria-label="Mark done"
+                          title="Mark done"
+                        />
+                        <button
+                          style={styles.reminderText}
+                          onClick={() => handleReminder(r)}
+                        >
+                          <span style={{ flexShrink: 0 }}>{r.icon}</span>
+                          <span style={{ flex: 1, textAlign: "left" }}>
+                            {r.text}
+                          </span>
+                          <span style={{ color: "var(--muted)" }}>›</span>
+                        </button>
+                      </div>
+                    ))}
+                  </div>
+                )}
+                <PlanStrip
+                  plan={plan}
+                  onToggleNext={toggleNextStep}
+                  onOpen={() => setTab("chat")}
+                />
+                <div style={styles.card}>
+                  <div style={styles.cardHead}>
+                    <span style={styles.cardClass}>🗓️ This week</span>
+                  </div>
+                  <p
+                    style={{
+                      color: "var(--muted)",
+                      margin: "2px 0 8px",
+                      fontSize: 13,
+                    }}
+                  >
+                    A focus plan from your goals, calendar &amp; assignments.
+                  </p>
+                  <Suggestions
+                    kind="week"
+                    label="🗓️ Plan my week"
+                    resultKey="items"
+                    body={{
+                      career: fourYearPlan?.destination,
+                      goals: goals.length ? goals : undefined,
+                      events: events.length ? events : undefined,
+                      assignments: assignments.length ? assignments : undefined,
+                      profile: profile ?? undefined,
+                    }}
+                    renderItem={(s, i, drop) => (
+                      <div key={i} style={styles.sugItem}>
+                        <div style={{ flex: 1 }}>
+                          <div style={styles.sugText}>
+                            {s.when ? <b>{s.when}: </b> : null}
+                            {s.title}
+                          </div>
+                          {s.why && <div style={styles.sugMeta}>{s.why}</div>}
+                        </div>
+                        <button
+                          style={styles.fypAddPlan}
+                          title="Add to Today's assignments"
+                          onClick={() => {
+                            if (s.title) {
+                              addAssignment({ title: s.title });
+                              drop();
+                            }
+                          }}
+                        >
+                          ＋ To-do
+                        </button>
+                      </div>
+                    )}
+                  />
+                </div>
+              </>
+            )}
+
+            {planSection === "goals" && (
+              <GoalsPanel
+                goals={goals}
+                subjects={subjects}
+                profile={profile}
+                career={fourYearPlan?.destination}
+                events={events}
+                onAdd={addGoal}
+                onStep={stepGoal}
+                onToggle={toggleGoalDone}
+                onRemove={removeGoal}
+                onBreakDown={breakDownGoal}
+                onToggleTask={toggleGoalTask}
+                onSetTaskDue={setGoalTaskDue}
+                onSetTaskDetail={setGoalTaskDetail}
+                onHelpTask={helpWithTask}
+                breakingGoalId={breakingGoalId}
+              />
+            )}
+
+            {planSection === "tasks" && (
+              <>
+                <AssignmentsPanel
+                  assignments={assignments}
+                  subjects={subjects}
+                  events={events}
+                  goals={goals}
+                  profile={profile}
+                  timeMgmt={timeMgmt}
+                  onToggleTimeMgmt={() => setTimeMgmt((v) => !v)}
+                  onSetTime={setAssignmentTime}
+                  onSetConcern={setAssignmentConcern}
+                  onSetSteps={setAssignmentSteps}
+                  onAdd={addAssignment}
+                  onToggle={toggleAssignment}
+                  onRemove={removeAssignment}
+                />
+                <PriorityPlanner
+                  assignments={assignments}
+                  events={events}
+                  profile={profile}
+                  onApply={applyPriorityPlan}
+                  onSetSteps={setAssignmentSteps}
+                />
+                <div style={styles.card}>
+                  <div style={styles.cardHead}>
+                    <span style={styles.cardClass}>📅 Calendar</span>
+                    <button
+                      style={styles.linkBtn}
+                      onClick={() => setTab("calendar")}
+                    >
+                      Open ›
+                    </button>
+                  </div>
+                  <MonthGrid
+                    events={events}
+                    assignments={assignments}
+                    dailyTasks={dailyTasks}
+                    onPickDate={() => setTab("calendar")}
+                  />
+                </div>
+              </>
+            )}
+
+            {planSection === "steps" && (
+              <>
+                {subjects.length > 0 && !showStudySurvey && (
+                  <div style={styles.quickPlanCard}>
+                    <span style={styles.quickPlanLabel}>
+                      ⚡ Instant plan — tap a subject
+                    </span>
+                    <div style={styles.quickPlanChips}>
+                      {subjects.map((s) => {
+                        const building =
+                          generatingStudyPlan && studyPlanSubject === s;
+                        return (
+                          <button
+                            key={s}
+                            style={{
+                              ...styles.quickPlanChip,
+                              ...(building
+                                ? { opacity: 0.6, cursor: "default" }
+                                : {}),
+                              ...(generatingStudyPlan && !building
+                                ? { opacity: 0.4, cursor: "default" }
+                                : {}),
+                            }}
+                            disabled={generatingStudyPlan}
+                            onClick={() => buildPlanForSubject(s)}
+                            title={`Build a study plan for ${s}`}
+                          >
+                            {building ? "Building…" : s}
+                          </button>
+                        );
+                      })}
+                    </div>
+                  </div>
+                )}
+                {showStudySurvey ? (
+                  <StudyPlanSurvey
+                    profile={profile}
+                    generating={generatingStudyPlan}
+                    onBuild={generateStudyPlan}
+                    onCancel={() => setShowStudySurvey(false)}
+                  />
+                ) : plan.length > 0 ? (
+                  <>
+                    <div style={styles.stepsBtnRow}>
+                      <button
+                        style={styles.planRebuildBtn}
+                        disabled={busy}
+                        onClick={buildPlanFromChat}
+                        title="Rebuild the plan from your conversation"
+                      >
+                        ↻ Rebuild from chat
+                      </button>
+                      <button
+                        style={styles.goalSuggestBtn}
+                        onClick={() => setShowStudySurvey(true)}
+                      >
+                        📝 Build with a survey
+                      </button>
+                    </div>
+                    <PlanBoard
+                      plan={plan}
+                      onToggle={togglePlan}
+                      onAdd={addMilestone}
+                      onRemove={removeMilestone}
+                      onEdit={editMilestone}
+                    />
+                  </>
+                ) : (
+                  <div style={styles.card}>
+                    <div style={styles.cardHead}>
+                      <span style={styles.cardClass}>
+                        🎯 Your learning plan
+                      </span>
+                    </div>
+                    <p style={{ color: "var(--muted)", margin: "8px 0 12px" }}>
+                      No plan yet. Answer a few questions and Eliora will build
+                      one, or build it from your conversation.
+                    </p>
+                    <button
+                      style={{ ...styles.studyToolBtn, width: "100%" }}
+                      onClick={() => setShowStudySurvey(true)}
+                    >
+                      📝 Build my plan with a survey
+                    </button>
+                    <button
+                      style={{
+                        ...styles.goalNewBtn,
+                        width: "100%",
+                        marginTop: 8,
+                      }}
+                      disabled={busy}
+                      onClick={buildPlanFromChat}
+                    >
+                      🎯 Build from our chat instead
+                    </button>
+                    <p style={{ color: "var(--muted)", margin: "12px 0 4px" }}>
+                      …or add your own steps:
+                    </p>
+                    <PlanPanel
+                      plan={plan}
+                      onToggle={togglePlan}
+                      onAdd={addMilestone}
+                      onRemove={removeMilestone}
+                      onEdit={editMilestone}
+                    />
+                  </div>
+                )}
+                {showClassSurvey ? (
+                  <ClassSurvey
+                    onCancel={() => setShowClassSurvey(false)}
+                    onSubmit={(d) => {
+                      setShowClassSurvey(false);
+                      addClass(d);
+                    }}
+                  />
+                ) : (
+                  <div style={styles.addClassRow}>
+                    <span style={styles.addClassLabel}>
+                      Need help with another class?
+                    </span>
+                    <button
+                      style={styles.addClassPlus}
+                      disabled={busy}
+                      onClick={() => setShowClassSurvey(true)}
+                      aria-label="Add a class you need help with"
+                      title="Add a class you need help with"
+                    >
+                      +
+                    </button>
+                  </div>
+                )}
+              </>
+            )}
+
+            {planSection === "fyp" && (
+              <FourYearPlanPanel
+                plan={fourYearPlan}
+                profile={profile}
+                generating={generatingFyp}
+                onGenerate={generateFourYearPlan}
+                onSetDestination={setFypDestination}
+                onAddCourse={addFypCourse}
+                onRemoveCourse={removeFypCourse}
+                onToggleCourse={toggleFypCourse}
+                onSetCourse={setFypCourse}
+                onAddMilestone={addFypMilestone}
+                onRemoveMilestone={removeFypMilestone}
+                onToggleMilestone={toggleFypMilestone}
+                onToggleCheckpoint={toggleFypCheckpoint}
+                onAddToPlan={addMilestone}
+                onResources={milestoneResources}
+                onAdvise={() => fourYearPlan && adviseNextSteps(fourYearPlan)}
+                onSetRequirement={setFypRequirement}
+                onAddRequirement={addFypRequirement}
+                onRemoveRequirement={removeFypRequirement}
+                onSetTotalRequired={setFypTotalRequired}
+                onUseDefaultRequirements={useTypicalFypRequirements}
+                onSetGpaGoal={setFypGpaGoal}
+                onSetProjectedGrade={setFypProjectedGrade}
+                onApplyGrades={applyFypGrades}
+                planTitles={new Set(plan.map((m) => m.title))}
+                reflections={reflections}
+                onReflect={reflectOnYear}
+                reflectionSummary={reflectionSummary}
+                onSummarizeReflections={summarizeReflections}
+                summarizingReflections={summarizingReflections}
+                onCreateGoalsFromReflections={goalsFromReflections}
+                creatingReflGoals={creatingReflGoals}
+                onClear={clearFourYearPlan}
+              />
+            )}
+          </div>
+        )}
+
+        {tab === "progress" && (
+          <div style={styles.studyScroll}>
+            <DailyRecap
+              study={studyLog}
+              assignments={assignments}
+              events={events}
+            />
+            <WeeklyRecap
+              study={studyLog}
+              plan={plan}
+              goals={goals}
+              assignments={assignments}
+              fourYearPlan={fourYearPlan}
+            />
+            <ProgressCard study={studyLog} />
+            {(() => {
+              const fyCourses = fourYearPlan
+                ? fourYearPlan.years.flatMap((y) => y.courses)
+                : [];
+              const areas = [
+                {
+                  label: "🎯 Study plan",
+                  done: plan.filter((m) => m.done).length,
+                  total: plan.length,
+                },
+                {
+                  label: "🌟 Goals",
+                  done: goals.filter((g) => g.done).length,
+                  total: goals.length,
+                },
+                {
+                  label: "📌 Assignments",
+                  done: assignments.filter((a) => a.done).length,
+                  total: assignments.length,
+                },
+                {
+                  label: "🗺️ 4-Year courses",
+                  done: fyCourses.filter((c) => c.done).length,
+                  total: fyCourses.length,
+                },
+              ].filter((a) => a.total > 0);
+              const done = areas.reduce((n, a) => n + a.done, 0);
+              const totalItems = areas.reduce((n, a) => n + a.total, 0);
+              const pct = totalItems
+                ? Math.round((done / totalItems) * 100)
+                : 0;
+              return (
+                <div style={styles.card}>
+                  <div style={styles.cardHead}>
+                    <span style={styles.cardClass}>🎯 Plan progress</span>
+                    <span style={styles.subjectsCount}>
+                      {done}/{totalItems} done
+                    </span>
+                  </div>
+                  {totalItems === 0 ? (
+                    <p style={styles.assignEmpty}>
+                      Nothing to track yet — add goals, assignments, or a study
+                      plan and your progress shows up here.
+                    </p>
+                  ) : (
+                    <>
+                      <div style={styles.planProgTrack}>
+                        <div
+                          style={{ ...styles.planProgFill, width: `${pct}%` }}
+                        />
+                      </div>
+                      <div style={styles.planProgMeta}>
+                        {pct}% complete
+                        {pct === 100
+                          ? " — 🎉 all done!"
+                          : ` · ${totalItems - done} to go`}
+                      </div>
+                      <div style={{ marginTop: 14 }}>
+                        {areas.map((a) => {
+                          const p = Math.round((a.done / a.total) * 100);
+                          return (
+                            <div key={a.label} style={styles.areaRow}>
+                              <span style={styles.areaLabel}>{a.label}</span>
+                              <div style={styles.areaTrack}>
+                                <div
+                                  style={{ ...styles.areaFill, width: `${p}%` }}
+                                />
+                              </div>
+                              <span style={styles.areaCount}>
+                                {a.done}/{a.total}
+                              </span>
+                            </div>
+                          );
+                        })}
+                      </div>
+                    </>
+                  )}
+                </div>
+              );
+            })()}
+          </div>
+        )}
+
+        {tab === "school" && (
+          <SchoolConnect
+            profile={profile}
+            onAddAssignment={addAssignment}
+            onAddEvent={addEvent}
+            onAddSubject={addSubject}
+            onShareGrades={(grades) => {
+              setTab("chat");
+              send(
+                "Here are my current grades from my school app:\n" +
+                  grades.map((g) => `- ${g.course}: ${g.grade}`).join("\n") +
+                  "\nKeep these in mind when you help me — start with where I'm " +
+                  "weakest, and celebrate what's going well.",
+                { hidden: true },
+              );
+            }}
+          />
+        )}
+
+        {/* The tutor gets its own tab: a session you sit down to, not a tool you
+          reach for mid-study. The persona picked on Home teaches it. */}
+        {tab === "tutor" && (
+          <div style={styles.tutorScroll}>
+            {/* The way out. With the rail folded away, the session has to say how
+              to leave it — ☰ reopens the menu, this closes the room. */}
+            <div style={styles.fullBleedBar}>
+              {/* Two ways of getting unstuck: ask her, or ask the room. */}
+              <div style={styles.outputRow}>
+                {(
+                  [
+                    ["session", "🧑‍🏫 Tutor session"],
+                    ["doubts", "🙋 Doubts"],
+                  ] as const
+                ).map(([k, label]) => (
+                  <button
+                    key={k}
+                    onClick={() => setTutorView(k)}
+                    style={{
+                      ...styles.outChip,
+                      ...(tutorView === k ? styles.outChipActive : {}),
+                    }}
+                  >
+                    {label}
+                  </button>
+                ))}
+              </div>
+              {tutorView === "session" && (
+                <button
+                  style={styles.fullBleedExit}
+                  onClick={() => setTab("home")}
+                  title="Leave the session"
+                >
+                  ✕ Exit full screen
+                </button>
+              )}
+            </div>
+            {tutorView === "session" ? (
+              <AiTutor
+                profile={profile}
+                tutorId={tutorId}
+                onMissed={addMissed}
+                onMistake={(m) => logMistake({ ...m, source: "quiz" })}
+                onAsk={(msg) => {
+                  setTab("chat");
+                  send(msg);
+                }}
+              />
+            ) : (
+              <DoubtsBoard
+                name={
+                  session?.user?.name?.trim() ||
+                  profile?.name?.trim() ||
+                  session?.user?.email?.split("@")[0] ||
+                  "Guest"
+                }
+              />
+            )}
+          </div>
+        )}
+
+        {tab === "study" && (
+          <div style={styles.studyScroll}>
+            <ProfileCard profile={profile} onEdit={() => setEditing(true)} />
+            <SubjectsPanel
+              subjects={subjects}
+              onAdd={addSubject}
+              onRemove={removeSubject}
+            />
+
+            <div style={styles.planSectionNav}>
+              {(
+                [
+                  ["practice", "📝 Practice & feedback"],
+                  ["plans", "🗂️ Plans & materials"],
+                  ["tools", "🛠️ Study tools & notes"],
+                  ["community", "💬 Community"],
+                ] as const
+              ).map(([key, label]) => (
+                <button
+                  key={key}
+                  style={{
+                    ...styles.planSectionBtn,
+                    ...(studySection === key ? styles.planSectionBtnActive : {}),
+                  }}
+                  onClick={() => setStudySection(key)}
+                >
+                  {label}
+                </button>
+              ))}
+            </div>
+
+            {studySection === "practice" && (
+              <>
+            <HelpDesk
+              subjects={subjects}
+              profile={profile}
+              onMissed={addMissed}
+              onMistake={(m) => logMistake({ ...m, source: "quiz" })}
+              onAsk={(msg) => {
+                setTab("chat");
+                send(msg);
+              }}
+            />
+            <PracticeQuiz
+              profile={profile}
+              subjects={subjects}
+              missed={missed}
+              onMissed={addMissed}
+              onMistake={(m) => logMistake({ ...m, source: "quiz" })}
+              onStudyGuide={studyGuideFromQuiz}
+            />
+            <StudyMethods
+              subjects={subjects}
+              profile={profile}
+              onAsk={(msg) => {
+                setTab("chat");
+                send(msg);
+              }}
+            />
+            <DraftReviewer
+              subjects={subjects}
+              profile={profile}
+              onAsk={(msg) => {
+                setTab("chat");
+                send(msg);
+              }}
+            />
+            <RubricGrader
+              subjects={subjects}
+              profile={profile}
+              onAsk={(msg) => {
+                setTab("chat");
+                send(msg);
+              }}
+            />
+            <AssignmentFeedback
+              subjects={subjects}
+              profile={profile}
+              initialPrompt={feedbackSeed}
+              onTrack={(m) => logMistake({ ...m, source: "feedback" })}
+            />
+            <ProjectGrader profile={profile} />
+            <PresentationPractice />
+              </>
+            )}
+
+            {studySection === "plans" && (
+              <>
+            <LessonPlanCard
+              session={firstSession}
+              subjects={subjects}
+              profile={profile}
+              onAdopt={(steps) => setPlan((prev) => appendPlan(prev, steps))}
+              onAsk={(msg) => {
+                setTab("chat");
+                send(msg);
+              }}
+            />
+            <CourseStudio
+              materials={materials}
+              profile={profile}
+              ns={ns}
+              busyName={materialBusy}
+              error={materialError}
+              onAddMaterial={addMaterial}
+              onMissed={addMissed}
+            />
+            <LessonStudio profile={profile} onMissed={addMissed} />
+            <PriorityPlanner
+              assignments={assignments}
+              events={events}
+              profile={profile}
+              onApply={applyPriorityPlan}
+              onSetSteps={setAssignmentSteps}
+            />
+              </>
+            )}
+
+            {studySection === "tools" && (
+              <>
+            <div style={styles.card}>
+              <div style={styles.cardHead}>
+                <span style={styles.cardClass}>🛠️ Study tools</span>
+              </div>
+              <div style={styles.studyToolsGrid}>
+                {(
+                  [
+                    // No "Flashcards" shortcut here — the real deck builder is
+                    // its own card further down this tab.
+                    ["📝 Quiz me", "Quiz me on what I'm learning."],
+                    [
+                      "📚 Study guide",
+                      "Make me a study guide for what I should review.",
+                    ],
+                    [
+                      "🎬 Study videos",
+                      "Recommend me a few study videos for my class.",
+                    ],
+                    [
+                      "📱 Short-form recs",
+                      "Recommend TikTok, YouTube Shorts, and Instagram accounts or searches for what I'm studying.",
+                    ],
+                    [
+                      "💡 Suggestions",
+                      "Give me a couple of study suggestions.",
+                    ],
+                  ] as const
+                ).map(([label, msg]) => (
+                  <button
+                    key={label}
+                    style={styles.studyToolBtn}
+                    disabled={busy}
+                    onClick={() => {
+                      setTab("chat");
+                      send(msg);
+                    }}
+                  >
+                    {label}
+                  </button>
+                ))}
+              </div>
+              <div style={{ marginTop: 12 }}>
+                <Suggestions
+                  kind="tools"
+                  label="💡 Suggest study tools to make"
+                  body={{
+                    career: fourYearPlan?.destination,
+                    profile: profile ?? undefined,
+                    events: events.length ? events : undefined,
+                    missed: missed.length ? missed : undefined,
+                    mistakes: mistakes.length ? mistakes : undefined,
+                  }}
+                  renderItem={(s, i, drop) => (
+                    <div key={i} style={styles.sugItem}>
+                      <div style={{ flex: 1 }}>
+                        <div style={styles.sugText}>
+                          {s.type === "quiz" ? "📝 Quiz" : "🃏 Flashcards"}:{" "}
+                          {s.topic}
+                        </div>
+                        {s.why && <div style={styles.sugMeta}>{s.why}</div>}
+                      </div>
+                      <button
+                        style={styles.fypAddPlan}
+                        disabled={busy}
+                        onClick={() => {
+                          // Flashcards have a real builder now — seed it
+                          // instead of asking chat for a wall of text.
+                          if (s.type === "quiz") {
+                            setTab("chat");
+                            send(`Make me a quiz on ${s.topic}.`);
+                          } else {
+                            setFlashSeed(s.topic);
+                          }
+                          drop();
+                        }}
+                      >
+                        Make it
+                      </button>
+                    </div>
+                  )}
+                />
+              </div>
+            </div>
+            <FlashcardsStudio
+              profile={profile}
+              subjects={subjects}
+              missed={missed}
+              ns={ns}
+              seed={flashSeed}
+              onSeedUsed={() => setFlashSeed(undefined)}
+              onMissed={addMissed}
+            />
+            <SmartNotes profile={profile} />
             <NotesWorkspace ns={ns} />
-          ) : (
             <Summarizer
               profile={profile}
               onAddToChat={(msg) => {
@@ -26975,1248 +31109,465 @@ function ElioraApp() {
               }}
               onStudyGuide={studyGuideFromQuiz}
             />
-          )}
-        </div>
-      )}
-
-      {tab === "practice" && (
-        <PracticeQuiz
-          profile={profile}
-          subjects={subjects}
-          missed={missed}
-          onMissed={addMissed}
-          onMistake={(m) => logMistake({ ...m, source: "quiz" })}
-          onStudyGuide={studyGuideFromQuiz}
-        />
-      )}
-
-
-      {tab === "calendar" && (
-        <div style={styles.studyScroll}>
-          {/* Sub-tabs: the dates themselves, and the week that repeats behind
-              them. Blocks drawn in "My week" show up on every matching day. */}
-          <div style={{ ...styles.outputRow, marginBottom: 12 }}>
-            {(
-              [
-                ["dates", "📅 Dates & today"],
-                ["week", "🗓️ My week"],
-              ] as const
-            ).map(([k, label]) => (
-              <button
-                key={k}
-                onClick={() => setCalendarView(k)}
-                style={{
-                  ...styles.outChip,
-                  ...(calendarView === k ? styles.outChipActive : {}),
-                }}
-              >
-                {label}
-              </button>
-            ))}
-          </div>
-          {calendarView === "week" && (
-            <ScheduleStudio
-              profile={profile}
-              schedule={weekSchedule}
-              onSchedule={setWeekSchedule}
-            />
-          )}
-          {/* Hidden rather than unmounted: a study timer may be running in
-              today's grid, and switching views shouldn't end someone's session. */}
-          <div
-            style={calendarView === "dates" ? undefined : { display: "none" }}
-          >
-            <ScheduleGrid
-              schedule={schedule}
-              onSet={setScheduleBlock}
-              onClear={clearSchedule}
-              homeHour={homeHour}
-              onSetHomeHour={setHomeHour}
-              onGenerate={() => generateStudySchedule()}
-              onSetupReady={handleScheduleSetup}
-              profile={profile}
-              generating={generatingSchedule}
-              onStudyMinutes={logStudyMinutes}
-              remindOn={remindOn}
-              onSetRemindOn={setRemindOn}
-              timerRequest={timerRequest}
-              onTimerRequestConsumed={() => setTimerRequest(null)}
-            />
-            <CalendarPanel
-              events={events}
-              assignments={assignments}
-              dailyTasks={dailyTasks}
-              goals={goals}
-              week={weekSchedule}
-              profile={profile}
-              career={fourYearPlan?.destination}
-              onAdd={addEvent}
-              onRemove={removeEvent}
-              onBreakDown={breakDownEvent}
-              onToggleTask={toggleEventTask}
-              onOpenGoals={() => {
-                setPlanSection("goals");
-                setTab("plan");
-              }}
-              breakingEventId={breakingEventId}
-            />
-          </div>
-        </div>
-      )}
-
-      {tab === "plan" && (
-        <div style={styles.studyScroll}>
-          <div style={styles.planSectionNav}>
-            {(
-              [
-                ["overview", "📋 Overview"],
-                ["monthly", "📈 Monthly"],
-                ["week", "📆 This week"],
-                ["goals", "🌟 Goals"],
-                ["tasks", "📌 Tasks"],
-                ["steps", "🎯 Study plan"],
-                ["fyp", "🗺️ 4-Year"],
-              ] as const
-            ).map(([key, label]) => (
-              <button
-                key={key}
-                style={{
-                  ...styles.planSectionBtn,
-                  ...(planSection === key ? styles.planSectionBtnActive : {}),
-                }}
-                onClick={() => setPlanSection(key)}
-              >
-                {label}
-              </button>
-            ))}
-          </div>
-
-          {planSection === "overview" && (
-            <>
-              <ProgressCard log={progress} study={studyLog} goals={goals} />
-              <PlanStrip
-                plan={plan}
-                onToggleNext={toggleNextStep}
-                onOpen={() => setPlanSection("steps")}
-              />
-              <GoalStrip goals={goals} onOpen={() => setPlanSection("goals")} />
-              {(() => {
-                const open = assignments.filter((a) => !a.done);
-                if (!open.length) return null;
-                const next = [...open].sort((a, b) =>
-                  (a.due || "9999").localeCompare(b.due || "9999"),
-                )[0];
-                return (
-                  <div style={styles.planStrip}>
-                    <div style={styles.planStripHead}>
-                      <span style={styles.planStripLabel}>
-                        📌 Assignments · {open.length} to do
-                      </span>
-                      <button
-                        style={styles.linkBtn}
-                        onClick={() => setPlanSection("tasks")}
-                      >
-                        View
-                      </button>
-                    </div>
-                    <button
-                      style={styles.planStripNext}
-                      onClick={() => setPlanSection("tasks")}
-                    >
-                      <span style={{ flex: 1, textAlign: "left" }}>
-                        <span style={styles.planStripNextLabel}>Next: </span>
-                        {next.title}
-                      </span>
-                      {next.due && (
-                        <span style={styles.goalDue}>{countdown(next.due)}</span>
-                      )}
-                    </button>
-                  </div>
-                );
-              })()}
-              <FourYearStrip
-                plan={fourYearPlan}
-                onOpen={() => setPlanSection("fyp")}
-              />
-              <button
-                style={{ ...styles.goalSuggestBtn, width: "100%" }}
-                onClick={() => setPlanSection("week")}
-              >
-                🗓️ Plan my week
-              </button>
-              {plan.length === 0 &&
-                goals.length === 0 &&
-                assignments.length === 0 &&
-                !fourYearPlan && (
-                  <div style={styles.card}>
-                    <p style={{ color: "var(--muted)", margin: "6px 0" }}>
-                      Your plan lives here. Use the tabs above to set a goal, add
-                      assignments, build a study plan, or map your 4-year path.
-                    </p>
-                  </div>
-                )}
-            </>
-          )}
-
-          {planSection === "monthly" && (
-            <MonthlyReport
-              log={progress}
-              study={studyLog}
-              goals={goals}
-              assignments={assignments}
-              mistakes={mistakes}
-              fourYearPlan={fourYearPlan}
-              reports={monthlyReports}
-              busyKey={monthlyReportBusy}
-              onGenerate={generateMonthlyReport}
-            />
-          )}
-
-          {planSection === "week" && (
-            <>
-              <WeeklyLearnedRecap
-                log={progress}
-                study={studyLog}
-                goals={goals}
-                assignments={assignments}
-                mistakes={mistakes}
-                fourYearPlan={fourYearPlan}
-                reports={weeklyReports}
-                busyKey={weeklyReportBusy}
-                onGenerate={generateWeeklyReport}
-              />
-              {shownReminders.length > 0 && (
-                <div style={styles.card}>
-                  <div style={styles.cardHead}>
-                    <span style={styles.cardClass}>🔔 Reminders</span>
-                    {notifSupported && !remindersOn && (
-                      <button style={styles.linkBtn} onClick={enableNotifications}>
-                        Turn on
-                      </button>
-                    )}
-                  </div>
-                  {shownReminders.map((r) => (
-                    <div key={r.id} style={styles.reminderRow}>
-                      <button
-                        style={styles.reminderCheck}
-                        onClick={() => checkReminder(r)}
-                        aria-label="Mark done"
-                        title="Mark done"
-                      />
-                      <button
-                        style={styles.reminderText}
-                        onClick={() => handleReminder(r)}
-                      >
-                        <span style={{ flexShrink: 0 }}>{r.icon}</span>
-                        <span style={{ flex: 1, textAlign: "left" }}>
-                          {r.text}
-                        </span>
-                        <span style={{ color: "var(--muted)" }}>›</span>
-                      </button>
-                    </div>
-                  ))}
-                </div>
-              )}
-              <PlanStrip
-                plan={plan}
-                onToggleNext={toggleNextStep}
-                onOpen={() => setTab("chat")}
-              />
-              <div style={styles.card}>
-                <div style={styles.cardHead}>
-                  <span style={styles.cardClass}>🗓️ This week</span>
-                </div>
-                <p
-                  style={{
-                    color: "var(--muted)",
-                    margin: "2px 0 8px",
-                    fontSize: 13,
-                  }}
-                >
-                  A focus plan from your goals, calendar &amp; assignments.
-                </p>
-                <Suggestions
-                  kind="week"
-                  label="🗓️ Plan my week"
-                  resultKey="items"
-                  body={{
-                    career: fourYearPlan?.destination,
-                    goals: goals.length ? goals : undefined,
-                    events: events.length ? events : undefined,
-                    assignments: assignments.length ? assignments : undefined,
-                    profile: profile ?? undefined,
-                  }}
-                  renderItem={(s, i, drop) => (
-                    <div key={i} style={styles.sugItem}>
-                      <div style={{ flex: 1 }}>
-                        <div style={styles.sugText}>
-                          {s.when ? <b>{s.when}: </b> : null}
-                          {s.title}
-                        </div>
-                        {s.why && <div style={styles.sugMeta}>{s.why}</div>}
-                      </div>
-                      <button
-                        style={styles.fypAddPlan}
-                        title="Add to Today's assignments"
-                        onClick={() => {
-                          if (s.title) {
-                            addAssignment({ title: s.title });
-                            drop();
-                          }
-                        }}
-                      >
-                        ＋ To-do
-                      </button>
-                    </div>
-                  )}
-                />
-              </div>
-            </>
-          )}
-
-          {planSection === "goals" && (
-            <GoalsPanel
-              goals={goals}
-              subjects={subjects}
-              profile={profile}
-              career={fourYearPlan?.destination}
-              events={events}
-              onAdd={addGoal}
-              onStep={stepGoal}
-              onToggle={toggleGoalDone}
-              onRemove={removeGoal}
-              onBreakDown={breakDownGoal}
-              onToggleTask={toggleGoalTask}
-              onHelpTask={helpWithTask}
-              breakingGoalId={breakingGoalId}
-              rewards={customRewards}
-              onLinkReward={linkGoalReward}
-            />
-          )}
-
-          {planSection === "tasks" && (
-            <>
-              <AssignmentsPanel
-                assignments={assignments}
-                subjects={subjects}
-                events={events}
-                goals={goals}
-                profile={profile}
-                timeMgmt={timeMgmt}
-                onToggleTimeMgmt={() => setTimeMgmt((v) => !v)}
-                onSetTime={setAssignmentTime}
-                onSetConcern={setAssignmentConcern}
-                onAdd={addAssignment}
-                onToggle={toggleAssignment}
-                onRemove={removeAssignment}
-              />
-              <PriorityPlanner
-                assignments={assignments}
-                events={events}
-                profile={profile}
-                onApply={applyPriorityPlan}
-              />
-              <div style={styles.card}>
-                <div style={styles.cardHead}>
-                  <span style={styles.cardClass}>📅 Calendar</span>
-                  <button
-                    style={styles.linkBtn}
-                    onClick={() => setTab("calendar")}
-                  >
-                    Open ›
-                  </button>
-                </div>
-                <MonthGrid
-                  events={events}
-                  assignments={assignments}
-                  dailyTasks={dailyTasks}
-                  onPickDate={() => setTab("calendar")}
-                />
-              </div>
-            </>
-          )}
-
-          {planSection === "steps" && (
-            <>
-              {subjects.length > 0 && !showStudySurvey && (
-                <div style={styles.quickPlanCard}>
-                  <span style={styles.quickPlanLabel}>
-                    ⚡ Instant plan — tap a subject
-                  </span>
-                  <div style={styles.quickPlanChips}>
-                    {subjects.map((s) => {
-                      const building =
-                        generatingStudyPlan && studyPlanSubject === s;
-                      return (
-                        <button
-                          key={s}
-                          style={{
-                            ...styles.quickPlanChip,
-                            ...(building
-                              ? { opacity: 0.6, cursor: "default" }
-                              : {}),
-                            ...(generatingStudyPlan && !building
-                              ? { opacity: 0.4, cursor: "default" }
-                              : {}),
-                          }}
-                          disabled={generatingStudyPlan}
-                          onClick={() => buildPlanForSubject(s)}
-                          title={`Build a study plan for ${s}`}
-                        >
-                          {building ? "Building…" : s}
-                        </button>
-                      );
-                    })}
-                  </div>
-                </div>
-              )}
-              {showStudySurvey ? (
-                <StudyPlanSurvey
-                  profile={profile}
-                  generating={generatingStudyPlan}
-                  onBuild={generateStudyPlan}
-                  onCancel={() => setShowStudySurvey(false)}
-                />
-              ) : plan.length > 0 ? (
-                <>
-                  <div style={styles.stepsBtnRow}>
-                    <button
-                      style={styles.planRebuildBtn}
-                      disabled={busy}
-                      onClick={buildPlanFromChat}
-                      title="Rebuild the plan from your conversation"
-                    >
-                      ↻ Rebuild from chat
-                    </button>
-                    <button
-                      style={styles.goalSuggestBtn}
-                      onClick={() => setShowStudySurvey(true)}
-                    >
-                      📝 Build with a survey
-                    </button>
-                  </div>
-                  <PlanBoard
-                    plan={plan}
-                    onToggle={togglePlan}
-                    onAdd={addMilestone}
-                    onRemove={removeMilestone}
-                    onEdit={editMilestone}
-                  />
-                </>
-              ) : (
-                <div style={styles.card}>
-                  <div style={styles.cardHead}>
-                    <span style={styles.cardClass}>🎯 Your learning plan</span>
-                  </div>
-                  <p style={{ color: "var(--muted)", margin: "8px 0 12px" }}>
-                    No plan yet. Answer a few questions and Eliora will build one,
-                    or build it from your conversation.
-                  </p>
-                  <button
-                    style={{ ...styles.studyToolBtn, width: "100%" }}
-                    onClick={() => setShowStudySurvey(true)}
-                  >
-                    📝 Build my plan with a survey
-                  </button>
-                  <button
-                    style={{
-                      ...styles.goalNewBtn,
-                      width: "100%",
-                      marginTop: 8,
-                    }}
-                    disabled={busy}
-                    onClick={buildPlanFromChat}
-                  >
-                    🎯 Build from our chat instead
-                  </button>
-                  <p style={{ color: "var(--muted)", margin: "12px 0 4px" }}>
-                    …or add your own steps:
-                  </p>
-                  <PlanPanel
-                    plan={plan}
-                    onToggle={togglePlan}
-                    onAdd={addMilestone}
-                    onRemove={removeMilestone}
-                    onEdit={editMilestone}
-                  />
-                </div>
-              )}
-              {showClassSurvey ? (
-                <ClassSurvey
-                  onCancel={() => setShowClassSurvey(false)}
-                  onSubmit={(d) => {
-                    setShowClassSurvey(false);
-                    addClass(d);
-                  }}
-                />
-              ) : (
-                <div style={styles.addClassRow}>
-                  <span style={styles.addClassLabel}>
-                    Need help with another class?
-                  </span>
-                  <button
-                    style={styles.addClassPlus}
-                    disabled={busy}
-                    onClick={() => setShowClassSurvey(true)}
-                    aria-label="Add a class you need help with"
-                    title="Add a class you need help with"
-                  >
-                    +
-                  </button>
-                </div>
-              )}
-            </>
-          )}
-
-          {planSection === "fyp" && (
-            <FourYearPlanPanel
-              plan={fourYearPlan}
-              profile={profile}
-              generating={generatingFyp}
-              onGenerate={generateFourYearPlan}
-              onSetDestination={setFypDestination}
-              onAddCourse={addFypCourse}
-              onRemoveCourse={removeFypCourse}
-              onToggleCourse={toggleFypCourse}
-              onSetCourse={setFypCourse}
-              onAddMilestone={addFypMilestone}
-              onRemoveMilestone={removeFypMilestone}
-              onToggleMilestone={toggleFypMilestone}
-              onToggleCheckpoint={toggleFypCheckpoint}
-              onAddToPlan={addMilestone}
-              onResources={milestoneResources}
-              onAdvise={() => fourYearPlan && adviseNextSteps(fourYearPlan)}
-              onSetRequirement={setFypRequirement}
-              onAddRequirement={addFypRequirement}
-              onRemoveRequirement={removeFypRequirement}
-              onSetTotalRequired={setFypTotalRequired}
-              onUseDefaultRequirements={useTypicalFypRequirements}
-              onSetGpaGoal={setFypGpaGoal}
-              onSetProjectedGrade={setFypProjectedGrade}
-              onApplyGrades={applyFypGrades}
-              planTitles={new Set(plan.map((m) => m.title))}
-              reflections={reflections}
-              onReflect={reflectOnYear}
-              reflectionSummary={reflectionSummary}
-              onSummarizeReflections={summarizeReflections}
-              summarizingReflections={summarizingReflections}
-              onCreateGoalsFromReflections={goalsFromReflections}
-              creatingReflGoals={creatingReflGoals}
-              onClear={clearFourYearPlan}
-            />
-          )}
-        </div>
-      )}
-
-      {tab === "progress" && (
-        <div style={styles.studyScroll}>
-          <DailyRecap log={progress} assignments={assignments} events={events} />
-          <WeeklyRecap
-            log={progress}
-            plan={plan}
-            goals={goals}
-            assignments={assignments}
-            fourYearPlan={fourYearPlan}
-          />
-          <ProgressCard log={progress} study={studyLog} goals={goals} />
-          {(() => {
-            const fyCourses = fourYearPlan
-              ? fourYearPlan.years.flatMap((y) => y.courses)
-              : [];
-            const areas = [
-              {
-                label: "🎯 Study plan",
-                done: plan.filter((m) => m.done).length,
-                total: plan.length,
-              },
-              {
-                label: "🌟 Goals",
-                done: goals.filter((g) => g.done).length,
-                total: goals.length,
-              },
-              {
-                label: "📌 Assignments",
-                done: assignments.filter((a) => a.done).length,
-                total: assignments.length,
-              },
-              {
-                label: "🗺️ 4-Year courses",
-                done: fyCourses.filter((c) => c.done).length,
-                total: fyCourses.length,
-              },
-            ].filter((a) => a.total > 0);
-            const done = areas.reduce((n, a) => n + a.done, 0);
-            const totalItems = areas.reduce((n, a) => n + a.total, 0);
-            const pct = totalItems ? Math.round((done / totalItems) * 100) : 0;
-            return (
-              <div style={styles.card}>
-                <div style={styles.cardHead}>
-                  <span style={styles.cardClass}>🎯 Plan progress</span>
-                  <span style={styles.subjectsCount}>
-                    {done}/{totalItems} done
-                  </span>
-                </div>
-                {totalItems === 0 ? (
-                  <p style={styles.assignEmpty}>
-                    Nothing to track yet — add goals, assignments, or a study
-                    plan and your progress shows up here.
-                  </p>
-                ) : (
-                  <>
-                    <div style={styles.planProgTrack}>
-                      <div
-                        style={{ ...styles.planProgFill, width: `${pct}%` }}
-                      />
-                    </div>
-                    <div style={styles.planProgMeta}>
-                      {pct}% complete
-                      {pct === 100
-                        ? " — 🎉 all done!"
-                        : ` · ${totalItems - done} to go`}
-                    </div>
-                    <div style={{ marginTop: 14 }}>
-                      {areas.map((a) => {
-                        const p = Math.round((a.done / a.total) * 100);
-                        return (
-                          <div key={a.label} style={styles.areaRow}>
-                            <span style={styles.areaLabel}>{a.label}</span>
-                            <div style={styles.areaTrack}>
-                              <div
-                                style={{ ...styles.areaFill, width: `${p}%` }}
-                              />
-                            </div>
-                            <span style={styles.areaCount}>
-                              {a.done}/{a.total}
-                            </span>
-                          </div>
-                        );
-                      })}
-                    </div>
-                  </>
-                )}
-              </div>
-            );
-          })()}
-        </div>
-      )}
-
-      {tab === "school" && (
-        <SchoolConnect
-          profile={profile}
-          onAddAssignment={addAssignment}
-          onAddEvent={addEvent}
-          onAddSubject={addSubject}
-          onShareGrades={(grades) => {
-            setTab("chat");
-            send(
-              "Here are my current grades from my school app:\n" +
-                grades.map((g) => `- ${g.course}: ${g.grade}`).join("\n") +
-                "\nKeep these in mind when you help me — start with where I'm " +
-                "weakest, and celebrate what's going well.",
-              { hidden: true },
-            );
-          }}
-        />
-      )}
-
-      {/* The tutor gets its own tab: a session you sit down to, not a tool you
-          reach for mid-study. The persona picked on Home teaches it. */}
-      {tab === "tutor" && (
-        <div style={styles.tutorScroll}>
-          {/* The way out. With the rail folded away, the session has to say how
-              to leave it — ☰ reopens the menu, this closes the room. */}
-          <div style={styles.fullBleedBar}>
-            {/* Two ways of getting unstuck: ask her, or ask the room. */}
-            <div style={styles.outputRow}>
-              {(
-                [
-                  ["session", "🧑‍🏫 Tutor session"],
-                  ["doubts", "🙋 Doubts"],
-                ] as const
-              ).map(([k, label]) => (
-                <button
-                  key={k}
-                  onClick={() => setTutorView(k)}
-                  style={{
-                    ...styles.outChip,
-                    ...(tutorView === k ? styles.outChipActive : {}),
-                  }}
-                >
-                  {label}
-                </button>
-              ))}
-            </div>
-            {tutorView === "session" && (
-              <button
-                style={styles.fullBleedExit}
-                onClick={() => setTab("home")}
-                title="Leave the session"
-              >
-                ✕ Exit full screen
-              </button>
+              </>
             )}
-          </div>
-          {tutorView === "session" ? (
-            <AiTutor
-              profile={profile}
-              tutorId={tutorId}
-              onMissed={addMissed}
-              onMistake={(m) => logMistake({ ...m, source: "quiz" })}
-              onAsk={(msg) => {
-                setTab("chat");
-                send(msg);
-              }}
-            />
-          ) : (
-            <DoubtsBoard
-              name={
-                session?.user?.name?.trim() ||
-                profile?.name?.trim() ||
-                session?.user?.email?.split("@")[0] ||
-                "Guest"
-              }
-            />
-          )}
-        </div>
-      )}
 
-      {tab === "study" && (
-        <div style={styles.studyScroll}>
-          <ProfileCard profile={profile} onEdit={() => setEditing(true)} />
-          <HelpDesk
-            subjects={subjects}
-            profile={profile}
-            onMissed={addMissed}
-            onMistake={(m) => logMistake({ ...m, source: "quiz" })}
-            onAsk={(msg) => {
-              setTab("chat");
-              send(msg);
-            }}
-          />
-          <DraftReviewer
-            subjects={subjects}
-            profile={profile}
-            onAsk={(msg) => {
-              setTab("chat");
-              send(msg);
-            }}
-          />
-          <LessonPlanCard
-            session={firstSession}
-            subjects={subjects}
-            profile={profile}
-            onAdopt={(steps) => setPlan((prev) => appendPlan(prev, steps))}
-            onAsk={(msg) => {
-              setTab("chat");
-              send(msg);
-            }}
-          />
-          <SubjectsPanel
-            subjects={subjects}
-            onAdd={addSubject}
-            onRemove={removeSubject}
-          />
-          <div style={styles.card}>
-            <div style={styles.cardHead}>
-              <span style={styles.cardClass}>🛠️ Study tools</span>
-            </div>
-            <div style={styles.studyToolsGrid}>
-              {(
-                [
-                  ["🃏 Flashcards", "Make me flashcards to study."],
-                  ["📝 Quiz me", "Quiz me on what I'm learning."],
-                  ["📚 Study guide", "Make me a study guide for what I should review."],
-                  ["🎬 Study videos", "Recommend me a few study videos for my class."],
-                  ["📱 Short-form recs", "Recommend TikTok, YouTube Shorts, and Instagram accounts or searches for what I'm studying."],
-                  ["💡 Suggestions", "Give me a couple of study suggestions."],
-                ] as const
-              ).map(([label, msg]) => (
-                <button
-                  key={label}
-                  style={styles.studyToolBtn}
-                  disabled={busy}
-                  onClick={() => {
-                    setTab("chat");
-                    send(msg);
-                  }}
-                >
-                  {label}
-                </button>
-              ))}
-            </div>
-            <div style={{ marginTop: 12 }}>
-              <Suggestions
-                kind="tools"
-                label="💡 Suggest study tools to make"
-                body={{
-                  career: fourYearPlan?.destination,
-                  profile: profile ?? undefined,
-                  events: events.length ? events : undefined,
-                  missed: missed.length ? missed : undefined,
-                  mistakes: mistakes.length ? mistakes : undefined,
-                }}
-                renderItem={(s, i, drop) => (
-                  <div key={i} style={styles.sugItem}>
-                    <div style={{ flex: 1 }}>
-                      <div style={styles.sugText}>
-                        {s.type === "quiz" ? "📝 Quiz" : "🃏 Flashcards"}:{" "}
-                        {s.topic}
-                      </div>
-                      {s.why && <div style={styles.sugMeta}>{s.why}</div>}
-                    </div>
-                    <button
-                      style={styles.fypAddPlan}
-                      disabled={busy}
-                      onClick={() => {
-                        setTab("chat");
-                        send(
-                          s.type === "quiz"
-                            ? `Make me a quiz on ${s.topic}.`
-                            : `Make me flashcards on ${s.topic}.`,
-                        );
-                        drop();
-                      }}
-                    >
-                      Make it
-                    </button>
-                  </div>
-                )}
-              />
-            </div>
-          </div>
-          <CourseStudio
-            materials={materials}
-            profile={profile}
-            ns={ns}
-            busyName={materialBusy}
-            error={materialError}
-            onAddMaterial={addMaterial}
-            onMissed={addMissed}
-          />
-          <LessonStudio profile={profile} onMissed={addMissed} />
-          <SmartNotes profile={profile} />
-          <PresentationPractice />
-          <ProjectGrader profile={profile} />
-          <AssignmentFeedback
-            subjects={subjects}
-            profile={profile}
-            initialPrompt={feedbackSeed}
-            onTrack={(m) => logMistake({ ...m, source: "feedback" })}
-          />
-        </div>
-      )}
-
-      {tab === "folder" && (
-        <SharedFolder
-          name={
-            session?.user?.name?.trim() ||
-            profile?.name?.trim() ||
-            session?.user?.email?.split("@")[0] ||
-            "Guest"
-          }
-        />
-      )}
-
-      {tab === "chat" && (
-        <>
-      <PlanStrip
-        plan={plan}
-        onToggleNext={toggleNextStep}
-        onOpen={() => setTab("study")}
-      />
-      <div ref={scrollRef} style={styles.scroll}>
-        {messages.map((m, i) => (
-          <div
-            key={i}
-            className="fade-in"
-            style={{
-              ...styles.row,
-              flexDirection: "column",
-              alignItems: m.role === "user" ? "flex-end" : "flex-start",
-            }}
-          >
-            {/* Above the bubble on purpose: the diagram tool call resolves
-                before the explanation streams, so the picture is already up
-                while Eliora is still talking her way through it. */}
-            {m.visual && (
-              <div style={styles.chatDiagram} className="fade-in">
-                <LessonDiagram visual={m.visual} />
-              </div>
-            )}
-            <div
-              className="eliora-bubble"
-              style={{
-                ...styles.bubble,
-                // Eliora speaks on a clean card; the learner's own words get
-                // the solid brand fill. Tinting both left them muddled against
-                // the paper background.
-                background:
-                  m.role === "user" ? "var(--user-bubble)" : "var(--surface)",
-                color:
-                  m.role === "user" ? "var(--user-text)" : "var(--assistant-text)",
-                ...(m.role === "user"
-                  ? { borderTopRightRadius: 6 }
-                  : {
-                      borderTopLeftRadius: 6,
-                      border: "1px solid var(--border)",
-                    }),
-              }}
-            >
-              {m.content
-                ? renderContent(
-                    m.content,
-                    m.role === "user" ? "#dff0e6" : "var(--accent)",
-                  )
-                : busy && !(i === messages.length - 1 && chatStatus)
-                  ? "…"
-                  : ""}
-              {m.attachments && m.attachments.length > 0 && (
-                <div
-                  style={{
-                    ...styles.attachStrip,
-                    marginTop: m.content ? 8 : 0,
-                    marginBottom: 0,
-                  }}
-                >
-                  {m.attachments.map((a, ai) => (
-                    <div key={ai} style={styles.msgAttach} title={a.name}>
-                      {a.dataUrl ? (
-                        // eslint-disable-next-line @next/next/no-img-element
-                        <img src={a.dataUrl} alt={a.name} style={styles.msgAttachImg} />
-                      ) : (
-                        <span style={styles.msgAttachFile}>
-                          {a.kind === "video" ? "🎬" : a.kind === "image" ? "🖼️" : "📄"}{" "}
-                          {a.name}
-                        </span>
-                      )}
-                      {a.kind === "video" && a.dataUrl && (
-                        <span style={styles.msgAttachPlay} aria-hidden>
-                          ▶
-                        </span>
-                      )}
-                    </div>
-                  ))}
-                </div>
-              )}
-              {/* Live status while tools run — shown even under partial text,
-                  since the model often writes a preamble before its tools. */}
-              {busy && i === messages.length - 1 && chatStatus && (
-                <div
-                  style={{
-                    fontStyle: "italic",
-                    opacity: 0.75,
-                    marginTop: m.content ? 6 : 0,
-                  }}
-                >
-                  {chatStatus}
-                </div>
-              )}
-            </div>
-            {m.role === "assistant" && m.content && (
-              <div style={styles.msgActions}>
-                {a11y.readAloud && (
-                  <SpeakButton text={m.content} voice={tutorVoice} />
-                )}
-                {looksPrintable(m.content) &&
-                  !(busy && i === messages.length - 1) && (
-                    <button
-                      style={styles.speakBtn}
-                      onClick={() =>
-                        printAsPdf(
-                          chatDocTitle(
-                            m.content,
-                            messages
-                              .slice(0, i)
-                              .reverse()
-                              .find((p) => p.role === "user")?.content,
-                          ),
-                          m.content,
-                        )
-                      }
-                    >
-                      📄 Save as PDF
-                    </button>
-                  )}
-              </div>
-            )}
-            {m.videos && m.videos.length > 0 && <VideoCards videos={m.videos} />}
-            {m.socials && m.socials.length > 0 && (
-              <SocialCards socials={m.socials} />
-            )}
-            {m.examples && m.examples.length > 0 && (
-              <ExampleCards examples={m.examples} />
-            )}
-            {m.flashcards && m.flashcards.length > 0 && (
-              <FlashcardDeck
-                cards={m.flashcards}
-                onMissed={addMissed}
-                onMistake={(c) =>
-                  logMistake({
-                    concept: c.front,
-                    fix: c.back,
-                    source: "quiz",
-                  })
+            {studySection === "community" && (
+              <DoubtsBoard
+                name={
+                  session?.user?.name?.trim() ||
+                  profile?.name?.trim() ||
+                  session?.user?.email?.split("@")[0] ||
+                  "Guest"
                 }
               />
             )}
-            {m.quiz && m.quiz.length > 0 && (
-              <QuizView
-                quiz={m.quiz}
-                onMissed={addMissed}
-                onMistake={(mk) => logMistake({ ...mk, source: "quiz" })}
-                onStudyGuide={studyGuideFromQuiz}
-              />
-            )}
           </div>
-        ))}
-      </div>
+        )}
 
-      {messages.length > 0 && (
-        <div
-          style={styles.lessonAsk}
-          role="group"
-          aria-label="Ask a question about this lesson"
-        >
-          <span style={styles.lessonAskLabel}>Ask</span>
-          {lessonPromptsFor(activeChat?.title ?? "", subjects, profile?.klass).map(
-            (p) => (
+        {tab === "folder" && (
+          <SharedFolder
+            name={
+              session?.user?.name?.trim() ||
+              profile?.name?.trim() ||
+              session?.user?.email?.split("@")[0] ||
+              "Guest"
+            }
+          />
+        )}
+
+        {tab === "chat" && (
+          <>
+            <PlanStrip
+              plan={plan}
+              onToggleNext={toggleNextStep}
+              onOpen={() => setTab("study")}
+            />
+            <div ref={scrollRef} style={styles.scroll}>
+              {messages.map((m, i) => (
+                <div
+                  key={i}
+                  className="fade-in"
+                  style={{
+                    ...styles.row,
+                    flexDirection: "column",
+                    alignItems: m.role === "user" ? "flex-end" : "flex-start",
+                  }}
+                >
+                  {/* Above the bubble on purpose: the diagram tool call resolves
+                before the explanation streams, so the picture is already up
+                while Eliora is still talking her way through it. */}
+                  {m.visual && (
+                    <div style={styles.chatDiagram} className="fade-in">
+                      <LessonDiagram visual={m.visual} />
+                    </div>
+                  )}
+                  <div
+                    className="eliora-bubble"
+                    style={{
+                      ...styles.bubble,
+                      // Eliora speaks on a clean card; the learner's own words get
+                      // the solid brand fill. Tinting both left them muddled against
+                      // the paper background.
+                      background:
+                        m.role === "user"
+                          ? "var(--user-bubble)"
+                          : "var(--surface)",
+                      color:
+                        m.role === "user"
+                          ? "var(--user-text)"
+                          : "var(--assistant-text)",
+                      ...(m.role === "user"
+                        ? { borderTopRightRadius: 6 }
+                        : {
+                            borderTopLeftRadius: 6,
+                            border: "1px solid var(--border)",
+                          }),
+                    }}
+                  >
+                    {m.content
+                      ? m.role === "user"
+                        ? // The learner's own words render literally — an
+                          // asterisk they typed is an asterisk, not bold.
+                          renderContent(m.content, "#dff0e6")
+                        : renderMarkdown(m.content, "var(--accent)", "chat")
+                      : busy && !(i === messages.length - 1 && chatStatus)
+                        ? "…"
+                        : ""}
+                    {m.attachments && m.attachments.length > 0 && (
+                      <div
+                        style={{
+                          ...styles.attachStrip,
+                          marginTop: m.content ? 8 : 0,
+                          marginBottom: 0,
+                        }}
+                      >
+                        {m.attachments.map((a, ai) => (
+                          <div key={ai} style={styles.msgAttach} title={a.name}>
+                            {a.dataUrl ? (
+                              // eslint-disable-next-line @next/next/no-img-element
+                              <img
+                                src={a.dataUrl}
+                                alt={a.name}
+                                style={styles.msgAttachImg}
+                              />
+                            ) : (
+                              <span style={styles.msgAttachFile}>
+                                {a.kind === "video"
+                                  ? "🎬"
+                                  : a.kind === "image"
+                                    ? "🖼️"
+                                    : "📄"}{" "}
+                                {a.name}
+                              </span>
+                            )}
+                            {a.kind === "video" && a.dataUrl && (
+                              <span style={styles.msgAttachPlay} aria-hidden>
+                                ▶
+                              </span>
+                            )}
+                          </div>
+                        ))}
+                      </div>
+                    )}
+                    {/* Live status while tools run — shown even under partial text,
+                  since the model often writes a preamble before its tools. */}
+                    {busy && i === messages.length - 1 && chatStatus && (
+                      <div
+                        style={{
+                          fontStyle: "italic",
+                          opacity: 0.75,
+                          marginTop: m.content ? 6 : 0,
+                        }}
+                      >
+                        {chatStatus}
+                      </div>
+                    )}
+                  </div>
+                  {m.role === "assistant" && m.content && (
+                    <div style={styles.msgActions}>
+                      {a11y.readAloud && (
+                        <SpeakButton text={m.content} voice={tutorVoice} />
+                      )}
+                      {looksPrintable(m.content) &&
+                        !(busy && i === messages.length - 1) && (
+                          <button
+                            style={styles.speakBtn}
+                            onClick={() =>
+                              printAsPdf(
+                                chatDocTitle(
+                                  m.content,
+                                  messages
+                                    .slice(0, i)
+                                    .reverse()
+                                    .find((p) => p.role === "user")?.content,
+                                ),
+                                m.content,
+                              )
+                            }
+                          >
+                            📄 Save as PDF
+                          </button>
+                        )}
+                    </div>
+                  )}
+                  {m.videos && m.videos.length > 0 && (
+                    <VideoCards videos={m.videos} />
+                  )}
+                  {m.socials && m.socials.length > 0 && (
+                    <SocialCards socials={m.socials} />
+                  )}
+                  {m.resources && m.resources.length > 0 && (
+                    <ResourceCards resources={m.resources} />
+                  )}
+                  {m.examples && m.examples.length > 0 && (
+                    <ExampleCards examples={m.examples} />
+                  )}
+                  {m.flashcards && m.flashcards.length > 0 && (
+                    <FlashcardDeck
+                      cards={m.flashcards}
+                      onMissed={addMissed}
+                      onMistake={(c) =>
+                        logMistake({
+                          concept: c.front,
+                          fix: c.back,
+                          source: "quiz",
+                        })
+                      }
+                    />
+                  )}
+                  {m.quiz && m.quiz.length > 0 && (
+                    <QuizView
+                      quiz={m.quiz}
+                      onMissed={addMissed}
+                      onMistake={(mk) => logMistake({ ...mk, source: "quiz" })}
+                      onStudyGuide={studyGuideFromQuiz}
+                    />
+                  )}
+                </div>
+              ))}
+            </div>
+
+            {messages.length > 0 && (
+              <div
+                style={styles.lessonAsk}
+                role="group"
+                aria-label="Ask a question about this lesson"
+              >
+                <span style={styles.lessonAskLabel}>Ask</span>
+                {lessonPromptsFor(
+                  activeChat?.title ?? "",
+                  subjects,
+                  profile?.klass,
+                ).map((p) => (
+                  <button
+                    key={p.label}
+                    type="button"
+                    style={styles.quickChip}
+                    disabled={busy || !!pendingKickoff}
+                    onClick={() => void send(p.prompt)}
+                    title={p.prompt}
+                  >
+                    {p.label}
+                  </button>
+                ))}
+              </div>
+            )}
+
+            {/* Prompted responses from the weak-topic algorithm: ready-to-send chips
+          built from the learner's quiz/flashcard misses (freshest first). */}
+            {missed.length > 0 && (
+              <div
+                style={styles.lessonAsk}
+                role="group"
+                aria-label="Practice a weak spot"
+              >
+                <span style={styles.lessonAskLabel}>🎯 Weak spots</span>
+                {weakTopicPrompts(missed).map((p) => (
+                  <button
+                    key={p.label}
+                    type="button"
+                    style={styles.weakChip}
+                    disabled={busy || !!pendingKickoff}
+                    onClick={() => void send(p.prompt)}
+                    title={p.prompt}
+                  >
+                    {p.label}
+                  </button>
+                ))}
+              </div>
+            )}
+
+            <div style={styles.composerActions}>
+              <div
+                style={styles.teachLevelGroup}
+                role="group"
+                aria-label="Teach-back difficulty"
+              >
+                <span style={styles.teachLevelLabel}>Level</span>
+                {TEACH_LEVELS.map((lvl) => (
+                  <button
+                    key={lvl.id}
+                    type="button"
+                    onClick={() => setTeachLevel(lvl.id)}
+                    disabled={busy || !!pendingKickoff}
+                    title={lvl.hint}
+                    aria-pressed={teachLevel === lvl.id}
+                    style={{
+                      ...styles.teachLevelBtn,
+                      ...(teachLevel === lvl.id
+                        ? styles.teachLevelBtnActive
+                        : null),
+                    }}
+                  >
+                    {lvl.emoji} {lvl.label}
+                  </button>
+                ))}
+              </div>
               <button
-                key={p.label}
                 type="button"
                 style={styles.quickChip}
                 disabled={busy || !!pendingKickoff}
-                onClick={() => void send(p.prompt)}
-                title={p.prompt}
+                onClick={teachBackInChat}
+                title={
+                  input.trim()
+                    ? `Teach back “${input.trim()}”`
+                    : "Teach a concept back to check your understanding"
+                }
               >
-                {p.label}
+                🧑‍🏫 Teach it back
               </button>
-            ),
-          )}
-        </div>
-      )}
-
-      {/* Prompted responses from the weak-topic algorithm: ready-to-send chips
-          built from the learner's quiz/flashcard misses (freshest first). */}
-      {missed.length > 0 && (
-        <div
-          style={styles.lessonAsk}
-          role="group"
-          aria-label="Practice a weak spot"
-        >
-          <span style={styles.lessonAskLabel}>🎯 Weak spots</span>
-          {weakTopicPrompts(missed).map((p) => (
-            <button
-              key={p.label}
-              type="button"
-              style={styles.weakChip}
-              disabled={busy || !!pendingKickoff}
-              onClick={() => void send(p.prompt)}
-              title={p.prompt}
-            >
-              {p.label}
-            </button>
-          ))}
-        </div>
-      )}
-
-      <div style={styles.composerActions}>
-        <div
-          style={styles.teachLevelGroup}
-          role="group"
-          aria-label="Teach-back difficulty"
-        >
-          <span style={styles.teachLevelLabel}>Level</span>
-          {TEACH_LEVELS.map((lvl) => (
-            <button
-              key={lvl.id}
-              type="button"
-              onClick={() => setTeachLevel(lvl.id)}
-              disabled={busy || !!pendingKickoff}
-              title={lvl.hint}
-              aria-pressed={teachLevel === lvl.id}
-              style={{
-                ...styles.teachLevelBtn,
-                ...(teachLevel === lvl.id ? styles.teachLevelBtnActive : null),
-              }}
-            >
-              {lvl.emoji} {lvl.label}
-            </button>
-          ))}
-        </div>
-        <button
-          type="button"
-          style={styles.quickChip}
-          disabled={busy || !!pendingKickoff}
-          onClick={teachBackInChat}
-          title={
-            input.trim()
-              ? `Teach back “${input.trim()}”`
-              : "Teach a concept back to check your understanding"
-          }
-        >
-          🧑‍🏫 Teach it back
-        </button>
-        <button
-          type="button"
-          style={styles.quickChip}
-          disabled={busy || !!pendingKickoff}
-          onClick={recordTeachBack}
-          title={
-            input.trim()
-              ? `Record yourself teaching “${input.trim()}”`
-              : "Record yourself teaching a concept back to camera"
-          }
-        >
-          🎥 Record it
-        </button>
-        <button
-          type="button"
-          style={styles.quickChip}
-          disabled={busy || !!pendingKickoff}
-          onClick={studyTipInChat}
-          title={
-            input.trim()
-              ? `Get a study tip for “${input.trim()}”`
-              : "Get a quick, practical study tip you can use right now"
-          }
-        >
-          💡 Study tip
-        </button>
-      </div>
-
-      {(attachments.length > 0 || attaching) && (
-        <div style={styles.attachStrip} aria-label="Attachments to send">
-          {attachments.map((a, i) => (
-            <div key={i} style={styles.attachChip} title={a.name}>
-              {a.dataUrl ? (
-                // eslint-disable-next-line @next/next/no-img-element
-                <img src={a.dataUrl} alt="" style={styles.attachThumb} />
-              ) : (
-                <span style={styles.attachIcon} aria-hidden>
-                  {a.kind === "video" ? "🎬" : a.kind === "image" ? "🖼️" : "📄"}
-                </span>
-              )}
-              <span style={styles.attachName}>{a.name}</span>
-              {a.kind === "video" && (
-                <span style={styles.attachBadge} aria-hidden>▶</span>
-              )}
               <button
                 type="button"
-                onClick={() => removeAttachment(i)}
-                style={styles.attachRemove}
-                aria-label={`Remove ${a.name}`}
+                style={styles.quickChip}
+                disabled={busy || !!pendingKickoff}
+                onClick={recordTeachBack}
+                title={
+                  input.trim()
+                    ? `Record yourself teaching “${input.trim()}”`
+                    : "Record yourself teaching a concept back to camera"
+                }
               >
-                ✕
+                🎥 Record it
+              </button>
+              <button
+                type="button"
+                style={styles.quickChip}
+                disabled={busy || !!pendingKickoff}
+                onClick={studyTipInChat}
+                title={
+                  input.trim()
+                    ? `Get a study tip for “${input.trim()}”`
+                    : "Get a quick, practical study tip you can use right now"
+                }
+              >
+                💡 Study tip
               </button>
             </div>
-          ))}
-          {attaching && <span style={styles.attachName}>Preparing…</span>}
-        </div>
-      )}
 
-      <div className="eliora-composer" style={styles.composer}>
-        <input
-          ref={fileInputRef}
-          type="file"
-          multiple
-          accept="image/*,video/*,.pdf,.txt,.md,.csv,.tsv,.json,.rtf,.html,.htm,.xml,.doc,.docx,.ppt,.pptx,.xls,.xlsx"
-          style={{ display: "none" }}
-          onChange={(e) => {
-            void addFiles(e.target.files);
-            e.target.value = ""; // let the same file be picked again later
-          }}
-        />
-        <button
-          type="button"
-          onClick={() => fileInputRef.current?.click()}
-          disabled={busy || attaching || attachments.length >= MAX_ATTACHMENTS}
-          style={styles.micBtn}
-          aria-label="Attach a photo, file, or video"
-          title={
-            attachments.length >= MAX_ATTACHMENTS
-              ? `You can attach up to ${MAX_ATTACHMENTS} items`
-              : "Attach a photo, file, or video"
-          }
-        >
-          📎
-        </button>
-        <textarea
-          value={input}
-          onChange={(e) => setInput(e.target.value)}
-          onKeyDown={(e) => {
-            if (e.key === "Enter" && !e.shiftKey) {
-              e.preventDefault();
-              send();
-            }
-          }}
-          onPaste={(e) => {
-            const files = Array.from(e.clipboardData?.files ?? []);
-            if (files.length) {
-              e.preventDefault();
-              void addFiles(files);
-            }
-          }}
-          placeholder="Message Eliora…"
-          rows={2}
-          className="eliora-input"
-          style={styles.input}
-          aria-label="Message Eliora"
-          spellCheck
-          autoCapitalize="sentences"
-        />
-        {speechSupported && (
-          <button
-            type="button"
-            onClick={() => {
-              recognitionRef.current?.stop();
-              stopSpeaking();
-              setVoiceMode(true);
-            }}
-            disabled={busy}
-            style={styles.micBtn}
-            aria-label="Start a voice conversation with Eliora"
-            title="Voice mode — talk out loud and Eliora answers out loud"
-          >
-            📞
-          </button>
+            {(attachments.length > 0 || attaching) && (
+              <div style={styles.attachStrip} aria-label="Attachments to send">
+                {attachments.map((a, i) => (
+                  <div key={i} style={styles.attachChip} title={a.name}>
+                    {a.dataUrl ? (
+                      // eslint-disable-next-line @next/next/no-img-element
+                      <img src={a.dataUrl} alt="" style={styles.attachThumb} />
+                    ) : (
+                      <span style={styles.attachIcon} aria-hidden>
+                        {a.kind === "video"
+                          ? "🎬"
+                          : a.kind === "image"
+                            ? "🖼️"
+                            : "📄"}
+                      </span>
+                    )}
+                    <span style={styles.attachName}>{a.name}</span>
+                    {a.kind === "video" && (
+                      <span style={styles.attachBadge} aria-hidden>
+                        ▶
+                      </span>
+                    )}
+                    <button
+                      type="button"
+                      onClick={() => removeAttachment(i)}
+                      style={styles.attachRemove}
+                      aria-label={`Remove ${a.name}`}
+                    >
+                      ✕
+                    </button>
+                  </div>
+                ))}
+                {attaching && <span style={styles.attachName}>Preparing…</span>}
+              </div>
+            )}
+
+            <div className="eliora-composer" style={styles.composer}>
+              <input
+                ref={fileInputRef}
+                type="file"
+                multiple
+                accept="image/*,video/*,.pdf,.txt,.md,.csv,.tsv,.json,.rtf,.html,.htm,.xml,.doc,.docx,.ppt,.pptx,.xls,.xlsx"
+                style={{ display: "none" }}
+                onChange={(e) => {
+                  void addFiles(e.target.files);
+                  e.target.value = ""; // let the same file be picked again later
+                }}
+              />
+              <button
+                type="button"
+                onClick={() => fileInputRef.current?.click()}
+                disabled={
+                  busy || attaching || attachments.length >= MAX_ATTACHMENTS
+                }
+                style={styles.micBtn}
+                aria-label="Attach a photo, file, or video"
+                title={
+                  attachments.length >= MAX_ATTACHMENTS
+                    ? `You can attach up to ${MAX_ATTACHMENTS} items`
+                    : "Attach a photo, file, or video"
+                }
+              >
+                📎
+              </button>
+              <textarea
+                value={input}
+                onChange={(e) => setInput(e.target.value)}
+                onKeyDown={(e) => {
+                  if (e.key === "Enter" && !e.shiftKey) {
+                    e.preventDefault();
+                    send();
+                  }
+                }}
+                onPaste={(e) => {
+                  const files = Array.from(e.clipboardData?.files ?? []);
+                  if (files.length) {
+                    e.preventDefault();
+                    void addFiles(files);
+                  }
+                }}
+                placeholder="Message Eliora…"
+                rows={2}
+                className="eliora-input"
+                style={styles.input}
+                aria-label="Message Eliora"
+                spellCheck
+                autoCapitalize="sentences"
+              />
+              {speechSupported && (
+                <button
+                  type="button"
+                  onClick={() => {
+                    recognitionRef.current?.stop();
+                    stopSpeaking();
+                    setVoiceMode(true);
+                  }}
+                  disabled={busy}
+                  style={styles.micBtn}
+                  aria-label="Start a voice conversation with Eliora"
+                  title="Voice mode — talk out loud and Eliora answers out loud"
+                >
+                  📞
+                </button>
+              )}
+              {speechSupported && (
+                <button
+                  onClick={toggleDictation}
+                  disabled={busy}
+                  style={{
+                    ...styles.micBtn,
+                    ...(listening ? styles.micBtnActive : {}),
+                  }}
+                  aria-label={
+                    listening ? "Stop dictation" : "Dictate your message"
+                  }
+                  title={listening ? "Stop dictation" : "Speak your message"}
+                >
+                  {listening ? "⏹" : "🗣️"}
+                </button>
+              )}
+              <button
+                onClick={() => (busy ? stopReply() : send())}
+                style={styles.sendBtn}
+                aria-label={busy ? "Stop the reply" : "Send your message"}
+              >
+                {busy ? "⏹ Stop" : "Send"}
+              </button>
+            </div>
+            {voiceMode && (
+              <VoiceChat
+                voice={tutorVoice}
+                onSend={(text, opts) => send(text, opts)}
+                onInterrupt={stopReply}
+                onClose={() => setVoiceMode(false)}
+                visual={
+                  messages[messages.length - 1]?.role === "assistant"
+                    ? messages[messages.length - 1]?.visual
+                    : undefined
+                }
+              />
+            )}
+          </>
         )}
-        {speechSupported && (
-          <button
-            onClick={toggleDictation}
-            disabled={busy}
-            style={{
-              ...styles.micBtn,
-              ...(listening ? styles.micBtnActive : {}),
-            }}
-            aria-label={listening ? "Stop dictation" : "Dictate your message"}
-            title={listening ? "Stop dictation" : "Speak your message"}
-          >
-            {listening ? "⏹" : "🗣️"}
-          </button>
-        )}
-        <button
-          onClick={() => (busy ? stopReply() : send())}
-          style={styles.sendBtn}
-          aria-label={busy ? "Stop the reply" : "Send your message"}
-        >
-          {busy ? "⏹ Stop" : "Send"}
-        </button>
-      </div>
-      {voiceMode && (
-        <VoiceChat
-          voice={tutorVoice}
-          onSend={(text, opts) => send(text, opts)}
-          onInterrupt={stopReply}
-          onClose={() => setVoiceMode(false)}
-          visual={
-            messages[messages.length - 1]?.role === "assistant"
-              ? messages[messages.length - 1]?.visual
-              : undefined
-          }
-        />
-      )}
-        </>
-      )}
       </main>
       {/* Persistent focus-music player — keeps playing across every tab. */}
       <FocusMusicPlayer storageKey={MUSIC_KEY} />
@@ -28548,191 +31899,6 @@ const styles: Record<string, React.CSSProperties> = {
     maxWidth: 1340,
   },
   homeHero: { padding: "4px 2px 8px" },
-  roomGrid: {
-    display: "grid",
-    gridTemplateColumns: "repeat(4, 1fr)",
-    gap: 8,
-    marginTop: 8,
-  },
-  rewardWrap: { borderTop: "1px solid var(--border)" },
-  rewardItem: {
-    display: "flex",
-    alignItems: "center",
-    gap: 10,
-    padding: "9px 0",
-  },
-  rewardComposeBox: {
-    display: "flex",
-    flexDirection: "column",
-    gap: 8,
-    padding: "0 0 12px 36px",
-  },
-  rewardComposeInput: {
-    width: "100%",
-    minHeight: 60,
-    resize: "vertical",
-    padding: "9px 11px",
-    borderRadius: 10,
-    border: "1px solid var(--border)",
-    background: "var(--surface)",
-    color: "var(--assistant-text)",
-    fontSize: 13.5,
-    fontFamily: "inherit",
-    lineHeight: 1.45,
-    boxSizing: "border-box",
-  },
-  rewardClaimBtn: {
-    alignSelf: "flex-start",
-    padding: "7px 14px",
-    borderRadius: 9,
-    border: "none",
-    background: "var(--accent)",
-    color: "var(--primary-foreground)",
-    fontSize: 13,
-    fontWeight: 700,
-    cursor: "pointer",
-  },
-  rewardLog: {
-    display: "flex",
-    flexDirection: "column",
-    gap: 3,
-    padding: "0 0 10px 36px",
-  },
-  rewardLogItem: {
-    fontSize: 12.5,
-    color: "var(--muted)",
-    lineHeight: 1.4,
-  },
-  rewardLogDot: { color: "var(--accent)", fontWeight: 700 },
-  rewardEmoji: { fontSize: 22, flexShrink: 0, width: 26, textAlign: "center" },
-  rewardTitle: {
-    fontSize: 14,
-    fontWeight: 600,
-    color: "var(--assistant-text)",
-    whiteSpace: "nowrap",
-    overflow: "hidden",
-    textOverflow: "ellipsis",
-  },
-  rewardRedeemed: { fontSize: 12, fontWeight: 600, color: "var(--accent)" },
-  rewardTrack: {
-    marginTop: 5,
-    height: 6,
-    borderRadius: 6,
-    background: "var(--assistant-bubble)",
-    overflow: "hidden",
-  },
-  rewardFill: {
-    height: "100%",
-    background: "var(--accent)",
-    transition: "width 200ms ease",
-  },
-  rewardCost: {
-    flexShrink: 0,
-    fontSize: 12.5,
-    fontWeight: 700,
-    color: "var(--muted)",
-    minWidth: 46,
-    textAlign: "right",
-  },
-  rewardRedeemBtn: {
-    flexShrink: 0,
-    padding: "6px 12px",
-    borderRadius: 9,
-    border: "none",
-    background: "var(--accent)",
-    color: "var(--primary-foreground)",
-    fontSize: 13,
-    fontWeight: 700,
-    cursor: "pointer",
-  },
-  rewardRedeemOff: {
-    background: "var(--assistant-bubble)",
-    color: "var(--muted)",
-    cursor: "not-allowed",
-  },
-  rewardAddBox: {
-    marginTop: 12,
-    paddingTop: 12,
-    borderTop: "1px solid var(--border)",
-  },
-  rewardEmojiRow: {
-    display: "flex",
-    flexWrap: "wrap",
-    gap: 4,
-    marginBottom: 8,
-  },
-  rewardEmojiPick: {
-    width: 32,
-    height: 32,
-    borderRadius: 8,
-    borderWidth: 1,
-    borderStyle: "solid",
-    borderColor: "var(--border)",
-    background: "var(--surface)",
-    fontSize: 17,
-    cursor: "pointer",
-    lineHeight: 1,
-  },
-  rewardEmojiPickOn: {
-    borderColor: "var(--accent)",
-    background: "var(--accent-soft)",
-  },
-  rewardAddRow: { display: "flex", gap: 8 },
-  rewardCostInput: {
-    width: 66,
-    flexShrink: 0,
-    padding: "9px 10px",
-    borderRadius: 10,
-    border: "1px solid var(--border)",
-    background: "var(--surface)",
-    color: "var(--assistant-text)",
-    fontSize: 14,
-  },
-  rewardAddBtn: {
-    flexShrink: 0,
-    padding: "9px 14px",
-    borderRadius: 10,
-    border: "none",
-    background: "var(--accent-soft)",
-    color: "var(--accent)",
-    fontSize: 14,
-    fontWeight: 700,
-    cursor: "pointer",
-  },
-  roomChip: {
-    position: "relative",
-    height: 74,
-    borderRadius: 12,
-    border: "none",
-    cursor: "pointer",
-    display: "flex",
-    flexDirection: "column",
-    alignItems: "center",
-    justifyContent: "center",
-    gap: 2,
-    padding: 4,
-    overflow: "hidden",
-  },
-  roomChipEq: {
-    outlineWidth: 3,
-    boxShadow: "0 0 0 3px var(--accent)",
-  },
-  roomEmoji: { fontSize: 22 },
-  roomName: {
-    fontSize: 11,
-    fontWeight: 700,
-    color: "#fff",
-    textShadow: "0 1px 2px rgba(0,0,0,0.4)",
-  },
-  roomStatus: {
-    fontSize: 9.5,
-    fontWeight: 700,
-    color: "rgba(255,255,255,0.95)",
-    textShadow: "0 1px 2px rgba(0,0,0,0.45)",
-    background: "rgba(0,0,0,0.25)",
-    padding: "1px 5px",
-    borderRadius: 999,
-  },
   progCard: {
     background: "var(--surface)",
     border: "1px solid var(--border)",
@@ -28755,67 +31921,6 @@ const styles: Record<string, React.CSSProperties> = {
   },
   progBig: { fontSize: 26, fontWeight: 800, color: "var(--accent)" },
   progLbl: { fontSize: 12, color: "var(--muted)", fontWeight: 600 },
-  badgeSection: { marginBottom: 12 },
-  badgeSectionHead: {
-    display: "flex",
-    alignItems: "center",
-    justifyContent: "space-between",
-    marginBottom: 8,
-  },
-  badgeSectionTitle: { fontSize: 13.5, fontWeight: 700, color: "var(--text)" },
-  badgeSectionCount: { fontSize: 12, color: "var(--muted)" },
-  badgeGrid: {
-    display: "flex",
-    flexWrap: "wrap",
-    gap: 10,
-    justifyContent: "center",
-  },
-  badgeItem: {
-    display: "flex",
-    flexDirection: "column",
-    alignItems: "center",
-    gap: 4,
-    width: 66,
-    background: "transparent",
-    border: "none",
-    padding: 2,
-    cursor: "pointer",
-  },
-  badgeMedal: {
-    position: "relative",
-    width: 48,
-    height: 48,
-    borderRadius: 999,
-    display: "flex",
-    alignItems: "center",
-    justifyContent: "center",
-    fontSize: 24,
-    color: "#fff",
-    border: "2px solid rgba(255,255,255,0.55)",
-    boxShadow: "0 2px 6px rgba(0,0,0,0.18)",
-  },
-  badgeMedalLocked: {
-    filter: "grayscale(0.85)",
-    opacity: 0.4,
-    boxShadow: "none",
-  },
-  badgeLockPip: {
-    position: "absolute",
-    right: -3,
-    bottom: -3,
-    fontSize: 12,
-    lineHeight: 1,
-    background: "var(--bg)",
-    borderRadius: 999,
-    padding: 1,
-  },
-  badgeItemLabel: {
-    fontSize: 10.5,
-    fontWeight: 600,
-    lineHeight: 1.2,
-    textAlign: "center",
-    color: "var(--text)",
-  },
   badgeModal: {
     position: "relative",
     background: "var(--bg)",
@@ -28830,40 +31935,11 @@ const styles: Record<string, React.CSSProperties> = {
     textAlign: "center",
     boxShadow: "var(--shadow-e1)",
   },
-  badgeModalClose: {
-    position: "absolute",
-    top: 10,
-    right: 14,
-    background: "transparent",
-    border: "none",
-    fontSize: 26,
-    lineHeight: 1,
-    color: "var(--muted)",
-    cursor: "pointer",
-  },
-  badgeModalMedal: {
-    width: 104,
-    height: 104,
-    borderRadius: 999,
-    display: "flex",
-    alignItems: "center",
-    justifyContent: "center",
-    fontSize: 52,
-    color: "#fff",
-    border: "3px solid rgba(255,255,255,0.6)",
-    boxShadow: "0 8px 24px rgba(0,0,0,0.25)",
-  },
   badgeModalTitle: {
     fontSize: 22,
     fontWeight: 800,
     color: "var(--text)",
     margin: 0,
-  },
-  badgeModalStatus: {
-    fontSize: 12.5,
-    fontWeight: 700,
-    padding: "3px 12px",
-    borderRadius: 999,
   },
   badgeModalBlurb: {
     fontSize: 14.5,
@@ -28872,51 +31948,11 @@ const styles: Record<string, React.CSSProperties> = {
     margin: 0,
     maxWidth: 300,
   },
-  badgeModalHint: {
-    display: "flex",
-    flexDirection: "column",
-    gap: 2,
-    width: "100%",
-    background: "var(--surface)",
-    border: "1px solid var(--border)",
-    borderRadius: 12,
-    padding: "10px 14px",
-    fontSize: 13.5,
-    color: "var(--text)",
-    textAlign: "left",
-  },
-  badgeModalHintLabel: {
-    fontSize: 11,
-    fontWeight: 700,
-    textTransform: "uppercase",
-    letterSpacing: 0.5,
-    color: "var(--muted)",
-  },
-  badgeModalReward: {
-    fontSize: 13.5,
-    fontWeight: 700,
-    color: "var(--accent)",
-  },
   badgeCelebrateKicker: {
     fontSize: 15,
     fontWeight: 800,
     color: "var(--accent)",
     letterSpacing: 0.3,
-  },
-  xpToast: {
-    position: "sticky",
-    top: 8,
-    zIndex: 20,
-    alignSelf: "center",
-    margin: "0 auto 12px",
-    width: "fit-content",
-    padding: "8px 16px",
-    borderRadius: 999,
-    background: "var(--accent)",
-    color: "var(--primary-foreground)",
-    fontSize: 14,
-    fontWeight: 800,
-    boxShadow: "var(--shadow-e1)",
   },
   progWeek: {
     display: "flex",
@@ -28947,25 +31983,6 @@ const styles: Record<string, React.CSSProperties> = {
   },
   progDotActive: { background: "#fde7c9" },
   progDotToday: { borderColor: "var(--accent)" },
-  progGoalRow: { display: "flex", alignItems: "center", gap: 10 },
-  progTrack: {
-    flex: 1,
-    height: 10,
-    borderRadius: 6,
-    background: "var(--assistant-bubble)",
-    overflow: "hidden",
-  },
-  progFill: {
-    height: "100%",
-    background: "var(--accent)",
-    transition: "width 300ms ease",
-  },
-  progGoalLbl: {
-    flexShrink: 0,
-    fontSize: 12.5,
-    fontWeight: 700,
-    color: "var(--muted)",
-  },
   progBarsHead: {
     fontSize: 12,
     fontWeight: 700,
@@ -30040,6 +33057,30 @@ const styles: Record<string, React.CSSProperties> = {
   schedTimerDone: {
     color: "#2f6f4f",
   },
+  schedDoneTick: {
+    flexShrink: 0,
+    fontSize: 13,
+    fontWeight: 800,
+    color: "#2f6f4f",
+    padding: "0 1px",
+  },
+  schedDayBar: {
+    marginTop: 12,
+    paddingTop: 10,
+    borderTop: "1px solid var(--border)",
+  },
+  schedDayBarHead: {
+    display: "flex",
+    alignItems: "baseline",
+    justifyContent: "space-between",
+    gap: 8,
+    fontSize: 12.5,
+    fontWeight: 700,
+    color: "var(--muted)",
+  },
+  schedDayBarCount: {
+    fontVariantNumeric: "tabular-nums",
+  },
   schedTimerClear: {
     background: "transparent",
     border: "none",
@@ -30458,6 +33499,22 @@ const styles: Record<string, React.CSSProperties> = {
     fontWeight: 700,
     color: "var(--assistant-text)",
     margin: "10px 0 2px",
+  },
+  // Same headings sized for a message bubble: a step above body text so the
+  // sections read at a glance, without shouting like a notes page.
+  chatMdH2: {
+    fontSize: 15.5,
+    fontWeight: 800,
+    color: "var(--accent)",
+    margin: "12px 0 3px",
+    lineHeight: 1.35,
+  },
+  chatMdH3: {
+    fontSize: 14.5,
+    fontWeight: 700,
+    color: "var(--assistant-text)",
+    margin: "10px 0 2px",
+    lineHeight: 1.35,
   },
   mdP: { margin: "4px 0" },
   // Highlighted key idea (==like this== in the AI notes) — a soft marker-pen
@@ -30939,6 +33996,51 @@ const styles: Record<string, React.CSSProperties> = {
   },
   calDots: { display: "flex", gap: 2, height: 5 },
   calDot: { width: 5, height: 5, borderRadius: 3 },
+  // The day you tapped open, filled in so it's obvious which one the panel
+  // below is talking about.
+  calCellOpen: {
+    background: "var(--accent-soft)",
+    borderColor: "var(--accent)",
+    fontWeight: 700,
+  },
+  calDayBox: {
+    marginTop: 10,
+    padding: "10px 12px",
+    background: "var(--surface)",
+    borderWidth: 1,
+    borderStyle: "solid",
+    borderColor: "var(--border)",
+    borderRadius: 10,
+  },
+  calDayHead: {
+    display: "flex",
+    alignItems: "center",
+    justifyContent: "space-between",
+    gap: 8,
+    marginBottom: 4,
+  },
+  calDayTitle: { fontSize: 13, fontWeight: 700, color: "var(--assistant-text)" },
+  calDayClose: {
+    background: "transparent",
+    border: "none",
+    cursor: "pointer",
+    fontSize: 18,
+    lineHeight: 1,
+    color: "var(--muted)",
+    padding: 0,
+  },
+  calDayEmpty: { margin: "2px 0", fontSize: 13, color: "var(--muted)" },
+  calDayAdd: {
+    marginTop: 8,
+    background: "transparent",
+    border: "none",
+    padding: 0,
+    fontSize: 13,
+    fontWeight: 600,
+    fontFamily: "inherit",
+    color: "var(--accent)",
+    cursor: "pointer",
+  },
   schedBox: {
     marginTop: 14,
     paddingTop: 12,
@@ -30983,6 +34085,36 @@ const styles: Record<string, React.CSSProperties> = {
     height: 6,
     borderRadius: 3,
     marginTop: 6,
+  },
+  // "· towards Biology final" — the thing a step leads up to, kept quiet so the
+  // step itself stays the thing you read.
+  schedToward: { color: "var(--muted)" },
+  // A to-do row in the schedule is a button (tap to tick off), but it has to
+  // still read as the plain line of text next to it.
+  schedTaskToggle: {
+    flex: 1,
+    background: "transparent",
+    border: "none",
+    padding: 0,
+    textAlign: "left",
+    cursor: "pointer",
+    font: "inherit",
+    fontSize: 13.5,
+    color: "var(--assistant-text)",
+  },
+  // The little date box on a step, sized to a date and no bigger.
+  stepDate: {
+    flexShrink: 0,
+    alignSelf: "center",
+    borderWidth: 1,
+    borderStyle: "solid",
+    borderColor: "var(--border)",
+    borderRadius: 8,
+    padding: "2px 5px",
+    fontSize: 12,
+    fontFamily: "inherit",
+    background: "var(--surface)",
+    color: "var(--muted)",
   },
   calLegend: {
     display: "flex",
@@ -31066,6 +34198,16 @@ const styles: Record<string, React.CSSProperties> = {
   tabPanel: {
     flex: 1,
     overflowY: "auto",
+    display: "flex",
+    flexDirection: "column",
+    gap: 12,
+    paddingBottom: 16,
+  },
+  // Sections embedded in the Study column (which already scrolls). `tabPanel`
+  // would collapse here — `flex: 1` plus its own `overflow` makes min-height
+  // resolve to 0, so the panel shrinks to its title. These size to content.
+  studySection: {
+    flexShrink: 0,
     display: "flex",
     flexDirection: "column",
     gap: 12,
@@ -31560,6 +34702,48 @@ const styles: Record<string, React.CSSProperties> = {
   },
   socialNote: { fontSize: 12, color: "var(--muted)", lineHeight: 1.35 },
   socialOpen: { fontSize: 12, fontWeight: 600, color: "var(--accent, #7b4bd0)" },
+  // Non-video resource cards (sites, books, practice sets)
+  resourceWrap: {
+    display: "flex",
+    flexDirection: "column",
+    gap: 8,
+    maxWidth: "85%",
+    marginTop: 2,
+  } as React.CSSProperties,
+  resourceHeader: { fontSize: 13, fontWeight: 700, color: "var(--muted)" },
+  resourceCard: {
+    display: "flex",
+    flexDirection: "column",
+    gap: 6,
+    textDecoration: "none",
+    color: "inherit",
+    background: "var(--surface)",
+    border: "1px solid var(--border)",
+    borderRadius: 12,
+    padding: "10px 12px",
+  } as React.CSSProperties,
+  resourceTopRow: {
+    display: "flex",
+    alignItems: "center",
+    gap: 8,
+    flexWrap: "wrap",
+  } as React.CSSProperties,
+  resourceBadge: {
+    fontSize: 11,
+    fontWeight: 700,
+    color: "#fff",
+    padding: "3px 8px",
+    borderRadius: 999,
+    whiteSpace: "nowrap",
+  } as React.CSSProperties,
+  resourceTitle: {
+    fontSize: 14,
+    fontWeight: 600,
+    lineHeight: 1.3,
+    color: "var(--assistant-text)",
+  },
+  resourceNote: { fontSize: 12, color: "var(--muted)", lineHeight: 1.35 },
+  resourceOpen: { fontSize: 12, fontWeight: 600, color: "var(--accent, #7b4bd0)" },
   // Anonymized peer-example cards ("how other students tackled this")
   exampleWrap: {
     display: "flex",
@@ -32042,7 +35226,10 @@ const styles: Record<string, React.CSSProperties> = {
   },
   assignItem: {
     display: "flex",
-    alignItems: "center",
+    // Top-aligned, not centred: once a row carries a step checklist it gets
+    // tall, and a centred tick box drifts down beside the middle step as if it
+    // belonged to it.
+    alignItems: "flex-start",
     gap: 10,
     padding: "10px 0",
     borderTopWidth: 1,
@@ -32272,55 +35459,6 @@ const styles: Record<string, React.CSSProperties> = {
     cursor: "pointer",
     whiteSpace: "nowrap",
   },
-  goalAchStrip: {
-    marginTop: 10,
-    marginBottom: 4,
-    padding: "12px 12px 10px",
-    borderRadius: 12,
-    background: "var(--accent-soft)",
-    border: "1px solid var(--border)",
-  },
-  goalAchHead: {
-    display: "flex",
-    alignItems: "center",
-    justifyContent: "space-between",
-    gap: 8,
-    marginBottom: 10,
-  },
-  goalAchTitle: { fontSize: 13, fontWeight: 800, color: "var(--accent)" },
-  goalAchRow: {
-    display: "flex",
-    gap: 10,
-    overflowX: "auto",
-    paddingBottom: 2,
-  },
-  goalAchItem: {
-    display: "flex",
-    flexDirection: "column",
-    alignItems: "center",
-    gap: 4,
-    width: 62,
-    flexShrink: 0,
-  },
-  goalAchMedal: {
-    width: 40,
-    height: 40,
-    borderRadius: 999,
-    display: "flex",
-    alignItems: "center",
-    justifyContent: "center",
-    fontSize: 20,
-    color: "#fff",
-    border: "2px solid rgba(255,255,255,0.55)",
-    boxShadow: "0 2px 6px rgba(0,0,0,0.18)",
-  },
-  goalAchLabel: {
-    fontSize: 10,
-    fontWeight: 700,
-    lineHeight: 1.15,
-    textAlign: "center",
-    color: "var(--assistant-text)",
-  },
   goalGroup: { marginTop: 16 },
   goalGroupHeadRow: {
     display: "flex",
@@ -32442,43 +35580,6 @@ const styles: Record<string, React.CSSProperties> = {
   },
   // The reward "prize" tied to a goal — a small picker on active goals and a
   // won-treat line on achieved ones.
-  goalPrizeRow: {
-    marginTop: 6,
-    marginLeft: 32,
-    display: "flex",
-    alignItems: "center",
-    gap: 8,
-    flexWrap: "wrap",
-  },
-  goalPrizeLabel: { fontSize: 12.5, fontWeight: 700, color: "var(--muted)" },
-  goalPrizeSelect: {
-    padding: "3px 8px",
-    borderRadius: 8,
-    border: "1px solid var(--border)",
-    background: "var(--surface)",
-    color: "var(--text)",
-    fontSize: 12.5,
-    fontFamily: "inherit",
-    cursor: "pointer",
-    maxWidth: 220,
-  },
-  goalPrizeHint: { fontSize: 12, color: "var(--muted)", fontStyle: "italic" },
-  goalPrizeEarned: {
-    marginTop: 6,
-    marginLeft: 32,
-    fontSize: 12.5,
-    fontWeight: 700,
-    color: "var(--accent)",
-  },
-  rewardGoalTag: {
-    marginTop: 2,
-    fontSize: 12,
-    fontWeight: 600,
-    color: "var(--accent)",
-    whiteSpace: "nowrap",
-    overflow: "hidden",
-    textOverflow: "ellipsis",
-  },
   goalTasks: { marginTop: 8, marginLeft: 32, display: "flex", flexDirection: "column", gap: 2 },
   goalTasksHead: {
     fontSize: 12,
@@ -32579,6 +35680,172 @@ const styles: Record<string, React.CSSProperties> = {
   },
   lessonFile: { marginTop: 8, fontSize: 13, color: "var(--muted)" },
   lessonErr: { marginTop: 8, fontSize: 13, color: "var(--destructive)" },
+
+  // Flashcards — deck shelf, editor, and the flip card.
+  fcNote: { fontSize: 13, color: "var(--muted)", marginTop: 8, lineHeight: 1.5 },
+  fcActions: { display: "flex", gap: 8, marginTop: 12, flexWrap: "wrap" },
+  fcBtn: {
+    padding: "10px 14px",
+    borderRadius: 10,
+    border: "1px solid var(--accent)",
+    background: "var(--accent-soft)",
+    color: "var(--accent)",
+    fontSize: 14,
+    fontWeight: 600,
+    cursor: "pointer",
+  },
+  fcBtnGhost: {
+    padding: "10px 14px",
+    borderRadius: 10,
+    border: "1px solid var(--border)",
+    background: "var(--surface)",
+    color: "var(--muted)",
+    fontSize: 14,
+    fontWeight: 600,
+    cursor: "pointer",
+  },
+  fcBtnGood: {
+    flex: 1,
+    minWidth: 130,
+    padding: "12px 14px",
+    borderRadius: 10,
+    border: "1px solid #2e7d32",
+    background: "#e4f4e6",
+    color: "#2e7d32",
+    fontSize: 15,
+    fontWeight: 700,
+    cursor: "pointer",
+  },
+  fcBtnBad: {
+    flex: 1,
+    minWidth: 130,
+    padding: "12px 14px",
+    borderRadius: 10,
+    border: "1px solid #b3453b",
+    background: "#fbe9e7",
+    color: "#b3453b",
+    fontSize: 15,
+    fontWeight: 700,
+    cursor: "pointer",
+  },
+  fcEditRow: {
+    border: "1px solid var(--border)",
+    borderRadius: 12,
+    padding: 10,
+    marginTop: 8,
+    background: "var(--surface)",
+  },
+  fcEditHead: {
+    display: "flex",
+    alignItems: "center",
+    gap: 6,
+    marginBottom: 6,
+    flexWrap: "wrap",
+  },
+  fcNum: { fontSize: 12, color: "var(--muted)", fontWeight: 700, minWidth: 18 },
+  fcBadge: {
+    fontSize: 11,
+    fontWeight: 700,
+    padding: "2px 7px",
+    borderRadius: 999,
+    background: "var(--accent-soft)",
+    color: "var(--accent)",
+  },
+  fcBadgeYou: { background: "var(--assistant-bubble)", color: "var(--muted)" },
+  fcTopic: { fontSize: 11.5, color: "var(--muted)" },
+  fcIconBtn: {
+    border: "none",
+    background: "transparent",
+    color: "var(--muted)",
+    fontSize: 15,
+    cursor: "pointer",
+    padding: "2px 6px",
+  },
+  fcEditFront: {
+    width: "100%",
+    padding: "8px 10px",
+    borderRadius: 8,
+    border: "1px solid var(--border)",
+    background: "var(--bg)",
+    color: "var(--text)",
+    fontSize: 14,
+    fontWeight: 600,
+    fontFamily: "inherit",
+    resize: "vertical",
+  },
+  fcEditBack: {
+    width: "100%",
+    marginTop: 6,
+    padding: "8px 10px",
+    borderRadius: 8,
+    border: "1px solid var(--border)",
+    background: "var(--bg)",
+    color: "var(--text)",
+    fontSize: 14,
+    fontFamily: "inherit",
+    resize: "vertical",
+  },
+  fcDeckRow: {
+    display: "flex",
+    alignItems: "center",
+    gap: 8,
+    marginTop: 8,
+  },
+  fcDeckOpen: {
+    flex: 1,
+    textAlign: "left",
+    padding: "10px 12px",
+    borderRadius: 10,
+    border: "1px solid var(--border)",
+    background: "var(--surface)",
+    cursor: "pointer",
+  },
+  fcDeckTitle: { fontSize: 14.5, fontWeight: 700, color: "var(--text)" },
+  fcDeckMeta: { fontSize: 12, color: "var(--muted)", marginTop: 2 },
+  fcBar: {
+    height: 6,
+    borderRadius: 999,
+    background: "var(--border)",
+    marginTop: 12,
+    overflow: "hidden",
+  },
+  fcBarFill: { height: "100%", background: "var(--accent)", borderRadius: 999 },
+  fcCount: { fontSize: 12, color: "var(--muted)", marginTop: 6 },
+  fcFace: {
+    display: "block",
+    width: "100%",
+    minHeight: 190,
+    marginTop: 12,
+    padding: "22px 18px",
+    borderRadius: 16,
+    border: "1px solid var(--border)",
+    background: "var(--surface)",
+    cursor: "pointer",
+    textAlign: "center",
+  },
+  fcSide: {
+    fontSize: 11,
+    fontWeight: 700,
+    letterSpacing: 0.6,
+    textTransform: "uppercase",
+    color: "var(--muted)",
+  },
+  fcFaceText: {
+    fontSize: 20,
+    lineHeight: 1.45,
+    fontWeight: 600,
+    color: "var(--text)",
+    margin: "14px 0",
+    whiteSpace: "pre-wrap",
+  },
+  fcHint: { fontSize: 13, color: "var(--muted)", fontStyle: "italic" },
+  fcTapHint: { fontSize: 11.5, color: "var(--muted)", marginTop: 10 },
+  fcScore: {
+    fontSize: 26,
+    fontWeight: 800,
+    color: "var(--accent)",
+    marginTop: 12,
+  },
   // Course from your textbook — the module map.
   courseMatRow: {
     display: "flex",
@@ -34149,6 +37416,105 @@ const styles: Record<string, React.CSSProperties> = {
     lineHeight: 1.5,
     marginBottom: 2,
   },
+  // AI Task Shredder — the step checklist that hangs under any single task.
+  bdWrap: { marginTop: 6 },
+  bdName: {
+    fontSize: 11.5,
+    fontWeight: 700,
+    letterSpacing: 0.3,
+    color: "var(--muted)",
+    marginBottom: 4,
+  },
+  bdHead: { display: "flex", alignItems: "center", gap: 8, marginBottom: 6 },
+  bdBar: {
+    flex: 1,
+    height: 6,
+    borderRadius: 999,
+    background: "var(--border)",
+    overflow: "hidden",
+  },
+  bdBarFill: {
+    height: "100%",
+    borderRadius: 999,
+    background: "var(--accent)",
+    transition: "width .25s ease",
+  },
+  bdCount: {
+    flexShrink: 0,
+    fontSize: 12,
+    fontWeight: 600,
+    color: "var(--muted)",
+  },
+  bdStep: {
+    display: "flex",
+    alignItems: "flex-start",
+    gap: 8,
+    padding: "5px 0",
+  },
+  bdStepTitle: {
+    fontSize: 13.5,
+    color: "var(--assistant-text)",
+    lineHeight: 1.45,
+  },
+  bdStepTitleDone: {
+    fontSize: 13.5,
+    color: "var(--muted)",
+    lineHeight: 1.45,
+    textDecoration: "line-through",
+  },
+  bdDetail: {
+    fontSize: 12.5,
+    color: "var(--muted)",
+    lineHeight: 1.45,
+    marginTop: 2,
+  },
+  bdMore: {
+    background: "none",
+    border: "none",
+    padding: 0,
+    marginTop: 2,
+    fontSize: 12,
+    color: "var(--accent)",
+    cursor: "pointer",
+  },
+  bdMin: {
+    flexShrink: 0,
+    fontSize: 12,
+    fontWeight: 600,
+    color: "var(--muted)",
+    paddingTop: 2,
+    minWidth: 44,
+    textAlign: "right",
+  },
+  bdDate: {
+    flexShrink: 0,
+    border: "none",
+    background: "none",
+    padding: 0,
+    fontSize: 11.5,
+    fontFamily: "inherit",
+    color: "var(--muted)",
+    cursor: "pointer",
+  },
+  bdFirst: {
+    marginTop: 6,
+    padding: "7px 10px",
+    borderRadius: 9,
+    background: "var(--accent-soft)",
+    color: "var(--accent)",
+    fontSize: 13,
+    fontWeight: 600,
+    lineHeight: 1.4,
+  },
+  bdNote: {
+    marginTop: 5,
+    fontSize: 12.5,
+    color: "var(--muted)",
+    lineHeight: 1.45,
+  },
+  bdFoot: { display: "flex", alignItems: "center", gap: 10, marginTop: 4 },
+  bdTotal: { flex: 1, fontSize: 12, fontWeight: 600, color: "var(--muted)" },
+  bdErr: { marginTop: 4, fontSize: 12.5, color: "var(--danger, #e05252)" },
   prioSchedule: {
     marginTop: 14,
     paddingTop: 12,
@@ -34339,6 +37705,108 @@ const styles: Record<string, React.CSSProperties> = {
     lineHeight: 1.45,
     padding: "3px 0",
   },
+  // Rubric grader — the score, the breakdown table, and the draft comparison.
+  rgOutOf: { fontSize: 15, fontWeight: 700, opacity: 0.6 },
+  rgBar: {
+    height: 8,
+    borderRadius: 999,
+    background: "var(--border)",
+    overflow: "hidden",
+    marginTop: 8,
+  },
+  rgBarFill: { height: "100%", borderRadius: 999 },
+  rgBarGood: { background: "#1a7f45" },
+  rgBarOk: { background: "var(--accent)" },
+  rgBarBad: { background: "var(--danger, #e05252)" },
+  // A rubric with long criteria names doesn't fit a phone, so the table scrolls
+  // sideways rather than wrapping into something unreadable.
+  rgTableWrap: { overflowX: "auto", marginTop: 8 },
+  rgTable: {
+    width: "100%",
+    borderCollapse: "collapse",
+    fontSize: 13,
+    minWidth: 420,
+  },
+  rgTh: {
+    textAlign: "left",
+    padding: "6px 8px",
+    fontSize: 11.5,
+    fontWeight: 700,
+    letterSpacing: 0.3,
+    textTransform: "uppercase",
+    color: "var(--muted)",
+    borderBottom: "1px solid var(--border)",
+    whiteSpace: "nowrap",
+  },
+  rgThNum: { textAlign: "right" },
+  rgTd: {
+    padding: "7px 8px",
+    verticalAlign: "top",
+    borderBottom: "1px solid var(--border)",
+    lineHeight: 1.4,
+  },
+  rgTdNum: {
+    textAlign: "right",
+    fontWeight: 700,
+    fontVariantNumeric: "tabular-nums",
+    whiteSpace: "nowrap",
+  },
+  rgCriterion: {
+    fontSize: 13,
+    fontWeight: 600,
+    color: "var(--assistant-text)",
+    lineHeight: 1.35,
+  },
+  rgLevel: { fontSize: 11.5, color: "var(--accent)", fontWeight: 600, marginTop: 2 },
+  // Their own words, quoted back — the proof the mark isn't invented.
+  rgEvidence: {
+    fontSize: 12,
+    color: "var(--assistant-text)",
+    opacity: 0.85,
+    fontStyle: "italic",
+    lineHeight: 1.4,
+    marginTop: 3,
+    paddingLeft: 8,
+    borderLeft: "2px solid var(--border)",
+  },
+  rgToFull: {
+    fontSize: 12,
+    color: "var(--accent)",
+    fontWeight: 600,
+    lineHeight: 1.4,
+    marginTop: 3,
+  },
+  rgTotal: {
+    fontWeight: 800,
+    color: "var(--assistant-text)",
+    borderBottom: "none",
+    fontSize: 13,
+  },
+  rgChangeGroup: { marginTop: 10 },
+  rgChangeHead: {
+    fontSize: 13,
+    fontWeight: 700,
+    color: "var(--assistant-text)",
+    marginBottom: 2,
+  },
+  rgNumUp: { background: "#1a7f45", fontSize: 10.5, width: "auto", padding: "0 6px" },
+  rgNumDown: {
+    background: "var(--danger, #e05252)",
+    fontSize: 10.5,
+    width: "auto",
+    padding: "0 6px",
+  },
+  rgRevHead: { display: "flex", alignItems: "center", gap: 6, flexWrap: "wrap" },
+  // The points an edit buys back is the reason it's ranked where it is, so it
+  // sits on the edit rather than being left for them to infer from the order.
+  rgPointsBack: {
+    fontSize: 11,
+    fontWeight: 800,
+    color: "#1a7f45",
+    background: "var(--good-soft, #dff5e6)",
+    borderRadius: 999,
+    padding: "1px 7px",
+  },
   // Split-by-priority control row above the task list.
   budgetSplit: {
     display: "flex",
@@ -34359,6 +37827,110 @@ const styles: Record<string, React.CSSProperties> = {
     cursor: "pointer",
     background: "var(--accent-soft)",
     color: "var(--accent)",
+  },
+  // ── A task row, Google Tasks style ────────────────────────────────────────
+  // Round tick box on the left, then title / details / chips stacked beside it,
+  // with a hairline between rows and nothing boxing them in.
+  gtRow: {
+    display: "flex",
+    alignItems: "flex-start",
+    gap: 12,
+    padding: "10px 2px",
+    borderBottomWidth: 1,
+    borderBottomStyle: "solid",
+    borderBottomColor: "var(--border)",
+  },
+  gtCheck: {
+    flexShrink: 0,
+    width: 20,
+    height: 20,
+    marginTop: 2,
+    borderRadius: "50%",
+    borderWidth: 2,
+    borderStyle: "solid",
+    borderColor: "var(--muted)",
+    background: "transparent",
+    color: "#fff",
+    fontSize: 12,
+    lineHeight: 1,
+    cursor: "pointer",
+    display: "flex",
+    alignItems: "center",
+    justifyContent: "center",
+  },
+  gtCheckDone: { background: "var(--accent)", borderColor: "var(--accent)" },
+  gtBody: { flex: 1, minWidth: 0 },
+  gtTitleLine: { display: "flex", alignItems: "center", gap: 8 },
+  gtTitle: {
+    flex: 1,
+    minWidth: 0,
+    fontSize: 14.5,
+    lineHeight: 1.45,
+    color: "var(--assistant-text)",
+    cursor: "text",
+  },
+  // Done: the title is struck through. The details line under it is already
+  // grey, so it's left alone — striking that through too reads as deleted.
+  gtTitleDone: { color: "var(--muted)", textDecoration: "line-through" },
+  gtDetail: {
+    fontSize: 13,
+    lineHeight: 1.45,
+    color: "var(--muted)",
+    cursor: "text",
+    marginTop: 1,
+    whiteSpace: "pre-wrap",
+  },
+  // "Add details" placeholder — there, but not asking to be read.
+  gtDetailEmpty: { opacity: 0.45 },
+  gtDetailInput: {
+    width: "100%",
+    marginTop: 2,
+    borderWidth: 1,
+    borderStyle: "solid",
+    borderColor: "var(--accent)",
+    borderRadius: 8,
+    padding: "4px 8px",
+    fontSize: 13,
+    fontFamily: "inherit",
+    lineHeight: 1.45,
+    resize: "vertical",
+    background: "var(--surface)",
+    color: "var(--assistant-text)",
+  },
+  gtChips: {
+    display: "flex",
+    flexWrap: "wrap",
+    alignItems: "center",
+    gap: 6,
+    marginTop: 6,
+  },
+  gtChip: {
+    display: "inline-flex",
+    alignItems: "center",
+    gap: 4,
+    position: "relative",
+    borderWidth: 0,
+    borderRadius: 999,
+    padding: "2px 9px",
+    fontSize: 11.5,
+    fontWeight: 600,
+    fontFamily: "inherit",
+    lineHeight: 1.6,
+    cursor: "pointer",
+    background: "var(--border)",
+    color: "var(--muted)",
+  },
+  gtChipDue: { background: "var(--accent-soft)", color: "var(--accent)" },
+  gtChipOverdue: { background: "#fdecea", color: "#c5221f" },
+  // The real date picker, laid invisibly over its chip so tapping the chip
+  // opens it. A bare date input can't be made to look like one.
+  gtChipInput: {
+    position: "absolute",
+    inset: 0,
+    width: "100%",
+    height: "100%",
+    opacity: 0,
+    cursor: "pointer",
   },
   // Priority badge + title on one line; badge is a tap-to-cycle button.
   taskTitleRow: { display: "flex", alignItems: "center", gap: 8 },
@@ -34395,15 +37967,45 @@ const styles: Record<string, React.CSSProperties> = {
     justifyContent: "center",
   },
   // "Add your own task" row at the foot of the list.
+  taskLaterHead: {
+    fontSize: 12,
+    fontWeight: 700,
+    color: "var(--muted)",
+    textTransform: "uppercase",
+    letterSpacing: 0.3,
+    marginTop: 12,
+    marginBottom: 2,
+  },
   taskAddRow: {
     display: "flex",
-    alignItems: "center",
-    gap: 8,
-    marginTop: 10,
+    alignItems: "flex-start",
+    gap: 12,
+    marginTop: 4,
     paddingTop: 10,
-    borderTopWidth: 1,
-    borderTopStyle: "solid",
-    borderTopColor: "var(--border)",
+  },
+  gtAddPlus: {
+    flexShrink: 0,
+    width: 20,
+    marginTop: 3,
+    textAlign: "center",
+    fontSize: 15,
+    lineHeight: 1.2,
+    color: "var(--accent)",
+  },
+  // A line to type on, not a box — the row shouldn't outweigh the tasks above.
+  gtAddInput: {
+    width: "100%",
+    borderWidth: 0,
+    borderBottomWidth: 1,
+    borderBottomStyle: "solid",
+    borderBottomColor: "var(--border)",
+    borderRadius: 0,
+    padding: "2px 0 4px",
+    fontSize: 14.5,
+    fontFamily: "inherit",
+    background: "transparent",
+    color: "var(--assistant-text)",
+    outline: "none",
   },
   taskAddInput: {
     flex: 1,
@@ -34664,6 +38266,20 @@ const styles: Record<string, React.CSSProperties> = {
     background: "transparent",
     color: "var(--accent)",
     fontSize: 14,
+    fontWeight: 600,
+    cursor: "pointer",
+  },
+  // Both actions under a study method sit as pills on one line — a full-width
+  // button repeated under every method would shout louder than the method does.
+  smPillRow: { display: "flex", flexWrap: "wrap", gap: 6, alignItems: "center" },
+  smRunBtn: {
+    marginTop: 8,
+    padding: "3px 10px",
+    borderRadius: 999,
+    border: "1px solid var(--accent)",
+    background: "transparent",
+    color: "var(--accent)",
+    fontSize: 12.5,
     fontWeight: 600,
     cursor: "pointer",
   },

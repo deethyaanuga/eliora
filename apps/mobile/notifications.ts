@@ -10,9 +10,7 @@ import AsyncStorage from "@react-native-async-storage/async-storage";
 import Constants from "expo-constants";
 import * as Device from "expo-device";
 import * as Notifications from "expo-notifications";
-
-const API_BASE_URL: string =
-  (Constants.expoConfig?.extra?.apiBaseUrl as string) ?? "http://localhost:3000";
+import { API_BASE_URL } from "./api";
 
 export const CHECKIN_ENABLED_KEY = "eliora-checkin-enabled";
 export const CHECKIN_TIME_KEY = "eliora-checkin-time"; // "HH:MM" (24h)

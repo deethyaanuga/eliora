@@ -29,6 +29,8 @@ import { findExamples, saveExample } from "@/lib/examples";
 //   {"type":"text","value":"..."}      incremental reply text
 //   {"type":"status","value":"..."}     what Eliora is doing right now (tool runs)
 //   {"type":"videos","items":[...]}    real YouTube videos to render as cards
+//   {"type":"socials","items":[...]}   short-form study recs (open a platform search)
+//   {"type":"resources","items":[...]} non-video study resources (sites, books, practice)
 //   {"type":"plan","items":[...]}      learning-plan milestones
 //   {"type":"event","item":{...}}      a calendar date
 //   {"type":"flashcards","items":[...]}
@@ -50,6 +52,7 @@ const MAX_HISTORY = 40;
 const TOOL_STATUS: Record<string, string> = {
   search_youtube: "Searching YouTube for real videos…",
   recommend_socials: "Finding creators on TikTok, YouTube & Instagram…",
+  recommend_resources: "Picking out study resources for you…",
   fetch_link: "Reading that link…",
   save_plan: "Updating your plan…",
   add_event: "Adding it to your calendar…",
@@ -131,6 +134,64 @@ const TOOLS: OpenAI.Chat.Completions.ChatCompletionTool[] = [
                 },
               },
               required: ["platform", "query"],
+            },
+          },
+        },
+        required: ["items"],
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "recommend_resources",
+      description:
+        "Recommend study resources for a topic that are NOT video: websites, " +
+        "books/textbooks, practice problem sets, articles, free courses, and " +
+        "tools (e.g. Khan Academy, Desmos, OpenStax, Paul's Online Math Notes, " +
+        "a chapter of the learner's own textbook). Use this when the learner " +
+        "asks what to read/use/practice with, wants something beyond videos, or " +
+        "is stuck and would benefit from a reference. The app shows each one as " +
+        "a card. Return 2–5 items, mixing kinds where it helps. Only fill in " +
+        "'url' when you are certain of a well-known, stable page (usually a " +
+        "site's homepage, e.g. https://www.khanacademy.org) — never guess at a " +
+        "deep link; leave it out and the app makes the card open a web search " +
+        "instead. Favor free and school-appropriate resources.",
+      parameters: {
+        type: "object",
+        properties: {
+          topic: {
+            type: "string",
+            description: "The subject/topic these recommendations are for",
+          },
+          items: {
+            type: "array",
+            items: {
+              type: "object",
+              properties: {
+                title: {
+                  type: "string",
+                  description:
+                    "Name of the resource, e.g. 'Khan Academy: Systems of Equations' " +
+                    "or 'OpenStax College Algebra, Ch. 7'",
+                },
+                kind: {
+                  type: "string",
+                  enum: ["site", "book", "practice", "article", "course", "tool"],
+                },
+                note: {
+                  type: "string",
+                  description:
+                    "One line on what it's good for and how to use it",
+                },
+                url: {
+                  type: "string",
+                  description:
+                    "Optional. Only a well-known, stable http(s) page you are " +
+                    "sure of. Omit rather than guess.",
+                },
+              },
+              required: ["title", "kind"],
             },
           },
         },
@@ -629,6 +690,68 @@ function buildSocialUrl(platform: SocialPlatform, query: string): string {
   }
 }
 
+// Non-video study resources (sites, books, practice sets, articles, courses,
+// tools). The model is told to supply a url ONLY for pages it's sure of, since
+// a made-up deep link is worse than no link — anything missing or malformed
+// becomes a web search for the resource, which always resolves to something.
+type ResourceKind =
+  | "site"
+  | "book"
+  | "practice"
+  | "article"
+  | "course"
+  | "tool";
+type ResourceRec = {
+  kind: ResourceKind;
+  title: string;
+  note?: string;
+  url: string;
+  searched?: boolean; // url is a search, not the resource itself
+};
+
+function safeResourceUrl(raw: unknown): string | null {
+  const value = String(raw ?? "").trim();
+  if (!value) return null;
+  try {
+    const parsed = new URL(value);
+    if (parsed.protocol !== "http:" && parsed.protocol !== "https:") return null;
+    return parsed.toString();
+  } catch {
+    return null;
+  }
+}
+
+// Telling the model "don't guess at deep links" isn't enough — it still returns
+// plausible-looking paths that 404 (a dead link is the worst thing to hand a
+// stuck learner), so we actually check before showing the card. Deliberately
+// conservative: only a definitive 404/410 or a failed request counts as dead,
+// because plenty of sites answer a bot's HEAD with 403 while the page is fine.
+async function resourceUrlIsLive(url: string): Promise<boolean> {
+  const check = async (method: "HEAD" | "GET") => {
+    const ctrl = new AbortController();
+    const timer = setTimeout(() => ctrl.abort(), 5000);
+    try {
+      const res = await fetch(url, {
+        method,
+        redirect: "follow",
+        signal: ctrl.signal,
+        headers: { "user-agent": "Mozilla/5.0 (compatible; Eliora/1.0)" },
+      });
+      return res.status;
+    } finally {
+      clearTimeout(timer);
+    }
+  };
+  try {
+    let status = await check("HEAD");
+    // Some servers don't implement HEAD — re-ask with GET before judging.
+    if (status === 405 || status === 501) status = await check("GET");
+    return status !== 404 && status !== 410;
+  } catch {
+    return false; // DNS failure, timeout, bad host — don't hand it over.
+  }
+}
+
 async function searchYouTube(
   query: string,
 ): Promise<Video[] | { error: string }> {
@@ -894,6 +1017,59 @@ async function runTool(
             note:
               "Give the learner a few concrete things to search for on TikTok, " +
               "YouTube Shorts, or Instagram instead.",
+          },
+    );
+  }
+  if (name === "recommend_resources") {
+    const topic = String(input.topic ?? "").trim();
+    const raw = (input.items as
+      | { title?: string; kind?: string; note?: string; url?: string }[]
+      | undefined) ?? [];
+    const valid = new Set<ResourceKind>([
+      "site",
+      "book",
+      "practice",
+      "article",
+      "course",
+      "tool",
+    ]);
+    const seen = new Set<string>();
+    const items: ResourceRec[] = [];
+    for (const it of raw) {
+      const title = String(it?.title ?? "").trim();
+      const kindRaw = String(it?.kind ?? "").trim() as ResourceKind;
+      if (!title) continue;
+      const kind = valid.has(kindRaw) ? kindRaw : "site";
+      const dedupe = title.toLowerCase();
+      if (seen.has(dedupe)) continue;
+      seen.add(dedupe);
+      items.push({
+        kind,
+        title,
+        note: it?.note ? String(it.note).trim() : undefined,
+        url: safeResourceUrl(it?.url) ?? "",
+      });
+    }
+    // Check the supplied links together rather than one at a time, then swap
+    // any dead one for a search so every card still leads somewhere useful.
+    await Promise.all(
+      items.map(async (item) => {
+        if (item.url && (await resourceUrlIsLive(item.url))) return;
+        item.url = `https://www.google.com/search?q=${encodeURIComponent(
+          topic ? `${item.title} ${topic}` : item.title,
+        )}`;
+        item.searched = true;
+      }),
+    );
+    if (items.length) send({ type: "resources", items });
+    return JSON.stringify(
+      items.length
+        ? { recommendations: items }
+        : {
+            error: "no_recommendations",
+            note:
+              "Name a couple of trusted study resources for the topic in your " +
+              "reply instead.",
           },
     );
   }

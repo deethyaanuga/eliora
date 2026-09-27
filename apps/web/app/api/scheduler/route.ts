@@ -99,6 +99,11 @@ const planTool = (
                 description:
                   "True for real commitments they told you about — these never move.",
               },
+              pomodoroMin: {
+                type: "integer",
+                description:
+                  "Study blocks only: work-interval length in minutes for a Pomodoro-style sprint inside this block (e.g. 25). Omit unless the learner wants Pomodoro pacing.",
+              },
             },
             required: ["day", "start", "min", "title", "kind"],
           },
@@ -131,6 +136,11 @@ const planTool = (
               },
               detail: { type: "string" },
               fixed: { type: "boolean" },
+              pomodoroMin: {
+                type: "integer",
+                description:
+                  "Study blocks only: work-interval length in minutes for a Pomodoro-style sprint (e.g. 25).",
+              },
             },
             required: ["action"],
           },
@@ -182,6 +192,13 @@ function normalize(raw: Record<string, unknown>, id: string): ScheduleBlock | nu
     ? (raw.kind as ScheduleBlockKind)
     : "other";
 
+  const pomodoroMin =
+    kind === "study" &&
+    typeof raw?.pomodoroMin === "number" &&
+    raw.pomodoroMin > 0
+      ? Math.min(Math.max(5, Math.round(raw.pomodoroMin / 5) * 5), min)
+      : undefined;
+
   return {
     id,
     day,
@@ -197,6 +214,7 @@ function normalize(raw: Record<string, unknown>, id: string): ScheduleBlock | nu
       raw?.fixed === true && (kind === "activity" || kind === "class")
         ? true
         : undefined,
+    pomodoroMin,
   };
 }
 
@@ -233,6 +251,7 @@ function pick(e: Record<string, unknown>): Record<string, unknown> {
     if (str(e?.[k])) out[k] = e[k];
   if (typeof e?.min === "number") out.min = e.min;
   if (typeof e?.fixed === "boolean") out.fixed = e.fixed;
+  if (typeof e?.pomodoroMin === "number") out.pomodoroMin = e.pomodoroMin;
   return out;
 }
 
@@ -293,7 +312,7 @@ function describe(schedule: WeekSchedule): string {
         (b) =>
           `  id=${b.id} | ${day} ${b.start} | ${b.min}min | ${b.kind}${
             b.fixed ? " (fixed)" : ""
-          } | ${b.title}${b.detail ? ` — ${b.detail}` : ""}`,
+          }${b.pomodoroMin ? ` (${b.pomodoroMin}min pomodoro)` : ""} | ${b.title}${b.detail ? ` — ${b.detail}` : ""}`,
       );
     return rows.length ? `${day.toUpperCase()}\n${rows.join("\n")}` : `${day.toUpperCase()}\n  (free)`;
   });

@@ -19,11 +19,11 @@ import {
 } from "react-native";
 import { fetch as expoFetch } from "expo/fetch";
 import { StatusBar } from "expo-status-bar";
-import Constants from "expo-constants";
 import AsyncStorage from "@react-native-async-storage/async-storage";
 import * as DocumentPicker from "expo-document-picker";
 import * as FileSystem from "expo-file-system";
 import * as Speech from "expo-speech";
+import { API_BASE_URL } from "./api";
 import {
   CHECK_IN_CHAT_PROMPT,
   DEFAULT_CHECKIN_TIME,
@@ -51,9 +51,62 @@ const SOCIAL_META: Record<
   tiktok: { label: "TikTok", emoji: "🎵", color: "#111111" },
   instagram: { label: "Instagram", emoji: "📸", color: "#c13584" },
 };
+// Non-video study resources Eliora recommends (sites, books, practice sets…).
+// `searched` marks a card whose url is a web search rather than the resource
+// itself — the chat route builds one whenever the model had no URL it was sure
+// of, so we label the card honestly instead of promising the real page.
+type ResourceKind = "site" | "book" | "practice" | "article" | "course" | "tool";
+type ResourceRec = {
+  kind: ResourceKind;
+  title: string;
+  note?: string;
+  url: string;
+  searched?: boolean;
+};
+const RESOURCE_META: Record<
+  ResourceKind,
+  { label: string; emoji: string; color: string }
+> = {
+  site: { label: "Website", emoji: "🌐", color: "#2f6fd0" },
+  book: { label: "Book", emoji: "📕", color: "#b0472f" },
+  practice: { label: "Practice", emoji: "📝", color: "#1f8a5f" },
+  article: { label: "Article", emoji: "📄", color: "#5a5f6b" },
+  course: { label: "Course", emoji: "🎓", color: "#7b4bd0" },
+  tool: { label: "Tool", emoji: "🧰", color: "#c07a1f" },
+};
 // A flashcard's learning format (mirrors FlashcardStyle in @eliora/shared).
 type FlashcardStyle = "basic" | "reversed" | "qa" | "cloze" | "example";
-type Flashcard = { front: string; back: string; style?: FlashcardStyle };
+type Flashcard = {
+  front: string;
+  back: string;
+  style?: FlashcardStyle;
+  hint?: string;
+  topic?: string;
+};
+// A card once it lives in a saved deck (mirrors DeckCard in @eliora/shared):
+// it has an identity, and we know who wrote it. Eliora only DRAFTS a deck —
+// the learner is expected to correct it, so an AI card they've fixed stops
+// counting as hers.
+type DeckCard = Flashcard & {
+  id: string;
+  source: "ai" | "you";
+  edited?: boolean;
+  starred?: boolean;
+};
+// A saved deck (mirrors FlashcardDeck in @eliora/shared). Named apart from the
+// <FlashcardDeck> viewer component below.
+type SavedDeck = {
+  id: string;
+  title: string;
+  cards: DeckCard[];
+  createdAt: number;
+  updatedAt: number;
+  style?: FlashcardStyle;
+  difficulty?: QuizDifficulty;
+  fromMaterial?: string;
+  known?: string[];
+  learning?: string[];
+};
 // UI labels per style: what to call each side of the card, plus a picker label.
 const FLASHCARD_STYLES: {
   key: FlashcardStyle;
@@ -83,6 +136,7 @@ type Message = {
   content: string;
   videos?: Video[];
   socials?: SocialRec[];
+  resources?: ResourceRec[];
   flashcards?: Flashcard[];
   quiz?: QuizQuestion[];
 };
@@ -146,6 +200,15 @@ type EventKind =
   | "project"
   | "other";
 type StudyEvent = { id: string; title: string; date: string; kind?: EventKind };
+// One step of an assignment's "break it down" checklist (mirrors TaskStep in
+// @eliora/shared — mobile doesn't bundle the shared package, so it keeps a copy).
+type TaskStep = {
+  title: string;
+  estMin: number;
+  detail?: string;
+  done: boolean;
+  due?: string;
+};
 type Assignment = {
   id: string;
   title: string;
@@ -153,10 +216,19 @@ type Assignment = {
   due?: string;
   concern?: string; // what the learner is worried about / stuck on
   done: boolean;
+  steps?: TaskStep[]; // "Break it down" checklist — the steps this actually takes
 };
 // A SMART goal the learner sets (Specific, Measurable, Achievable, Relevant,
 // Time-bound). Only `specific` is required; `target`/`current` drive a progress bar.
-type GoalTask = { title: string; done: boolean };
+// `due` is the day the step is meant to happen (YYYY-MM-DD, set on the web
+// side); `detail` is the notes line under it. Both are kept here so a goal that
+// round-trips through the phone doesn't come back stripped of them.
+type GoalTask = {
+  title: string;
+  done: boolean;
+  due?: string;
+  detail?: string;
+};
 type SmartGoal = {
   id: string;
   specific: string;
@@ -172,9 +244,6 @@ type SmartGoal = {
   done: boolean;
 };
 
-const API_BASE_URL: string =
-  (Constants.expoConfig?.extra?.apiBaseUrl as string) ?? "http://localhost:3000";
-
 const STORAGE_KEY = "eliora-chat"; // legacy single conversation (migrated)
 const CHATS_KEY = "eliora-chats";
 const ACTIVE_KEY = "eliora-active-chat";
@@ -189,6 +258,7 @@ const GOALS_KEY = "eliora-goals";
 const REM_DISMISSED_KEY = "eliora-rem-dismissed";
 const SCHEDULE_KEY = "eliora-schedule"; // today's day plan (reset each new day)
 const HOMETIME_KEY = "eliora-hometime"; // hour (24h) the learner gets home
+const DECKS_KEY = "eliora-decks"; // saved flashcard decks
 
 // Multiple-choice answers for the sign-up survey questions.
 const STUDY_HABIT_OPTIONS = [
@@ -388,6 +458,35 @@ function todayISO(): string {
   const p = (n: number) => n.toString().padStart(2, "0");
   return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}`;
 }
+// Give an ordered list of steps a day each, spread evenly over the run-up to a
+// deadline (mirrors paceStepDates in the web app). Undefined for every step
+// when there's no deadline to work back from, or it's already passed.
+function paceStepDates(
+  count: number,
+  targetISO?: string,
+): (string | undefined)[] {
+  const out: (string | undefined)[] = Array.from({ length: count });
+  const today = todayISO();
+  if (!count || !targetISO || !/^\d{4}-\d{2}-\d{2}$/.test(targetISO))
+    return out;
+  if (targetISO <= today) return out;
+  const dayOf = (iso: string) => new Date(`${iso}T00:00:00`);
+  const isoOf = (d: Date) => {
+    const p = (n: number) => n.toString().padStart(2, "0");
+    return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}`;
+  };
+  const span = Math.round(
+    (dayOf(targetISO).getTime() - dayOf(today).getTime()) / 86_400_000,
+  );
+  const last = span > count ? span - 1 : span;
+  for (let i = 0; i < count; i++) {
+    const offset = Math.max(1, Math.round(((i + 1) * last) / count));
+    const d = dayOf(today);
+    d.setDate(d.getDate() + offset);
+    out[i] = isoOf(d);
+  }
+  return out;
+}
 // "9:00 AM", "1:00 PM" … for an hour in 24h form.
 function hourLabel(h: number): string {
   const period = h < 12 ? "AM" : "PM";
@@ -432,6 +531,78 @@ function renderContent(text: string) {
   }
   if (last < text.length) nodes.push(text.slice(last));
   return nodes;
+}
+
+// Eliora writes in markdown — headings, bullets, numbered steps, **bold**. Run
+// through renderContent alone those come out as literal #s and asterisks, so
+// lay the lines out as real blocks instead. Same subset the web app renders.
+function renderMessageBody(text: string) {
+  const blocks: React.ReactNode[] = [];
+  text.split("\n").forEach((raw, i) => {
+    const line = raw.replace(/\s+$/, "");
+    if (!line.trim()) {
+      // Skip a leading blank so the bubble doesn't open with dead space.
+      if (blocks.length) blocks.push(<View key={i} style={{ height: 6 }} />);
+      return;
+    }
+    let m: RegExpMatchArray | null;
+    if ((m = line.match(/^(#{1,6})\s+(.*)$/))) {
+      blocks.push(
+        <Text
+          key={i}
+          style={[
+            m[1].length <= 2 ? styles.mdH2 : styles.mdH3,
+            blocks.length === 0 && { marginTop: 0 },
+          ]}
+        >
+          {renderInlineBold(m[2])}
+        </Text>,
+      );
+    } else if ((m = line.match(/^(\s*)([-*]|\d+\.)\s+(.*)$/))) {
+      const mark = m[2] === "-" || m[2] === "*" ? "•" : m[2];
+      blocks.push(
+        <View
+          key={i}
+          style={[styles.mdBullet, { marginLeft: Math.min(m[1].length, 6) * 4 }]}
+        >
+          <Text style={styles.mdBulletMark}>{mark}</Text>
+          <Text style={[styles.assistantText, { flex: 1 }]}>
+            {renderInlineBold(m[3])}
+          </Text>
+        </View>,
+      );
+    } else {
+      blocks.push(
+        <Text key={i} style={[styles.assistantText, styles.mdP]}>
+          {renderInlineBold(line)}
+        </Text>,
+      );
+    }
+  });
+  return <View>{blocks}</View>;
+}
+
+// **bold** and ==highlight== inside one line, with links still tappable.
+function renderInlineBold(text: string) {
+  const out: React.ReactNode[] = [];
+  text.split(/(\*\*[^*]+\*\*|==[^=]+==)/g).forEach((part, i) => {
+    if (!part) return;
+    let m: RegExpMatchArray | null;
+    if ((m = part.match(/^\*\*([^*]+)\*\*$/)))
+      out.push(
+        <Text key={i} style={styles.mdBold}>
+          {renderContent(m[1])}
+        </Text>,
+      );
+    else if ((m = part.match(/^==([^=]+)==$/)))
+      out.push(
+        <Text key={i} style={styles.mdMark}>
+          {renderContent(m[1])}
+        </Text>,
+      );
+    else out.push(<Text key={i}>{renderContent(part)}</Text>);
+  });
+  return out;
 }
 
 function VideoCards({ videos }: { videos: Video[] }) {
@@ -490,6 +661,48 @@ function SocialCards({ socials }: { socials: SocialRec[] }) {
               </Text>
             )}
             <Text style={styles.socialOpen}>Open on {meta.label} →</Text>
+          </TouchableOpacity>
+        );
+      })}
+    </View>
+  );
+}
+
+// Study resources that aren't video — sites, books, practice sets, articles.
+// Rendered from the chat stream's {type:"resources"} event.
+function ResourceCards({ resources }: { resources: ResourceRec[] }) {
+  return (
+    <View style={styles.resourceWrap}>
+      <Text style={styles.resourceHeader}>📚 Resources for this</Text>
+      {resources.map((r, i) => {
+        const meta = RESOURCE_META[r.kind] ?? RESOURCE_META.site;
+        return (
+          <TouchableOpacity
+            key={`${r.kind}-${i}`}
+            style={styles.resourceCard}
+            onPress={() => Linking.openURL(r.url)}
+            accessibilityLabel={`Open ${meta.label}: ${r.title}`}
+          >
+            <View style={styles.resourceTopRow}>
+              <View
+                style={[styles.resourceBadge, { backgroundColor: meta.color }]}
+              >
+                <Text style={styles.resourceBadgeText}>
+                  {meta.emoji} {meta.label}
+                </Text>
+              </View>
+              <Text style={styles.resourceTitle} numberOfLines={2}>
+                {r.title}
+              </Text>
+            </View>
+            {!!r.note && (
+              <Text style={styles.resourceNote} numberOfLines={3}>
+                {r.note}
+              </Text>
+            )}
+            <Text style={styles.resourceOpen}>
+              {r.searched ? "Search for it →" : "Open →"}
+            </Text>
           </TouchableOpacity>
         );
       })}
@@ -585,6 +798,152 @@ function ConcernField({
   );
 }
 
+// The day as it reads on a step's date chip — "Today"/"Tomorrow" rather than
+// making you work out what the 24th is. Matches the web side.
+function chipDay(iso: string, today: string) {
+  if (iso === today) return "Today";
+  const d = new Date(`${iso}T00:00:00`);
+  const t = new Date(`${today}T00:00:00`);
+  const days = Math.round((d.getTime() - t.getTime()) / 86400000);
+  if (days === 1) return "Tomorrow";
+  if (days === -1) return "Yesterday";
+  return d.toLocaleDateString(undefined, {
+    month: "short",
+    day: "numeric",
+    ...(d.getFullYear() === t.getFullYear() ? {} : { year: "numeric" }),
+  });
+}
+
+// One step in a goal's checklist, drawn the way Google Tasks draws a task:
+// round tick box, title, grey details line, then the day as a chip. The day
+// itself is set on the web side — there's no native date picker in this app —
+// so here it's shown, not edited.
+function ChecklistRow({
+  task,
+  onToggle,
+  onSetDetail,
+  onHelp,
+}: {
+  task: GoalTask;
+  onToggle: () => void;
+  onSetDetail: (detail: string) => void;
+  onHelp: () => void;
+}) {
+  const today = todayISO();
+  const [draft, setDraft] = useState(task.detail ?? "");
+  const [editing, setEditing] = useState(false);
+  useEffect(() => {
+    if (!editing) setDraft(task.detail ?? "");
+  }, [task.detail, editing]);
+  const overdue = !task.done && !!task.due && task.due < today;
+  return (
+    <View style={styles.gtRow}>
+      <TouchableOpacity
+        style={[styles.gtCheck, task.done && styles.gtCheckDone]}
+        onPress={onToggle}
+        accessibilityRole="checkbox"
+        accessibilityState={{ checked: task.done }}
+      >
+        {task.done && <Text style={styles.gtCheckMark}>✓</Text>}
+      </TouchableOpacity>
+      <View style={styles.gtBody}>
+        <View style={styles.gtTitleLine}>
+          <Text style={[styles.gtTitle, task.done && styles.gtTitleDone]}>
+            {task.title}
+          </Text>
+          {!task.done && (
+            <TouchableOpacity style={styles.goalTaskHelp} onPress={onHelp}>
+              <Text style={styles.goalTaskHelpText}>Help</Text>
+            </TouchableOpacity>
+          )}
+        </View>
+        {editing || task.detail ? (
+          <TextInput
+            style={styles.gtDetailInput}
+            value={draft}
+            onChangeText={setDraft}
+            onFocus={() => setEditing(true)}
+            onBlur={() => {
+              setEditing(false);
+              if (draft.trim() !== (task.detail ?? "")) onSetDetail(draft);
+            }}
+            placeholder="Details"
+            placeholderTextColor="#9b93b3"
+            multiline
+          />
+        ) : (
+          <TouchableOpacity onPress={() => setEditing(true)}>
+            <Text style={[styles.gtDetail, styles.gtDetailEmpty]}>
+              Add details
+            </Text>
+          </TouchableOpacity>
+        )}
+        {!!task.due && (
+          <View style={styles.gtChips}>
+            <View style={[styles.gtChip, overdue && styles.gtChipOverdue]}>
+              <Text
+                style={[styles.gtChipText, overdue && styles.gtChipTextOverdue]}
+              >
+                ▤ {chipDay(task.due, today)}
+              </Text>
+            </View>
+          </View>
+        )}
+      </View>
+    </View>
+  );
+}
+
+// One row of an assignment's "break it down" checklist.
+function StepRow({ step, onToggle }: { step: TaskStep; onToggle: () => void }) {
+  const today = todayISO();
+  const [showDetail, setShowDetail] = useState(false);
+  const overdue = !step.done && !!step.due && step.due < today;
+  const fmtMin = (m: number) =>
+    m >= 60 ? `${Math.round((m / 60) * 10) / 10} hr` : `${m} min`;
+  return (
+    <View style={styles.gtRow}>
+      <TouchableOpacity
+        style={[styles.gtCheck, step.done && styles.gtCheckDone]}
+        onPress={onToggle}
+        accessibilityRole="checkbox"
+        accessibilityState={{ checked: step.done }}
+      >
+        {step.done && <Text style={styles.gtCheckMark}>✓</Text>}
+      </TouchableOpacity>
+      <View style={styles.gtBody}>
+        <View style={styles.gtTitleLine}>
+          <Text style={[styles.gtTitle, step.done && styles.gtTitleDone]}>
+            {step.title}
+          </Text>
+          <Text style={styles.stepMin}>{fmtMin(step.estMin)}</Text>
+        </View>
+        {step.detail &&
+          (showDetail ? (
+            <Text style={styles.gtDetail}>{step.detail}</Text>
+          ) : (
+            <TouchableOpacity onPress={() => setShowDetail(true)}>
+              <Text style={[styles.gtDetail, styles.gtDetailEmpty]}>
+                what this means
+              </Text>
+            </TouchableOpacity>
+          ))}
+        {!!step.due && (
+          <View style={styles.gtChips}>
+            <View style={[styles.gtChip, overdue && styles.gtChipOverdue]}>
+              <Text
+                style={[styles.gtChipText, overdue && styles.gtChipTextOverdue]}
+              >
+                ▤ {chipDay(step.due, today)}
+              </Text>
+            </View>
+          </View>
+        )}
+      </View>
+    </View>
+  );
+}
+
 function AssignmentsPanel({
   assignments,
   subjects,
@@ -592,6 +951,10 @@ function AssignmentsPanel({
   onToggle,
   onSetConcern,
   onRemove,
+  onBreakDown,
+  onToggleStep,
+  onClearSteps,
+  breakingAssignmentId,
 }: {
   assignments: Assignment[];
   subjects: string[];
@@ -599,6 +962,10 @@ function AssignmentsPanel({
   onToggle: (id: string) => void;
   onSetConcern: (id: string, concern: string) => void;
   onRemove: (id: string) => void;
+  onBreakDown: (a: Assignment) => void;
+  onToggleStep: (id: string, index: number) => void;
+  onClearSteps: (id: string) => void;
+  breakingAssignmentId: string | null;
 }) {
   const [title, setTitle] = useState("");
   const [subject, setSubject] = useState("");
@@ -698,6 +1065,43 @@ function AssignmentsPanel({
                   value={a.concern}
                   onCommit={(c) => onSetConcern(a.id, c)}
                 />
+              )}
+              {a.steps && a.steps.length > 0 && (
+                <View style={styles.goalTasks}>
+                  <Text style={styles.goalTasksHead}>
+                    STEPS · {a.steps.filter((s) => s.done).length}/
+                    {a.steps.length}
+                  </Text>
+                  {a.steps.map((s, i) => (
+                    <StepRow
+                      key={i}
+                      step={s}
+                      onToggle={() => onToggleStep(a.id, i)}
+                    />
+                  ))}
+                </View>
+              )}
+              {!a.done && (
+                <View style={styles.goalBreakRow}>
+                  <TouchableOpacity
+                    style={[styles.goalBreakBtn, { marginTop: 0, marginLeft: 0 }]}
+                    onPress={() => onBreakDown(a)}
+                    disabled={breakingAssignmentId === a.id}
+                  >
+                    <Text style={styles.goalBreakBtnText}>
+                      {breakingAssignmentId === a.id
+                        ? "Breaking it down…"
+                        : a.steps && a.steps.length
+                          ? "↻ Redo steps"
+                          : "✂️ Break it down"}
+                    </Text>
+                  </TouchableOpacity>
+                  {a.steps && a.steps.length > 0 && (
+                    <TouchableOpacity onPress={() => onClearSteps(a.id)}>
+                      <Text style={styles.goalBreakClear}>Clear</Text>
+                    </TouchableOpacity>
+                  )}
+                </View>
               )}
             </View>
             <TouchableOpacity onPress={() => onRemove(a.id)}>
@@ -863,6 +1267,7 @@ function GoalsPanel({
   onRemove,
   onBreakDown,
   onToggleTask,
+  onSetTaskDetail,
   onHelpTask,
   breakingGoalId,
 }: {
@@ -874,6 +1279,7 @@ function GoalsPanel({
   onRemove: (id: string) => void;
   onBreakDown: (g: SmartGoal) => void;
   onToggleTask: (goalId: string, index: number) => void;
+  onSetTaskDetail: (goalId: string, index: number, detail: string) => void;
   onHelpTask: (goal: SmartGoal, taskTitle: string) => void;
   breakingGoalId: string | null;
 }) {
@@ -972,34 +1378,13 @@ function GoalsPanel({
                   {g.tasks.length}
                 </Text>
                 {g.tasks.map((t, i) => (
-                  <View key={i} style={styles.goalTaskRow}>
-                    <TouchableOpacity
-                      style={styles.goalTaskToggle}
-                      onPress={() => onToggleTask(g.id, i)}
-                    >
-                      <View
-                        style={[styles.checkbox, t.done && styles.checkboxOn]}
-                      >
-                        {t.done && <Text style={styles.checkmark}>✓</Text>}
-                      </View>
-                      <Text
-                        style={[
-                          styles.goalTaskText,
-                          t.done && styles.assignTitleDone,
-                        ]}
-                      >
-                        {t.title}
-                      </Text>
-                    </TouchableOpacity>
-                    {!t.done && (
-                      <TouchableOpacity
-                        style={styles.goalTaskHelp}
-                        onPress={() => onHelpTask(g, t.title)}
-                      >
-                        <Text style={styles.goalTaskHelpText}>Help</Text>
-                      </TouchableOpacity>
-                    )}
-                  </View>
+                  <ChecklistRow
+                    key={i}
+                    task={t}
+                    onToggle={() => onToggleTask(g.id, i)}
+                    onSetDetail={(d) => onSetTaskDetail(g.id, i, d)}
+                    onHelp={() => onHelpTask(g, t.title)}
+                  />
                 ))}
               </View>
             )}
@@ -4107,6 +4492,665 @@ const QUIZ_DIFFICULTIES: { key: QuizDifficulty; label: string }[] = [
   { key: "college", label: "College" },
 ];
 
+// ---------------------------------------------------------------------------
+// Flashcards — the Quizlet-shaped study tool. Mirrors the web app's studio.
+//
+// Three screens in one: the deck shelf, the editor, and the study round. The
+// editor is the point — Eliora drafts, the learner corrects, and the deck is
+// honest about which side wrote each card.
+//
+// Decks persist in AsyncStorage, same local-first approach as the plan.
+// ---------------------------------------------------------------------------
+
+function newCardId(): string {
+  return `c${Date.now().toString(36)}${Math.random().toString(36).slice(2, 6)}`;
+}
+
+function FlashcardsScreen({
+  profile,
+  subjects,
+  missed,
+  onMissed,
+}: {
+  profile: LearnerProfile | null;
+  subjects: string[];
+  missed: string[];
+  onMissed: (topic: string) => void;
+}) {
+  const [decks, setDecks] = useState<SavedDeck[]>([]);
+  const [loaded, setLoaded] = useState(false);
+  const [openId, setOpenId] = useState<string | null>(null);
+  const [studying, setStudying] = useState(false);
+
+  const [topic, setTopic] = useState("");
+  const [text, setText] = useState("");
+  const [style, setStyle] = useState<FlashcardStyle | undefined>(undefined);
+  const [difficulty, setDifficulty] = useState<QuizDifficulty>("high");
+  const [count, setCount] = useState(12);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  useEffect(() => {
+    (async () => {
+      try {
+        const raw = await AsyncStorage.getItem(DECKS_KEY);
+        const saved = raw ? (JSON.parse(raw) as SavedDeck[]) : null;
+        if (Array.isArray(saved)) setDecks(saved);
+      } catch {
+        /* ignore corrupt storage */
+      }
+      setLoaded(true);
+    })();
+  }, []);
+
+  useEffect(() => {
+    if (!loaded) return;
+    AsyncStorage.setItem(DECKS_KEY, JSON.stringify(decks)).catch(() => {});
+  }, [decks, loaded]);
+
+  const deck = decks.find((d) => d.id === openId) ?? null;
+
+  function patchDeck(id: string, fn: (d: SavedDeck) => SavedDeck) {
+    setDecks((prev) =>
+      prev.map((d) => (d.id === id ? { ...fn(d), updatedAt: Date.now() } : d)),
+    );
+  }
+
+  const suggestions = Array.from(
+    new Set([...subjects, ...missed].map((s) => s.trim()).filter(Boolean)),
+  ).slice(0, 8);
+
+  // Draft a deck, or (when `into` is given) draft more cards onto an open one.
+  async function generate(into?: SavedDeck) {
+    if (busy) return;
+    const cleanTopic = topic.trim();
+    const cleanText = text.trim();
+    if (!into && !cleanTopic && !cleanText) return;
+    setBusy(true);
+    setError(null);
+    try {
+      const body: Record<string, unknown> = {
+        count,
+        style,
+        difficulty,
+        focus: missed.slice(0, 8),
+        profile: profile ?? undefined,
+      };
+      if (into) {
+        // "More like these": keep the deck's framing, and tell her what's
+        // already in it so she doesn't hand back the same cards reworded.
+        body.topic = into.title;
+        body.style = into.style ?? style;
+        body.difficulty = into.difficulty ?? difficulty;
+        body.existing = into.cards.map((c) => c.front);
+      } else {
+        if (cleanTopic) body.topic = cleanTopic;
+        if (cleanText) body.material = cleanText;
+      }
+
+      const res = await expoFetch(`${API_BASE_URL}/api/flashcards`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+      });
+      const data = await res.json();
+      if (data.error || !Array.isArray(data.cards) || !data.cards.length) {
+        setError(data.error || "I couldn't make cards from that. Try again.");
+        return;
+      }
+      const cards = data.cards as DeckCard[];
+
+      if (into) {
+        patchDeck(into.id, (d) => ({ ...d, cards: [...d.cards, ...cards] }));
+        return;
+      }
+      const now = Date.now();
+      const fresh: SavedDeck = {
+        id: `d${now.toString(36)}`,
+        title: cleanTopic || "Untitled deck",
+        cards,
+        createdAt: now,
+        updatedAt: now,
+        style,
+        difficulty,
+        fromMaterial: cleanText ? "pasted notes" : undefined,
+      };
+      setDecks((prev) => [fresh, ...prev]);
+      setOpenId(fresh.id);
+      setTopic("");
+      setText("");
+    } catch {
+      setError("Something went wrong. Please try again.");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  // --- Study round ---------------------------------------------------------
+  if (deck && studying) {
+    return (
+      <StudyRound
+        deck={deck}
+        onExit={() => setStudying(false)}
+        onMissed={onMissed}
+        onFinish={(known, learning) =>
+          patchDeck(deck.id, (d) => ({ ...d, known, learning }))
+        }
+      />
+    );
+  }
+
+  // --- Deck editor ---------------------------------------------------------
+  if (deck) {
+    const aiCount = deck.cards.filter((c) => c.source === "ai" && !c.edited).length;
+    return (
+      <View style={styles.card}>
+        <View style={styles.cardHead}>
+          <Text style={styles.cardClass}>🃏 Flashcards</Text>
+          <Text style={styles.linkBtn} onPress={() => setOpenId(null)}>
+            All decks
+          </Text>
+        </View>
+
+        <TextInput
+          style={[styles.assignInput, { marginTop: 10, fontWeight: "700" }]}
+          value={deck.title}
+          placeholder="Deck name"
+          placeholderTextColor="#9aa39c"
+          onChangeText={(v) => patchDeck(deck.id, (d) => ({ ...d, title: v }))}
+        />
+
+        <Text style={styles.fcNote}>
+          {aiCount > 0
+            ? "Eliora drafted these — read them before you drill them. Fix anything she got wrong and it stops counting as hers."
+            : "Your deck, your wording. Edit any card, or add your own."}
+        </Text>
+
+        <View style={styles.fcActions}>
+          <TouchableOpacity
+            style={[styles.fcBtn, !deck.cards.length && styles.primaryBtnDisabled]}
+            disabled={!deck.cards.length}
+            onPress={() => setStudying(true)}
+          >
+            <Text style={styles.fcBtnText}>
+              ▶️ Study {deck.cards.length} card{deck.cards.length === 1 ? "" : "s"}
+            </Text>
+          </TouchableOpacity>
+          <TouchableOpacity
+            style={styles.fcBtnGhost}
+            onPress={() =>
+              patchDeck(deck.id, (d) => ({
+                ...d,
+                cards: [
+                  ...d.cards,
+                  { id: newCardId(), front: "", back: "", source: "you" },
+                ],
+              }))
+            }
+          >
+            <Text style={styles.fcBtnGhostText}>＋ Add a card</Text>
+          </TouchableOpacity>
+          <TouchableOpacity
+            style={[styles.fcBtnGhost, busy && styles.primaryBtnDisabled]}
+            disabled={busy}
+            onPress={() => generate(deck)}
+          >
+            <Text style={styles.fcBtnGhostText}>
+              {busy ? "Writing…" : "✦ More like these"}
+            </Text>
+          </TouchableOpacity>
+        </View>
+        {!!error && (
+          <Text style={[styles.resultText, { color: "#c0392b", marginTop: 8 }]}>
+            {error}
+          </Text>
+        )}
+
+        {deck.cards.map((c, i) => (
+          <View key={c.id} style={styles.fcEditRow}>
+            <View style={styles.fcEditHead}>
+              <Text style={styles.fcNum}>{i + 1}</Text>
+              <Text
+                style={[
+                  styles.fcBadge,
+                  (c.source === "you" || c.edited) && styles.fcBadgeYou,
+                ]}
+              >
+                {c.source === "you" ? "✍️ You" : c.edited ? "✦ Edited" : "✦ AI"}
+              </Text>
+              {!!c.topic && <Text style={styles.fcTopic}>{c.topic}</Text>}
+              <View style={{ flex: 1 }} />
+              <Text
+                style={styles.fcIconBtn}
+                onPress={() =>
+                  patchDeck(deck.id, (d) => ({
+                    ...d,
+                    cards: d.cards.map((x) =>
+                      x.id === c.id ? { ...x, starred: !x.starred } : x,
+                    ),
+                  }))
+                }
+              >
+                {c.starred ? "★" : "☆"}
+              </Text>
+              <Text
+                style={styles.fcIconBtn}
+                onPress={() =>
+                  patchDeck(deck.id, (d) => ({
+                    ...d,
+                    cards: d.cards.filter((x) => x.id !== c.id),
+                  }))
+                }
+              >
+                ✕
+              </Text>
+            </View>
+            <TextInput
+              style={styles.fcEditFront}
+              value={c.front}
+              multiline
+              placeholder="Front — the term or question"
+              placeholderTextColor="#9aa39c"
+              onChangeText={(v) =>
+                patchDeck(deck.id, (d) => ({
+                  ...d,
+                  cards: d.cards.map((x) =>
+                    x.id === c.id
+                      ? { ...x, front: v, edited: x.source === "ai" }
+                      : x,
+                  ),
+                }))
+              }
+            />
+            <TextInput
+              style={styles.fcEditBack}
+              value={c.back}
+              multiline
+              placeholder="Back — the definition or answer"
+              placeholderTextColor="#9aa39c"
+              onChangeText={(v) =>
+                patchDeck(deck.id, (d) => ({
+                  ...d,
+                  cards: d.cards.map((x) =>
+                    x.id === c.id
+                      ? { ...x, back: v, edited: x.source === "ai" }
+                      : x,
+                  ),
+                }))
+              }
+            />
+          </View>
+        ))}
+        {!deck.cards.length && (
+          <Text style={styles.assignEmpty}>
+            This deck is empty. Add a card, or ask Eliora for more.
+          </Text>
+        )}
+      </View>
+    );
+  }
+
+  // --- Deck shelf + draft form --------------------------------------------
+  return (
+    <View style={styles.card}>
+      <View style={styles.cardHead}>
+        <Text style={styles.cardClass}>🃏 Flashcards</Text>
+      </View>
+      <Text style={styles.assignEmpty}>
+        Name a topic or paste your own notes — Eliora drafts the deck, you clean
+        it up, then you flip through it.
+      </Text>
+
+      <View style={styles.assignAddRow}>
+        <TextInput
+          style={styles.assignInput}
+          value={topic}
+          placeholder="Cards on… (e.g. cell organelles)"
+          placeholderTextColor="#9aa39c"
+          onChangeText={setTopic}
+          editable={!busy}
+          onSubmitEditing={() => generate()}
+        />
+        <TouchableOpacity
+          style={styles.assignAddBtn}
+          onPress={() => generate()}
+          disabled={busy || (!topic.trim() && !text.trim())}
+        >
+          <Text style={styles.assignAddBtnText}>{busy ? "…" : "Make"}</Text>
+        </TouchableOpacity>
+      </View>
+
+      {suggestions.length > 0 && (
+        <View style={styles.assignSubjRow}>
+          {suggestions.map((s) => (
+            <TouchableOpacity
+              key={s}
+              style={styles.assignSubjChip}
+              disabled={busy}
+              onPress={() => setTopic(s)}
+            >
+              <Text style={styles.assignSubjChipText}>
+                {missed.includes(s) ? "🎯 " : "📁 "}
+                {s}
+              </Text>
+            </TouchableOpacity>
+          ))}
+        </View>
+      )}
+
+      <TextInput
+        style={styles.fcPaste}
+        value={text}
+        placeholder="…or paste the notes you want cards from"
+        placeholderTextColor="#9aa39c"
+        onChangeText={setText}
+        editable={!busy}
+        multiline
+      />
+
+      <Text style={[styles.quizQ, { marginTop: 14 }]}>Card style</Text>
+      <View style={styles.assignSubjRow}>
+        <TouchableOpacity
+          disabled={busy}
+          onPress={() => setStyle(undefined)}
+          style={[
+            styles.assignSubjChip,
+            style === undefined && styles.assignSubjChipActive,
+          ]}
+        >
+          <Text
+            style={[
+              styles.assignSubjChipText,
+              style === undefined && styles.assignSubjChipTextActive,
+            ]}
+          >
+            🎲 Mixed
+          </Text>
+        </TouchableOpacity>
+        {FLASHCARD_STYLES.map((s) => (
+          <TouchableOpacity
+            key={s.key}
+            disabled={busy}
+            onPress={() => setStyle(s.key)}
+            style={[
+              styles.assignSubjChip,
+              style === s.key && styles.assignSubjChipActive,
+            ]}
+          >
+            <Text
+              style={[
+                styles.assignSubjChipText,
+                style === s.key && styles.assignSubjChipTextActive,
+              ]}
+            >
+              {s.emoji} {s.label}
+            </Text>
+          </TouchableOpacity>
+        ))}
+      </View>
+
+      <Text style={[styles.quizQ, { marginTop: 14 }]}>How hard?</Text>
+      <View style={styles.assignSubjRow}>
+        {QUIZ_DIFFICULTIES.map((d) => (
+          <TouchableOpacity
+            key={d.key}
+            disabled={busy}
+            onPress={() => setDifficulty(d.key)}
+            style={[
+              styles.assignSubjChip,
+              difficulty === d.key && styles.assignSubjChipActive,
+            ]}
+          >
+            <Text
+              style={[
+                styles.assignSubjChipText,
+                difficulty === d.key && styles.assignSubjChipTextActive,
+              ]}
+            >
+              {d.label}
+            </Text>
+          </TouchableOpacity>
+        ))}
+      </View>
+
+      <Text style={[styles.quizQ, { marginTop: 14 }]}>How many cards?</Text>
+      <View style={styles.assignSubjRow}>
+        {[8, 12, 20, 30].map((n) => (
+          <TouchableOpacity
+            key={n}
+            disabled={busy}
+            onPress={() => setCount(n)}
+            style={[
+              styles.assignSubjChip,
+              count === n && styles.assignSubjChipActive,
+            ]}
+          >
+            <Text
+              style={[
+                styles.assignSubjChipText,
+                count === n && styles.assignSubjChipTextActive,
+              ]}
+            >
+              {n}
+            </Text>
+          </TouchableOpacity>
+        ))}
+      </View>
+
+      {!!error && (
+          <Text style={[styles.resultText, { color: "#c0392b", marginTop: 8 }]}>
+            {error}
+          </Text>
+        )}
+
+      {decks.length > 0 && (
+        <>
+          <Text style={[styles.quizQ, { marginTop: 18 }]}>Your decks</Text>
+          {decks.map((d) => {
+            const left = d.learning?.length ?? 0;
+            return (
+              <View key={d.id} style={styles.fcDeckRow}>
+                <TouchableOpacity
+                  style={styles.fcDeckOpen}
+                  onPress={() => setOpenId(d.id)}
+                >
+                  <Text style={styles.fcDeckTitle}>{d.title}</Text>
+                  <Text style={styles.fcDeckMeta}>
+                    {d.cards.length} card{d.cards.length === 1 ? "" : "s"}
+                    {d.fromMaterial ? ` · from ${d.fromMaterial}` : ""}
+                    {left ? ` · ${left} still learning` : ""}
+                  </Text>
+                </TouchableOpacity>
+                <TouchableOpacity
+                  style={[styles.fcBtn, !d.cards.length && styles.primaryBtnDisabled]}
+                  disabled={!d.cards.length}
+                  onPress={() => {
+                    setOpenId(d.id);
+                    setStudying(true);
+                  }}
+                >
+                  <Text style={styles.fcBtnText}>▶️</Text>
+                </TouchableOpacity>
+                <Text
+                  style={styles.fcIconBtn}
+                  onPress={() => setDecks((prev) => prev.filter((x) => x.id !== d.id))}
+                >
+                  ✕
+                </Text>
+              </View>
+            );
+          })}
+        </>
+      )}
+    </View>
+  );
+}
+
+// One pass through a deck: flip the card, say whether you knew it, move on.
+//
+// "Still learning" is the useful half — those cards come back in the next round
+// and get logged as weak areas, so the rest of Eliora knows what to aim at.
+function StudyRound({
+  deck,
+  onExit,
+  onMissed,
+  onFinish,
+}: {
+  deck: SavedDeck;
+  onExit: () => void;
+  onMissed: (topic: string) => void;
+  onFinish: (known: string[], learning: string[]) => void;
+}) {
+  // A round is a frozen list of ids: editing the deck mid-round shouldn't
+  // shuffle the cards out from under the learner.
+  const [round, setRound] = useState<string[]>(() =>
+    deck.cards.filter((c) => c.front.trim()).map((c) => c.id),
+  );
+  const [i, setI] = useState(0);
+  const [flipped, setFlipped] = useState(false);
+  const [known, setKnown] = useState<string[]>([]);
+  const [learning, setLearning] = useState<string[]>([]);
+
+  const card = deck.cards.find((c) => c.id === round[i]);
+  const done = i >= round.length;
+
+  function mark(gotIt: boolean) {
+    if (!card) return;
+    const nextKnown = gotIt ? [...known, card.id] : known;
+    const nextLearning = gotIt ? learning : [...learning, card.id];
+    setKnown(nextKnown);
+    setLearning(nextLearning);
+    if (!gotIt) {
+      // Feed the weak-area tracker the sub-concept, falling back to the front.
+      const topic = (card.topic || card.front).trim();
+      if (topic) onMissed(topic);
+    }
+    setFlipped(false);
+    setI((n) => n + 1);
+    // Last card: hand the tally back so "still learning" survives a reload.
+    if (i + 1 >= round.length) onFinish(nextKnown, nextLearning);
+  }
+
+  function startRound(ids: string[]) {
+    setRound(ids);
+    setI(0);
+    setFlipped(false);
+    setKnown([]);
+    setLearning([]);
+  }
+
+  if (done) {
+    const total = known.length + learning.length;
+    return (
+      <View style={styles.card}>
+        <View style={styles.cardHead}>
+          <Text style={styles.cardClass}>🃏 {deck.title}</Text>
+          <Text style={styles.linkBtn} onPress={onExit}>
+            Edit deck
+          </Text>
+        </View>
+        <Text style={styles.fcScore}>
+          {known.length} / {total} known
+        </Text>
+        <Text style={styles.assignEmpty}>
+          {learning.length
+            ? `${learning.length} card${learning.length === 1 ? "" : "s"} to go again — they're saved as weak areas too.`
+            : "Every card, first try. That deck is done."}
+        </Text>
+        <View style={styles.fcActions}>
+          {learning.length > 0 && (
+            <TouchableOpacity
+              style={styles.fcBtn}
+              onPress={() => startRound(learning)}
+            >
+              <Text style={styles.fcBtnText}>
+                🔁 Just the {learning.length} I&apos;m still learning
+              </Text>
+            </TouchableOpacity>
+          )}
+          <TouchableOpacity
+            style={styles.fcBtnGhost}
+            onPress={() =>
+              startRound(deck.cards.filter((c) => c.front.trim()).map((c) => c.id))
+            }
+          >
+            <Text style={styles.fcBtnGhostText}>↻ Whole deck again</Text>
+          </TouchableOpacity>
+          <TouchableOpacity style={styles.fcBtnGhost} onPress={onExit}>
+            <Text style={styles.fcBtnGhostText}>Done</Text>
+          </TouchableOpacity>
+        </View>
+      </View>
+    );
+  }
+
+  if (!card) {
+    return (
+      <View style={styles.card}>
+        <Text style={styles.assignEmpty}>Nothing to study yet.</Text>
+        <TouchableOpacity style={styles.fcBtnGhost} onPress={onExit}>
+          <Text style={styles.fcBtnGhostText}>Back to the deck</Text>
+        </TouchableOpacity>
+      </View>
+    );
+  }
+
+  const meta = flashcardStyleMeta(card.style);
+
+  return (
+    <View style={styles.card}>
+      <View style={styles.cardHead}>
+        <Text style={styles.cardClass}>🃏 {deck.title}</Text>
+        <Text style={styles.linkBtn} onPress={onExit}>
+          Edit deck
+        </Text>
+      </View>
+
+      <View style={styles.fcBar}>
+        <View
+          style={[styles.fcBarFill, { width: `${(i / round.length) * 100}%` }]}
+        />
+      </View>
+      <Text style={styles.fcCount}>
+        {i + 1} of {round.length} · {known.length} known · {learning.length} still
+        learning
+      </Text>
+
+      <TouchableOpacity
+        style={styles.fcFace}
+        onPress={() => setFlipped((f) => !f)}
+        accessibilityLabel="Flip card"
+      >
+        {/* Name each side the way its style does — a cloze card's front is a
+            "Fill in the blank", not a "Term". */}
+        <Text style={styles.fcSide}>{flipped ? meta.back : meta.front}</Text>
+        <Text style={styles.fcFaceText}>{flipped ? card.back : card.front}</Text>
+        {!flipped && !!card.hint && (
+          <Text style={styles.fcHint}>💡 {card.hint}</Text>
+        )}
+        <Text style={styles.fcTapHint}>Tap to flip</Text>
+      </TouchableOpacity>
+
+      {flipped ? (
+        <View style={styles.fcActions}>
+          <TouchableOpacity style={styles.fcBtnBad} onPress={() => mark(false)}>
+            <Text style={styles.fcBtnBadText}>Still learning</Text>
+          </TouchableOpacity>
+          <TouchableOpacity style={styles.fcBtnGood} onPress={() => mark(true)}>
+            <Text style={styles.fcBtnGoodText}>Got it</Text>
+          </TouchableOpacity>
+        </View>
+      ) : (
+        <View style={styles.fcActions}>
+          <TouchableOpacity style={styles.fcBtn} onPress={() => setFlipped(true)}>
+            <Text style={styles.fcBtnText}>Show the answer</Text>
+          </TouchableOpacity>
+        </View>
+      )}
+    </View>
+  );
+}
+
 function PracticeQuiz({
   profile,
   subjects,
@@ -5306,11 +6350,19 @@ export default function App() {
   const [pendingCheckIn, setPendingCheckIn] = useState(false);
   const [generatingSchedule, setGeneratingSchedule] = useState(false);
   const [breakingGoalId, setBreakingGoalId] = useState<string | null>(null);
+  const [breakingAssignmentId, setBreakingAssignmentId] = useState<
+    string | null
+  >(null);
   const [editing, setEditing] = useState(false);
   const [summarizing, setSummarizing] = useState(false);
   const [tab, setTab] = useState<
     "chat" | "study" | "practice" | "calendar" | "plan" | "notebook"
   >("chat");
+  // Sub-tab within the Study tab; lives here (not inside the Study view) so it
+  // survives switching to another top-level tab and back.
+  const [studySection, setStudySection] = useState<
+    "overview" | "plan" | "notes" | "lessons" | "flashcards"
+  >("overview");
   const [input, setInput] = useState("");
   const [busy, setBusy] = useState(false);
   const [loaded, setLoaded] = useState(false);
@@ -5502,6 +6554,76 @@ export default function App() {
   }
   function removeAssignment(id: string) {
     setAssignments((prev) => prev.filter((a) => a.id !== id));
+  }
+  async function breakDownAssignment(a: Assignment) {
+    if (breakingAssignmentId) return;
+    setBreakingAssignmentId(a.id);
+    try {
+      const res = await fetch(`${API_BASE_URL}/api/breakdown`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          task: a.title,
+          subject: a.subject,
+          due: a.due,
+          today: todayISO(),
+          context: a.concern,
+          profile: profile ?? undefined,
+        }),
+      });
+      const data = (await res.json()) as {
+        breakdown?: { steps?: Omit<TaskStep, "done" | "due">[] };
+      };
+      const steps = data.breakdown?.steps ?? [];
+      if (steps.length) {
+        // Re-running keeps whatever was already ticked off, matched by title —
+        // losing progress is a reason never to press the button twice.
+        const before = new Map(
+          (a.steps ?? []).map((s) => [s.title.toLowerCase(), s] as const),
+        );
+        const dues = paceStepDates(steps.length, a.due);
+        setAssignments((prev) =>
+          prev.map((x) =>
+            x.id === a.id
+              ? {
+                  ...x,
+                  steps: steps.map((s, i) => {
+                    const prev = before.get(s.title.toLowerCase());
+                    return {
+                      ...s,
+                      due: prev?.due ?? dues[i],
+                      done: !!prev?.done,
+                    };
+                  }),
+                }
+              : x,
+          ),
+        );
+      }
+    } catch {
+      /* ignore — the button can be tapped again */
+    } finally {
+      setBreakingAssignmentId(null);
+    }
+  }
+  function toggleAssignmentStep(id: string, index: number) {
+    setAssignments((prev) =>
+      prev.map((a) =>
+        a.id === id
+          ? {
+              ...a,
+              steps: (a.steps ?? []).map((s, i) =>
+                i === index ? { ...s, done: !s.done } : s,
+              ),
+            }
+          : a,
+      ),
+    );
+  }
+  function clearAssignmentSteps(id: string) {
+    setAssignments((prev) =>
+      prev.map((a) => (a.id === id ? { ...a, steps: undefined } : a)),
+    );
   }
 
   // Persist SMART goals.
@@ -5765,6 +6887,22 @@ export default function App() {
               ...g,
               tasks: (g.tasks ?? []).map((t, i) =>
                 i === index ? { ...t, done: !t.done } : t,
+              ),
+            }
+          : g,
+      ),
+    );
+  }
+  // The notes line under a goal step. Emptying it clears the line.
+  function setGoalTaskDetail(goalId: string, index: number, detail: string) {
+    const clean = detail.trim();
+    setGoals((prev) =>
+      prev.map((g) =>
+        g.id === goalId
+          ? {
+              ...g,
+              tasks: (g.tasks ?? []).map((t, i) =>
+                i === index ? { ...t, detail: clean || undefined } : t,
               ),
             }
           : g,
@@ -6077,6 +7215,7 @@ export default function App() {
       let acc = "";
       const videos: Video[] = [];
       const socials: SocialRec[] = [];
+      const resources: ResourceRec[] = [];
       let flashcards: Flashcard[] | undefined;
       let quiz: QuizQuestion[] | undefined;
 
@@ -6088,6 +7227,7 @@ export default function App() {
           items?:
             | Video[]
             | SocialRec[]
+            | ResourceRec[]
             | IncomingMilestone[]
             | Flashcard[]
             | QuizQuestion[];
@@ -6134,6 +7274,8 @@ export default function App() {
           videos.push(...(evt.items as Video[]));
         else if (evt.type === "socials" && evt.items)
           socials.push(...(evt.items as SocialRec[]));
+        else if (evt.type === "resources" && evt.items)
+          resources.push(...(evt.items as ResourceRec[]));
         else if (evt.type === "flashcards")
           flashcards = (evt.items as Flashcard[]) ?? [];
         else if (evt.type === "quiz") quiz = (evt.items as QuizQuestion[]) ?? [];
@@ -6144,6 +7286,7 @@ export default function App() {
             content: acc,
             videos: videos.length ? [...videos] : undefined,
             socials: socials.length ? [...socials] : undefined,
+            resources: resources.length ? [...resources] : undefined,
             flashcards,
             quiz,
           };
@@ -6329,6 +7472,7 @@ export default function App() {
             onRemove={removeGoal}
             onBreakDown={breakDownGoal}
             onToggleTask={toggleGoalTask}
+            onSetTaskDetail={setGoalTaskDetail}
             onHelpTask={helpWithTask}
             breakingGoalId={breakingGoalId}
           />
@@ -6339,6 +7483,10 @@ export default function App() {
             onToggle={toggleAssignment}
             onSetConcern={setAssignmentConcern}
             onRemove={removeAssignment}
+            onBreakDown={breakDownAssignment}
+            onToggleStep={toggleAssignmentStep}
+            onClearSteps={clearAssignmentSteps}
+            breakingAssignmentId={breakingAssignmentId}
           />
           <ScheduleCard
             schedule={schedule}
@@ -6447,53 +7595,94 @@ export default function App() {
         </ScrollView>
       ) : tab === "study" ? (
         <ScrollView contentContainerStyle={styles.studyScroll}>
-          <ProfileCard profile={profile} onEdit={() => setEditing(true)} />
-          <SubjectsPanel
-            subjects={subjects}
-            onAdd={addSubject}
-            onRemove={removeSubject}
-          />
-          <View style={styles.card}>
-            <View style={styles.cardHead}>
-              <Text style={styles.cardClass}>🛠️ Study tools</Text>
-            </View>
-            <View style={styles.studyToolsGrid}>
-              {(
-                [
-                  ["🃏 Flashcards", "Make me flashcards to study."],
-                  ["📝 Quiz me", "Quiz me on what I'm learning."],
-                  ["📚 Study guide", "Make me a study guide for what I should review."],
-                  ["🎬 Study videos", "Recommend me a few study videos for my class."],
-                  ["📱 Short-form recs", "Recommend TikTok, YouTube Shorts, and Instagram accounts or searches for what I'm studying."],
-                  ["🧠 Study tip", studyTipPrompt()],
-                  ["💡 Suggestions", "Give me a couple of study suggestions."],
-                ] as const
-              ).map(([label, msg]) => (
-                <TouchableOpacity
-                  key={label}
-                  style={styles.studyToolBtn}
-                  disabled={busy}
-                  onPress={() => {
-                    setTab("chat");
-                    send(msg);
-                  }}
+          <View style={styles.outputRow}>
+            {(
+              [
+                ["overview", "🏠 Overview"],
+                ["plan", "🗓️ Plan"],
+                ["notes", "📓 Notes"],
+                ["lessons", "🧩 Lessons"],
+                ["flashcards", "🃏 Flashcards"],
+              ] as const
+            ).map(([key, label]) => (
+              <TouchableOpacity
+                key={key}
+                style={[styles.outChip, studySection === key && styles.outChipActive]}
+                onPress={() => setStudySection(key)}
+              >
+                <Text
+                  style={[
+                    styles.outChipText,
+                    studySection === key && styles.outChipTextActive,
+                  ]}
                 >
-                  <Text style={styles.studyToolBtnText}>{label}</Text>
-                </TouchableOpacity>
-              ))}
-            </View>
+                  {label}
+                </Text>
+              </TouchableOpacity>
+            ))}
           </View>
-          <SessionLessonPlan
-            session={firstSession}
-            profile={profile}
-            onAdopt={(steps) => setPlan((prev) => appendPlan(prev, steps))}
-            onAsk={(msg) => {
-              setTab("chat");
-              send(msg);
-            }}
-          />
-          <SmartNotes profile={profile} />
-          <LessonBuilder profile={profile} onMissed={addMissed} />
+          {studySection === "overview" ? (
+            <>
+              <ProfileCard profile={profile} onEdit={() => setEditing(true)} />
+              <SubjectsPanel
+                subjects={subjects}
+                onAdd={addSubject}
+                onRemove={removeSubject}
+              />
+              <View style={styles.card}>
+                <View style={styles.cardHead}>
+                  <Text style={styles.cardClass}>🛠️ Study tools</Text>
+                </View>
+                <View style={styles.studyToolsGrid}>
+                  {(
+                    [
+                      // No "Flashcards" shortcut here — the real deck builder is
+                      // its own card further down this tab.
+                      ["📝 Quiz me", "Quiz me on what I'm learning."],
+                      ["📚 Study guide", "Make me a study guide for what I should review."],
+                      ["🎬 Study videos", "Recommend me a few study videos for my class."],
+                      ["📱 Short-form recs", "Recommend TikTok, YouTube Shorts, and Instagram accounts or searches for what I'm studying."],
+                      ["🧠 Study tip", studyTipPrompt()],
+                      ["💡 Suggestions", "Give me a couple of study suggestions."],
+                    ] as const
+                  ).map(([label, msg]) => (
+                    <TouchableOpacity
+                      key={label}
+                      style={styles.studyToolBtn}
+                      disabled={busy}
+                      onPress={() => {
+                        setTab("chat");
+                        send(msg);
+                      }}
+                    >
+                      <Text style={styles.studyToolBtnText}>{label}</Text>
+                    </TouchableOpacity>
+                  ))}
+                </View>
+              </View>
+            </>
+          ) : studySection === "plan" ? (
+            <SessionLessonPlan
+              session={firstSession}
+              profile={profile}
+              onAdopt={(steps) => setPlan((prev) => appendPlan(prev, steps))}
+              onAsk={(msg) => {
+                setTab("chat");
+                send(msg);
+              }}
+            />
+          ) : studySection === "notes" ? (
+            <SmartNotes profile={profile} />
+          ) : studySection === "lessons" ? (
+            <LessonBuilder profile={profile} onMissed={addMissed} />
+          ) : (
+            <FlashcardsScreen
+              profile={profile}
+              subjects={subjects}
+              missed={missed}
+              onMissed={addMissed}
+            />
+          )}
         </ScrollView>
       ) : tab === "notebook" ? (
         <NotesWorkspace />
@@ -6725,11 +7914,13 @@ export default function App() {
                 item.role === "user" ? styles.userBubble : styles.assistantBubble,
               ]}
             >
-              <Text
-                style={item.role === "user" ? styles.userText : styles.assistantText}
-              >
-                {item.content ? renderContent(item.content) : busy ? "…" : ""}
-              </Text>
+              {item.role === "user" ? (
+                <Text style={styles.userText}>{renderContent(item.content)}</Text>
+              ) : item.content ? (
+                renderMessageBody(item.content)
+              ) : (
+                <Text style={styles.assistantText}>{busy ? "…" : ""}</Text>
+              )}
             </View>
             {item.role === "assistant" && !!item.content && (
               <TouchableOpacity
@@ -6748,6 +7939,9 @@ export default function App() {
             )}
             {item.socials && item.socials.length > 0 && (
               <SocialCards socials={item.socials} />
+            )}
+            {item.resources && item.resources.length > 0 && (
+              <ResourceCards resources={item.resources} />
             )}
             {item.flashcards && item.flashcards.length > 0 && (
               <FlashcardDeck cards={item.flashcards} onMissed={addMissed} />
@@ -7691,6 +8885,28 @@ const styles = StyleSheet.create({
   userText: { color: "#fff", fontSize: 17, lineHeight: 24 },
   assistantText: { color: "#2a2350", fontSize: 17, lineHeight: 24 },
   link: { color: "#7b4bd0", textDecorationLine: "underline" },
+  // Markdown blocks inside an assistant bubble (see renderMessageBody).
+  mdH2: {
+    color: "#7b4bd0",
+    fontSize: 17,
+    fontWeight: "800",
+    lineHeight: 23,
+    marginTop: 12,
+    marginBottom: 3,
+  },
+  mdH3: {
+    color: "#2a2350",
+    fontSize: 16,
+    fontWeight: "700",
+    lineHeight: 22,
+    marginTop: 10,
+    marginBottom: 2,
+  },
+  mdP: { marginVertical: 3 },
+  mdBullet: { flexDirection: "row", gap: 8, marginVertical: 3 },
+  mdBulletMark: { color: "#7b4bd0", fontWeight: "700", fontSize: 17, lineHeight: 24 },
+  mdBold: { fontWeight: "700" },
+  mdMark: { backgroundColor: "#ffe9a8", fontWeight: "600" },
   speakBtn: {
     borderWidth: 1,
     borderColor: "#efe4f0",
@@ -7733,6 +8949,33 @@ const styles = StyleSheet.create({
   socialTitle: { fontSize: 13, fontWeight: "600", color: "#2a2350", lineHeight: 17 },
   socialNote: { fontSize: 11, color: "#6b6280", lineHeight: 15 },
   socialOpen: { fontSize: 12, fontWeight: "600", color: "#7b4bd0" },
+  // Non-video resource cards (sites, books, practice sets)
+  resourceWrap: { gap: 8, maxWidth: "90%" },
+  resourceHeader: { fontSize: 13, fontWeight: "700", color: "#6b6280" },
+  resourceCard: {
+    backgroundColor: "#fff",
+    borderRadius: 12,
+    borderWidth: 1,
+    borderColor: "#efe4f0",
+    padding: 10,
+    gap: 6,
+  },
+  resourceTopRow: { flexDirection: "row", alignItems: "center", gap: 8 },
+  resourceBadge: {
+    borderRadius: 999,
+    paddingVertical: 3,
+    paddingHorizontal: 8,
+  },
+  resourceBadgeText: { color: "#fff", fontSize: 11, fontWeight: "700" },
+  resourceTitle: {
+    flex: 1,
+    fontSize: 13,
+    fontWeight: "600",
+    color: "#2a2350",
+    lineHeight: 17,
+  },
+  resourceNote: { fontSize: 11, color: "#6b6280", lineHeight: 15 },
+  resourceOpen: { fontSize: 12, fontWeight: "600", color: "#7b4bd0" },
   // Study tools (flashcards + quiz)
   toolBox: {
     maxWidth: "90%",
@@ -7768,6 +9011,161 @@ const styles = StyleSheet.create({
     textAlign: "center",
   },
   flashcardHint: { fontSize: 12, color: "#8b83a3" },
+
+  // Flashcards studio — deck shelf, editor, and the flip card.
+  fcNote: { fontSize: 13, color: "#6b6280", marginTop: 8, lineHeight: 19 },
+  fcPaste: {
+    marginTop: 10,
+    minHeight: 74,
+    borderWidth: 1,
+    borderColor: "#efe4f0",
+    borderRadius: 10,
+    paddingHorizontal: 12,
+    paddingVertical: 10,
+    fontSize: 14,
+    color: "#2a2350",
+    backgroundColor: "#fff",
+    textAlignVertical: "top",
+  },
+  fcActions: { flexDirection: "row", gap: 8, marginTop: 12, flexWrap: "wrap" },
+  fcBtn: {
+    paddingHorizontal: 14,
+    paddingVertical: 10,
+    borderRadius: 10,
+    borderWidth: 1,
+    borderColor: "#7b4bd0",
+    backgroundColor: "#f3ebfd",
+  },
+  fcBtnText: { color: "#7b4bd0", fontSize: 14, fontWeight: "600" },
+  fcBtnGhost: {
+    paddingHorizontal: 14,
+    paddingVertical: 10,
+    borderRadius: 10,
+    borderWidth: 1,
+    borderColor: "#efe4f0",
+    backgroundColor: "#fff",
+  },
+  fcBtnGhostText: { color: "#6b6280", fontSize: 14, fontWeight: "600" },
+  fcBtnGood: {
+    flex: 1,
+    minWidth: 130,
+    paddingVertical: 13,
+    borderRadius: 10,
+    borderWidth: 1,
+    borderColor: "#2e7d32",
+    backgroundColor: "#e4f4e6",
+    alignItems: "center",
+  },
+  fcBtnGoodText: { color: "#2e7d32", fontSize: 15, fontWeight: "700" },
+  fcBtnBad: {
+    flex: 1,
+    minWidth: 130,
+    paddingVertical: 13,
+    borderRadius: 10,
+    borderWidth: 1,
+    borderColor: "#c0392b",
+    backgroundColor: "#fbe9e7",
+    alignItems: "center",
+  },
+  fcBtnBadText: { color: "#c0392b", fontSize: 15, fontWeight: "700" },
+  fcEditRow: {
+    borderWidth: 1,
+    borderColor: "#efe4f0",
+    borderRadius: 12,
+    padding: 10,
+    marginTop: 8,
+    backgroundColor: "#fff",
+  },
+  fcEditHead: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 6,
+    marginBottom: 6,
+    flexWrap: "wrap",
+  },
+  fcNum: { fontSize: 12, color: "#6b6280", fontWeight: "700", minWidth: 16 },
+  fcBadge: {
+    fontSize: 11,
+    fontWeight: "700",
+    paddingHorizontal: 7,
+    paddingVertical: 2,
+    borderRadius: 999,
+    overflow: "hidden",
+    backgroundColor: "#f3ebfd",
+    color: "#7b4bd0",
+  },
+  fcBadgeYou: { backgroundColor: "#efe9f5", color: "#6b6280" },
+  fcTopic: { fontSize: 11.5, color: "#8b83a3" },
+  fcIconBtn: { color: "#6b6280", fontSize: 16, paddingHorizontal: 6 },
+  fcEditFront: {
+    borderWidth: 1,
+    borderColor: "#efe4f0",
+    borderRadius: 8,
+    paddingHorizontal: 10,
+    paddingVertical: 8,
+    fontSize: 14,
+    fontWeight: "600",
+    color: "#2a2350",
+    backgroundColor: "#fdf9ff",
+    textAlignVertical: "top",
+  },
+  fcEditBack: {
+    marginTop: 6,
+    borderWidth: 1,
+    borderColor: "#efe4f0",
+    borderRadius: 8,
+    paddingHorizontal: 10,
+    paddingVertical: 8,
+    fontSize: 14,
+    color: "#2a2350",
+    backgroundColor: "#fdf9ff",
+    textAlignVertical: "top",
+  },
+  fcDeckRow: { flexDirection: "row", alignItems: "center", gap: 8, marginTop: 8 },
+  fcDeckOpen: {
+    flex: 1,
+    paddingHorizontal: 12,
+    paddingVertical: 10,
+    borderRadius: 10,
+    borderWidth: 1,
+    borderColor: "#efe4f0",
+    backgroundColor: "#fff",
+  },
+  fcDeckTitle: { fontSize: 14.5, fontWeight: "700", color: "#2a2350" },
+  fcDeckMeta: { fontSize: 12, color: "#6b6280", marginTop: 2 },
+  fcBar: {
+    height: 6,
+    borderRadius: 999,
+    backgroundColor: "#efe4f0",
+    marginTop: 12,
+    overflow: "hidden",
+  },
+  fcBarFill: { height: "100%", backgroundColor: "#7b4bd0", borderRadius: 999 },
+  fcCount: { fontSize: 12, color: "#6b6280", marginTop: 6 },
+  fcFace: {
+    minHeight: 180,
+    marginTop: 12,
+    paddingHorizontal: 18,
+    paddingVertical: 22,
+    borderRadius: 16,
+    borderWidth: 1,
+    borderColor: "#efe4f0",
+    backgroundColor: "#f3ebfd",
+    alignItems: "center",
+    justifyContent: "center",
+    gap: 12,
+  },
+  fcSide: { fontSize: 11, letterSpacing: 1, fontWeight: "700", color: "#6b6280" },
+  fcFaceText: {
+    fontSize: 20,
+    lineHeight: 28,
+    fontWeight: "600",
+    color: "#2a2350",
+    textAlign: "center",
+  },
+  fcHint: { fontSize: 13, color: "#6b6280", fontStyle: "italic" },
+  fcTapHint: { fontSize: 11.5, color: "#8b83a3" },
+  fcScore: { fontSize: 26, fontWeight: "800", color: "#7b4bd0", marginTop: 12 },
   flashNav: {
     flexDirection: "row",
     alignItems: "center",
@@ -8089,6 +9487,15 @@ const styles = StyleSheet.create({
     backgroundColor: "#f3ebfd",
   },
   goalBreakBtnText: { color: "#7b4bd0", fontSize: 13, fontWeight: "600" },
+  goalBreakRow: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 14,
+    marginTop: 10,
+    marginLeft: 34,
+  },
+  goalBreakClear: { color: "#9b93b3", fontSize: 13, fontWeight: "600" },
+  stepMin: { fontSize: 11.5, color: "#9b93b3", fontWeight: "600" },
   goalTasks: { marginTop: 10, marginLeft: 34 },
   goalTasksHead: {
     fontSize: 11,
@@ -8118,6 +9525,58 @@ const styles = StyleSheet.create({
     borderColor: "#7b4bd0",
   },
   goalTaskHelpText: { color: "#7b4bd0", fontSize: 12.5, fontWeight: "600" },
+  // ── A checklist step, Google Tasks style ──────────────────────────────────
+  // Round tick box on the left, then title / details / day stacked beside it,
+  // with a hairline between steps and nothing boxing them in.
+  gtRow: {
+    flexDirection: "row",
+    alignItems: "flex-start",
+    gap: 12,
+    paddingVertical: 9,
+    borderBottomWidth: StyleSheet.hairlineWidth,
+    borderBottomColor: "#e4dff0",
+  },
+  gtCheck: {
+    width: 20,
+    height: 20,
+    marginTop: 2,
+    borderRadius: 10,
+    borderWidth: 2,
+    borderColor: "#9b93b3",
+    alignItems: "center",
+    justifyContent: "center",
+  },
+  gtCheckDone: { backgroundColor: "#7b4bd0", borderColor: "#7b4bd0" },
+  gtCheckMark: { color: "#fff", fontSize: 12, fontWeight: "700", lineHeight: 14 },
+  gtBody: { flex: 1, minWidth: 0 },
+  gtTitleLine: { flexDirection: "row", alignItems: "center", gap: 8 },
+  gtTitle: { flex: 1, fontSize: 14.5, lineHeight: 21, color: "#2a2350" },
+  // Done: the title is struck through. The details line under it is already
+  // grey, so it's left alone — striking that through too reads as deleted.
+  gtTitleDone: {
+    color: "#6b6280",
+    textDecorationLine: "line-through",
+  },
+  gtDetail: { fontSize: 13, lineHeight: 19, color: "#6b6280", marginTop: 1 },
+  // "Add details" placeholder — there, but not asking to be read.
+  gtDetailEmpty: { color: "#9b93b3" },
+  gtDetailInput: {
+    marginTop: 2,
+    paddingVertical: 2,
+    fontSize: 13,
+    lineHeight: 19,
+    color: "#2a2350",
+  },
+  gtChips: { flexDirection: "row", flexWrap: "wrap", gap: 6, marginTop: 6 },
+  gtChip: {
+    borderRadius: 999,
+    paddingVertical: 2,
+    paddingHorizontal: 9,
+    backgroundColor: "#f3ebfd",
+  },
+  gtChipOverdue: { backgroundColor: "#fdecea" },
+  gtChipText: { fontSize: 11.5, fontWeight: "600", color: "#7b4bd0" },
+  gtChipTextOverdue: { color: "#c5221f" },
   studyToolsGrid: {
     flexDirection: "row",
     flexWrap: "wrap",

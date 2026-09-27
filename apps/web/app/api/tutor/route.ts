@@ -1,5 +1,11 @@
 import OpenAI from "openai";
 import {
+  condenseTranscript,
+  extractVideoId,
+  fetchTranscript,
+  TRANSCRIPT_SINGLE_PASS_MAX,
+} from "../_lib/youtube-transcript";
+import {
   ELIORA_SUMMARY_MODEL,
   tutorPrompt,
   type QuizQuestion,
@@ -356,6 +362,49 @@ export async function POST(req: Request) {
     );
   }
 
+  // A video to teach from. Already-condensed material is echoed back by the
+  // client on later turns so it's only ever fetched once, on the opening turn.
+  let material = body.material?.trim() || "";
+  const videoUrl = body.videoUrl?.trim();
+  let client: OpenAI | null = null;
+  if (!material && videoUrl) {
+    const id = extractVideoId(videoUrl);
+    if (!id) {
+      return Response.json(
+        { error: "That doesn't look like a YouTube link. Please check it." },
+        { status: 200 },
+      );
+    }
+    const transcript = await fetchTranscript(id);
+    if (!transcript) {
+      return Response.json(
+        {
+          error:
+            "I couldn't pull this video's transcript automatically — YouTube " +
+            "blocks fetching captions from a server. Here's the quick " +
+            "workaround:\n\n" +
+            '1. On the video, click "…more" under the title → "Show transcript".\n' +
+            "2. Select all the transcript text and copy it.\n" +
+            "3. Paste it into the box here, and I'll teach from it instead.",
+        },
+        { status: 200 },
+      );
+    }
+    try {
+      client = new OpenAI();
+      material =
+        transcript.length > TRANSCRIPT_SINGLE_PASS_MAX
+          ? (await condenseTranscript(client, transcript)) ||
+            transcript.slice(0, TRANSCRIPT_SINGLE_PASS_MAX)
+          : transcript;
+    } catch {
+      return Response.json(
+        { error: "Sorry, I couldn't read that video. Please try again." },
+        { status: 200 },
+      );
+    }
+  }
+
   // The opening and closing turns have no learner message to carry, so the user
   // turn is the stage direction instead: they've sat down, or the clock's gone.
   const goal = str(body.goal);
@@ -365,6 +414,10 @@ export async function POST(req: Request) {
           body.planMinutes ?? 30
         }-minute ${subject} session. They haven't said anything yet.${
           goal ? ` They said they want to work on: ${goal}` : ""
+        }${
+          material && !goal
+            ? " They gave you a video to teach this session from instead of naming a goal."
+            : ""
         } Open the session.]`
       : phase === "wrap"
         ? `[Time's up on today's ${subject} session. Close it out and tell them where they got to.]`
@@ -379,7 +432,7 @@ export async function POST(req: Request) {
             : text;
 
   try {
-    const client = new OpenAI();
+    client ??= new OpenAI();
     const completion = await client.chat.completions.create({
       model: ELIORA_SUMMARY_MODEL,
       max_completion_tokens: 2200,
@@ -394,6 +447,7 @@ export async function POST(req: Request) {
             subject,
             text,
             phase,
+            material,
           }),
         },
         { role: "user", content: intro },
@@ -460,6 +514,9 @@ export async function POST(req: Request) {
           : undefined,
       beatDone: args.beatDone === true,
       recap,
+      // Echoed back so the client caches it and resends it on later turns
+      // instead of refetching the video every time.
+      material: material || undefined,
     };
 
     return Response.json({ answer });

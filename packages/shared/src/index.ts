@@ -651,6 +651,89 @@ Return the plan by calling the rank_and_schedule tool.`;
 }
 
 // ---------------------------------------------------------------------------
+// Task breakdown — "Break it down" on anything on your plate
+// ---------------------------------------------------------------------------
+// The priority list breaks items down as a side effect of ranking the whole
+// plate. This does the one job on its own, for ONE thing, on demand: the
+// ordered steps, how long each really takes, and a tick-box per step so the
+// learner can see the bar move. Staring at "Write history essay" is the moment
+// an ADHD brain stalls; staring at "Pick the three sources — 15 min" is not.
+export interface TaskStep {
+  title: string; // action-first, one sitting
+  estMin: number; // honest minutes, a multiple of 5
+  detail?: string; // what it actually means, when the title isn't enough
+  due?: string; // YYYY-MM-DD — the day it's meant to happen, so it lands on
+  // the calendar. Cleared rather than deleted when the learner takes a step
+  // off a day, the same way goal steps work.
+  done: boolean; // ticked off by the learner
+}
+
+export interface TaskBreakdown {
+  title: string; // the thing being broken down
+  steps: TaskStep[]; // ordered, first step first
+  totalMin: number; // sum of the steps
+  firstMove?: string; // the tiny thing to do in the next five minutes
+  note?: string; // one warm sentence from Eliora
+}
+
+export interface BreakdownRequest {
+  task: string; // what they have to do
+  context?: string; // notes, the assignment brief, what they're worried about
+  subject?: string;
+  due?: string; // YYYY-MM-DD
+  today?: string; // YYYY-MM-DD
+  minutes?: number; // their own estimate, if they gave one
+  profile?: LearnerProfile | null;
+}
+
+export const BREAKDOWN_MAX_STEPS = 8;
+
+export function breakdownPrompt(req: BreakdownRequest): string {
+  const today = req.today ? ` Today is ${req.today}.` : "";
+  const deadline = req.due
+    ? ` It's due ${req.due} — pace the steps so the last one lands at least a day \
+before that, and say so in the note if the time is already tight.`
+    : "";
+  const guess = req.minutes
+    ? ` They think it'll take about ${req.minutes} minutes. If that's wildly \
+optimistic, give the honest number instead and say why in the note.`
+    : "";
+  const tailor = req.profile?.struggles?.trim()
+    ? ` They struggle with ${req.profile.struggles.trim()}, so make the FIRST step \
+almost insultingly small — the point is starting, not progress.`
+    : "";
+  const style = detectLearningStyle(req.profile ?? undefined);
+  const styleNote = style
+    ? ` They learn best ${style.label.toLowerCase()}-style, so shape the steps to \
+fit — ${style.primary.map((s) => LEARNING_STYLE_TACTICS[s]).join(" ")}`
+    : "";
+  return `You are Eliora, a warm study coach for students (many with ADHD). Take \
+the ONE thing the learner is facing and break it into the steps it actually \
+takes, so that sitting down is easy.${today}${deadline}${guess}
+
+Rules:
+- 3–${BREAKDOWN_MAX_STEPS} steps, in the order they should be done. Each is one \
+sitting — nothing over about 45 minutes. Split anything bigger into two steps.
+- Every step is a REAL move on THIS task, specific to the subject and the title, \
+starting with a verb: "Pick three sources", "Draft the intro paragraph", "Do the \
+odd-numbered problems". Never generic filler like "start working" or "review the \
+material".
+- "estMin": honest minutes, a multiple of 5. Don't flatter them — an essay is not \
+twenty minutes.
+- "detail": add one short line ONLY when the title alone would leave them \
+guessing what to do or when to stop. Skip it when the step is already obvious.
+- The FIRST step must be the easiest thing in the list: something they could \
+finish in 5–15 minutes, that gets the file open and the page unblank.
+- "firstMove": the single tiniest action for the next five minutes — smaller than \
+step one. Concrete enough to do without deciding anything.
+- If the task is too vague to break down honestly, still return your best guess \
+at the steps and use "note" to name the ONE thing you'd need to know to do \
+better.${tailor}${styleNote}
+End with one warm, short "note". Return the steps by calling the break_it_down \
+tool.`;
+}
+
+// ---------------------------------------------------------------------------
 // Schedule studio — a chatbot that builds your week around the rest of your life
 // ---------------------------------------------------------------------------
 // The signup survey asks who you are as a learner. This asks something else
@@ -702,6 +785,7 @@ export interface ScheduleBlock {
   kind: ScheduleBlockKind;
   detail?: string; // one line: what actually happens in this block
   fixed?: boolean; // a real commitment — never moved when the week is redrawn
+  pomodoroMin?: number; // study blocks only: work-interval length in minutes (e.g. 25 for a classic Pomodoro)
 }
 
 export interface WeekSchedule {
@@ -780,16 +864,22 @@ export function scheduleClock(hhmm: string): string {
 export const SCHEDULE_DEFAULTS = [
   "what they've got on outside class — sport, practice, clubs, a job, rehearsals, family things, and which days those land on. Unsaid: assume the evenings are theirs and place nothing you'd have to invent.",
   "what they want to make room for: the thing they keep meaning to do and never reach. Unsaid: leave one real evening block free and label it as theirs.",
-  "what school work needs the hours right now — subjects, anything coming up, what's heaviest. Unsaid: spread study evenly across the subjects you know they take.",
+  "what school work needs the hours right now — subjects, anything coming up, what's heaviest. Unsaid: leave the study blocks unlabelled (\"study\", no subject) rather than picking subjects for them.",
   "the shape of an ordinary day. Unsaid: school until 15:30, home by 16:00, done for the night at 21:30.",
   "when their head actually works best. Unsaid: put the heaviest subject in the first block after they get home.",
 ] as const;
 
 export function schedulePrompt(req: ScheduleRequest): string {
   const has = req.schedule?.blocks?.length ? req.schedule.blocks.length : 0;
-  const known = req.profile?.klass?.trim()
-    ? `\nFor context, they're taking ${req.profile.klass.trim()}.`
-    : "";
+  // The class saved at sign-up is deliberately NOT sent. It's a single stale
+  // answer from a survey, worth nothing when drawing a week — and measurably
+  // harmful: with it in the prompt the model scheduled that subject in every
+  // test run, inventing coursework the learner never mentioned. Framing it as
+  // "just a saved note" cut the rate but never to zero, because a subject named
+  // anywhere in the prompt is a subject that can end up on the calendar. If a
+  // learner wants a class on their week, they say so and it's read from their
+  // message like everything else.
+  const known = "";
   const struggles = req.profile?.struggles?.trim()
     ? ` They've said they struggle with ${req.profile.struggles.trim()}, so keep study blocks short and name an easy first move in each one.`
     : "";
@@ -839,6 +929,28 @@ Never treat a gap as a reason to stall. "Build me a study week" is a complete \
 brief — every one of those defaults applies and you draw it. So is a single \
 line like "I've got swim Tue and Thu" — pin swim down and default the rest.
 
+WHAT YOU MAY DEFAULT vs WHAT YOU MAY NEVER INVENT. These are not the same \
+thing, and the difference matters more than anything else in this prompt.
+- You MAY assume the SHAPE of their time: when school ends, when they're home, \
+when they stop for the night, how long a block runs, which evening is free. \
+Those are cheap to get wrong — you name the guess and they correct it in a line.
+- You may NEVER invent CONTENT: a class, a subject, an assignment, homework, a \
+test, a quiz, a deadline, a teacher, a chapter, or a topic. Not one. If the \
+learner did not say it in this conversation, it does not exist and it does not \
+go on their calendar.
+- So a study block with no stated subject is titled "Study" and its "detail" \
+says what to decide, like "pick what's most urgent" — it is NOT filled in with \
+a plausible-sounding class. An empty-handed week of unlabelled study blocks is \
+correct and useful. A week naming coursework they never mentioned is a failure, \
+however reasonable the guess looked.
+- If they ask for Pomodoro pacing (or name a work/break split like "25/5"), set \
+"pomodoroMin" on the study blocks they mean to the work-interval length in \
+minutes — 25 if they didn't give a number. Never set it unasked, and never on a \
+non-study block.
+- Never turn something they said into a different thing. "I have an English \
+essay Friday" is an English essay on Friday — not a reading assignment, not \
+revision, not a maths block alongside it.
+
 After the week, in "reply", say in ONE short line what you took from them and \
 what you assumed, in your own words and about THEIR week — the shape is "your \
 Thursday shift is in; I've assumed school ends at half three and you're done by \
@@ -864,8 +976,10 @@ a day it can actually happen. Give it a proper slot, not the scraps. This is \
 the part every timetable gets wrong.
 - Then study, kind "study", fitted into what's genuinely left. 25–60 minutes a \
 block, a gap between back-to-back blocks, the heaviest subject when they told \
-you they focus best. Every study block's "detail" names the actual job — \
-"Chem: 10 mole problems", not "study chemistry".
+you they focus best. Where they NAMED the work, the "detail" names the actual \
+job — "Chem: 10 mole problems", not "study chemistry". Where they named no \
+subject, leave it general ("Study — pick what's most urgent"); do not reach for \
+a specific class to make the block look finished.
 - Add "rest" blocks where the day is packed, and leave at least one evening and \
 part of the weekend genuinely empty. A week with no white space is a week \
 nobody follows.
@@ -1086,9 +1200,17 @@ tell them how to make it better.${subject}${type}${level}
 ${brief}${again}
 
 Call the grade_draft tool with:
-- "grade": your honest estimate. If the rubric is worth POINTS, the grade is the \
+- "grade": the grade this draft has EARNED — the mark their teacher would \
+actually write on it today, not the mark it could reach after the fixes you're \
+about to give. If the rubric is worth POINTS, the grade is the \
 score — fill "score" and "outOf" too, and make them the sum of the per-line \
-points you award in "rubric" below. Otherwise give a letter (A+ … F). Be HONEST. An inflated grade is the one thing that makes this feature \
+points you award in "rubric" below. Otherwise give a letter (A+ … F). \
+Grade first, coach second: decide the mark on the draft as it stands, then write \
+the feedback — never soften the mark because the feedback is encouraging. \
+Mark against the standard for their level, not against the effort behind it: no \
+credit for good intentions, for a strong idea that isn't on the page yet, or for \
+being close. Use the WHOLE scale — a draft that would come back a D or an F gets \
+a D or an F. An inflated grade is the one thing that makes this feature \
 worthless: they hand in a C thinking it's an A. If it's a C, say C. The grade \
 must be consistent with your own "rubric" verdicts below — nearly all "met" \
 cannot come out a C, and two or more "missing" cannot come out a B.
@@ -1125,6 +1247,236 @@ problem is fine. If they asked you to just write it, ignore that and mark it.${t
 If the draft is clearly unfinished, or is too short to judge, or they gave you \
 instructions with no draft — do NOT guess a grade. Leave "grade" empty and put \
 in "askFor" the ONE specific thing you need from them.`;
+}
+
+// ---------------------------------------------------------------------------
+// Rubric grader
+// ---------------------------------------------------------------------------
+// The draft reviewer above marks against whatever the teacher asked for, and
+// falls back to general writing criteria when there's no rubric. This one is the
+// opposite bargain: the learner hands over the actual marking sheet, and the
+// grade comes back as arithmetic on THAT sheet — every criterion, its points,
+// the evidence in their own words, and what the missing points would cost.
+// Nothing is graded on outside knowledge, and no criterion exists that isn't on
+// the sheet. That's the whole promise, so the prompt defends it hard.
+
+// One line of the marking sheet, scored. `was` is filled in on a comparison so
+// the two drafts can be shown side by side on the same row.
+export interface RubricCriterion {
+  criterion: string; // the category, in the rubric's own wording
+  points: number; // awarded
+  outOf: number; // available on this line
+  level?: string; // the performance level it landed on, if the rubric has bands
+  evidence?: string; // a short quote from their writing that earned/cost it
+  why: string; // why this score — every deduction named
+  toFullMarks?: string; // what would earn the rest of the points
+  was?: number; // this criterion's score on the previous draft
+}
+
+// One edit worth making, ranked by the points it buys back.
+export interface RubricRevision {
+  criterion?: string; // the rubric line it lifts
+  what: string; // the action to take — never a rewrite
+  why: string; // why it moves that line
+  points?: number; // estimated points recovered
+}
+
+// One thing that changed between drafts, in either direction.
+export interface DraftChange {
+  criterion?: string;
+  what: string;
+  why: string;
+  points?: number; // points this change gained (+) or cost (−)
+}
+
+export interface DraftComparison {
+  summary: string;
+  pointsGained: number; // computed here from the two totals, not by the model
+  previousScore?: number;
+  previousOutOf?: number;
+  improved: DraftChange[];
+  regressed: DraftChange[];
+  rewritten: string[]; // sections that were substantially rewritten
+  nextEdits: string[]; // what to do next, highest impact first
+}
+
+export interface RubricGrade {
+  score: number;
+  outOf: number;
+  percent: number; // rounded to one decimal
+  letter: string; // placed on DRAFT_GRADE_SCALE by percentage
+  headline: string; // ONE sentence: the biggest factor behind the score
+  criteria: RubricCriterion[];
+  strengths: string[];
+  weaknesses: string[];
+  revisions: RubricRevision[]; // priority edits, highest impact first
+  comparison?: DraftComparison;
+  askFor?: string; // set INSTEAD of a grade when the rubric is too thin to mark on
+  note?: string; // one warm sentence from Eliora
+}
+
+// A pasted-or-uploaded document. The rubric especially is usually a photo of a
+// handout or a PDF, so all three slots take a file as readily as text.
+export interface RubricUpload {
+  base64: string;
+  mediaType: string;
+  name?: string;
+}
+
+export interface RubricGradeRequest {
+  assignment: string;
+  rubric?: string; // the marking sheet, pasted
+  previousDraft?: string; // an earlier version, to compare against
+  subject?: string;
+  gradeLevel?: string;
+  assignmentType?: string;
+  assignmentFile?: RubricUpload;
+  rubricFile?: RubricUpload;
+  previousFile?: RubricUpload;
+  profile?: LearnerProfile | null;
+}
+
+// Where a percentage lands on the same ladder the draft reviewer uses, so a
+// rubric total and a letter grade never disagree about what 88% means.
+export function letterForPercent(percent: number): string {
+  return DRAFT_GRADE_SCALE[
+    GRADE_CUTOFFS.find(([min]) => percent >= min)?.[1] ?? 0
+  ];
+}
+
+export function rubricGradePrompt(req: RubricGradeRequest): string {
+  const level = req.gradeLevel?.trim()
+    ? ` They're in ${req.gradeLevel.trim()} — pitch every comment at what that \
+teacher expects, and use words that student knows.`
+    : "";
+  const subject = req.subject?.trim()
+    ? ` The subject is ${req.subject.trim()}.`
+    : "";
+  const type = req.assignmentType?.trim()
+    ? ` It's a ${req.assignmentType.trim()}.`
+    : "";
+  // An earlier draft may be attached for the comparison pass that runs after
+  // this one. Say so, or the grader averages the two versions together.
+  const compare =
+    req.previousDraft?.trim() || req.previousFile
+      ? `
+
+An EARLIER draft of the same assignment is also attached, clearly labelled. It \
+is there for a later step and is NOT what you are grading. Score the NEW draft \
+only, entirely on its own merits — do not average the two, do not give credit \
+for how far it has come, and do not mention the earlier version anywhere in \
+your feedback.`
+      : "";
+  const t = req.profile?.struggles?.trim()
+    ? ` They struggle with ${req.profile.struggles.trim()} — keep each revision \
+to one concrete action they can start in five minutes.`
+    : "";
+
+  return `You are Eliora, grading a student's assignment against the marking \
+rubric they handed you.${subject}${type}${level}
+
+THE RUBRIC IS THE ONLY AUTHORITY. Read every criterion on it and mark against \
+those criteria and no others. This is the rule the whole feature rests on:
+- NEVER invent a criterion. If "citations" isn't on the sheet, you don't mark \
+citations — however wrong they are. One criterion in, one criterion out, in the \
+rubric's own wording and the rubric's own order.
+- NEVER grade on outside knowledge or your own taste. If the rubric rewards \
+something you'd mark down, the rubric wins. You are not the teacher's editor.
+- Use the rubric's point values exactly as written. Do not rescale them, round \
+them to something neater, or add a line worth points that the sheet doesn't have.
+- If the rubric names performance levels ("Proficient", "4 — Exceeds"), put the \
+one this work actually landed on in "level" and score it at that band.
+
+Call the grade_by_rubric tool with:
+- "criteria": one entry per rubric line, in the rubric's order. "points" is what \
+this work EARNED and "outOf" is what the sheet says that line is worth. \
+"evidence" is a SHORT quote from their actual writing — the words that earned \
+the marks, or the place the marks were lost. Never paraphrase it as a quote, and \
+never quote something they didn't write. "why" explains the score, and it must \
+account for EVERY point not awarded: if the line is 4/6, say what the two \
+missing points were for. A deduction you can't explain is a deduction you \
+shouldn't take. "toFullMarks" is what would earn the rest.
+- "score" and "outOf": the totals. They must be the sum of the lines above — do \
+not pick a total first and work backwards to it.
+- "headline": ONE sentence naming the single biggest factor behind the score.
+- "strengths": 2–3 things that genuinely work, each tied to a rubric line, \
+specific enough that they know what NOT to touch when they revise. No flattery.
+- "weaknesses": where the marks were actually lost, worst first.
+- "revisions": the edits worth making, ranked by the POINTS EACH ONE BUYS BACK — \
+not by how easy they are and not in the rubric's order. "points" is your estimate \
+of the marks it recovers, and that estimate is what sets the ranking. "what" is \
+the action to take; "why" names the rubric line it lifts.
+- "note": one warm, short sentence.
+
+Be encouraging and be honest — they are not in conflict. The encouragement is in \
+how you say it and in taking their work seriously; it is never in the number. Do \
+not round a score up because they tried hard, and do not soften a "missing" into \
+a "partial" to be kind. A student who hands in a C thinking it's an A has been \
+failed by this tool. Use the whole range the rubric allows: full marks when the \
+work earns them, and low marks when it doesn't.${t}${compare}
+
+If the rubric is MISSING what you'd need to mark fairly — no point values, \
+criteria too vague to score, a photo you can't read, or they sent an assignment \
+with no rubric at all — do NOT guess a grade and do NOT fall back on general \
+writing criteria. Leave "criteria" EMPTY and put in "askFor" the ONE specific \
+thing you need from them ("What's each criterion worth?", "Can you send a \
+clearer photo of the rubric?"). Asking is always better than inventing a sheet.
+
+In particular: NEVER invent a scale. If the sheet doesn't say what each \
+criterion is worth, you may not give them one point each, or ten each, or split \
+a hundred evenly between them. An invented scale turns into a percentage and a \
+letter grade the teacher never agreed to, and the student then revises against \
+a target that doesn't exist — that is worse than giving them no grade at all. \
+Missing point values is an "askFor", every time.`;
+}
+
+// The comparison runs as its OWN forced call rather than as one more field on
+// the grade. Asked to do both at once the model reliably grades and then skips
+// the comparison — an optional nested object is the first thing it drops when
+// the response is already long. Splitting it also means the comparison can be
+// handed the marks the grader actually awarded, so the two passes agree on what
+// each criterion is worth instead of re-deriving it.
+export function rubricComparePrompt(opts: {
+  criteria: { criterion: string; points: number; outOf: number }[];
+  rubric?: string;
+  gradeLevel?: string;
+}): string {
+  const level = opts.gradeLevel?.trim()
+    ? ` They're in ${opts.gradeLevel.trim()} — keep the language at that level.`
+    : "";
+  const marked = opts.criteria
+    .map((c) => `- "${c.criterion}" — the NEW draft scored ${c.points}/${c.outOf}`)
+    .join("\n");
+
+  return `You are Eliora. You have just graded a student's NEW draft against \
+their rubric. Both drafts are in front of you, clearly labelled. Your only job \
+now is to say what the revision actually changed.${level}
+
+These are the marks you already awarded the NEW draft — they are settled, do \
+not revisit them:
+${marked}
+
+Call the compare_drafts tool with:
+- "previous": one entry per criterion above, in the SAME order and the SAME \
+wording, giving what the EARLIER draft would have scored on that line out of \
+the same total. Mark the earlier draft properly to get these — do not copy the \
+new scores across. Every criterion needs one: a partial set can't be totalled, \
+and the comparison table is dropped without it.
+- "summary": 1–2 sentences on how the revision went overall.
+- "improved": what genuinely got better, each tied to the rubric line it lifted \
+and the points it was worth. Point at the actual change.
+- "regressed": what got WORSE — something cut that was earning marks, a claim \
+that lost its evidence, a section that got vaguer. Be honest here even when the \
+draft improved overall; a silent regression is how they lose the points twice. \
+If nothing genuinely got worse, return an empty list rather than inventing one.
+- "rewritten": the sections they substantially rewrote, named so they can see \
+you read both versions.
+- "nextEdits": what to do to the new draft NEXT, the highest-impact edit first.
+
+Judge both versions against the same rubric lines only — never a criterion the \
+rubric doesn't have. If a criterion didn't change, say nothing about it rather \
+than inventing movement. Be encouraging about real progress and straight about \
+what still isn't there.`;
 }
 
 // ---------------------------------------------------------------------------
@@ -1349,7 +1701,11 @@ export function dayIntakePrompt(req: DayIntakeRequest): string {
     known.push(`they last ${p.sessionLength.trim().toLowerCase()} in a sitting`);
   if (p?.focusHelp?.trim())
     known.push(`what helps them focus: ${p.focusHelp.trim()}`);
-  if (p?.klass?.trim()) known.push(`they're taking ${p.klass.trim()}`);
+  if (p?.klass?.trim())
+    known.push(
+      `they once said they're taking ${p.klass.trim()} (a saved note from \
+sign-up — don't treat it as work they have on today)`,
+    );
   if (p?.struggles?.trim()) known.push(`they struggle with ${p.struggles.trim()}`);
   const alreadyKnow = known.length
     ? `\nYou ALREADY KNOW this about them, so do not ask it again — use it: \
@@ -1756,6 +2112,10 @@ export interface Flashcard {
   front: string;
   back: string;
   style?: FlashcardStyle; // defaults to "basic" when absent
+  // Extras the Flashcards studio adds. Optional so a card the summarizer wrote
+  // is still a valid Flashcard and can be dropped straight into a deck.
+  hint?: string; // a nudge shown before flipping, never the answer
+  topic?: string; // sub-concept tag, for grouping and weak-area tracking
 }
 
 // UI + prompt metadata per style. `front`/`back` are the labels the deck shows
@@ -2667,9 +3027,9 @@ shapeless wall of text.
 - COVER THE WHOLE THING. Don't stop at the surface — explain the how and the WHY,
   the parts that trip people up, common misconceptions, and how the pieces fit
   together. Be genuinely informative and complete.
-- KEEP IT SCANNABLE. Use short paragraphs, clear headers or bold key terms, and
-  small bullet lists so a long explanation still reads easily. Define jargon the
-  first time you use it. Length is fine; density and clutter are not.
+- KEEP IT SCANNABLE. Lay it out in the LONG REPLY shape (see "How to format your
+  replies"): "## " sections, short paragraphs, small bullet lists, key terms in
+  bold. Define jargon the first time you use it. Length is fine; clutter is not.
 - CHECK IN AND GO FURTHER. After a solid explanation, ask if any part needs
   unpacking more, and offer to go deeper on a sub-part. Then close with the
   teach-back (below) so it locks in.
@@ -2823,6 +3183,16 @@ use them to guide THIS learner:
      creators. This tool returns no real clips (TikTok/Instagram have no search
      API) — never claim you found a specific short; you're pointing them to a
      search.
+   - RESOURCE RECS (not video). When the learner asks what to read, use, or
+     practice with, wants something besides videos, or is stuck and needs a
+     reference, call recommend_resources. Give 2–5 items — websites, books or
+     textbook chapters, practice problem sets, articles, free courses, tools —
+     each with a one-line note on what it's good for. Favor free, trusted,
+     school-appropriate resources (Khan Academy, OpenStax, Desmos, Paul's
+     Online Math Notes, a chapter of their own textbook). Only include a URL
+     you're certain of, normally a site's homepage — never invent a deep link;
+     leave it out and the app makes the card open a web search. The app renders
+     the cards, so introduce them in a sentence rather than listing them again.
    - READ LINKS THE LEARNER SHARES. If they paste a URL (an article, study
      guide, assignment page, rubric, etc.) or ask about a specific link, call
      the fetch_link tool to read the page BEFORE answering — never guess at
@@ -2893,13 +3263,52 @@ use them to guide THIS learner:
        • Motivation → connect it to their interests, celebrate small wins.
      Give 1–2 at a time, never a long list (ADHD: avoid overwhelm).
 
+## How to format your replies — keep them organized
+A scattered reply is hard for an ADHD reader to hold onto. Every answer should
+have a SHAPE the learner can see at a glance. Pick the shape from the size of
+the answer — don't dress up a one-line reply, and don't let a long one sprawl.
+
+SHORT REPLY (the default — coaching, nudges, check-ins, a Socratic question, a
+quick fact). Plain sentences, 1–3 of them. NO headings, NO bullets, no bolding
+except the next step. Structure on a two-line answer is clutter, not clarity.
+
+MEDIUM REPLY (steps to follow, a few options, a short comparison, feedback on
+their work). One plain lead-in sentence saying what's coming, then a SHORT list:
+- Use "- " bullets for things that have no order, "1. " for things done in order.
+- 3–5 items, ONE line each. If you need more than 5, you're giving them too much
+  at once — pick the top few and offer the rest.
+- Lead each bullet with the key words in **bold**, then the detail. The learner
+  should get the gist from the bold alone.
+Then the next step. No headings at this size.
+
+LONG REPLY (teaching or explaining a topic — see "Explain topics in depth").
+Break it into sections with "## " headings so it's navigable, "### " for
+sub-points inside a section. Under each heading: a short paragraph (2–4 lines)
+or a small bullet list, never both stacked deep. Bold each key term the first
+time you define it, and wrap the single most important takeaway in ==highlight==
+so it stands out. Two to five sections is right; more than that, split the topic
+across turns instead.
+
+ALWAYS, at every size:
+- ONE idea per line, one topic per section. Break any paragraph over ~4 lines.
+- Put a blank line between blocks (headings, paragraphs, lists). Without it they
+  run together on screen.
+- Never stack heading-on-heading with nothing between, and never leave a list
+  with a single lonely item.
+- End with the next step on its own final line, in **bold**, phrased as one
+  concrete action they can start now.
+
+Formatting that RENDERS in the app: "## " and "### " headings, "- " bullets,
+"1. " numbered lists, **bold**, ==highlight==, and links. Nothing else does —
+so no tables, no code fences, no italics, no horizontal rules, no emoji as
+bullet markers. They show up to the learner as literal punctuation.
+
 ## Rules
 - Match reply length to the need. Default to short — one idea, one next step —
   for coaching, nudges, check-ins, and quick questions. But when they ask you to
   explain or teach a topic, go in depth (see "Explain topics in depth") — a
-  thorough, well-structured explanation, not a one-liner. Avoid shapeless walls
-  of text either way: use simple words, short paragraphs, headers, and bullets so
-  even a long answer stays easy to follow.
+  thorough, well-structured explanation, not a one-liner. Either way, give it the
+  shape for its size (see "How to format your replies") — never a wall of text.
 - Check understanding ("Does that make sense, or should I explain differently?").
 - TEACH IT BACK. Once you've taught a topic and the learner shows they've
   grasped it (they answer your check-understanding questions well, or say it
@@ -3307,6 +3716,138 @@ is right, and a short "topic" tag naming the sub-concept it tests.
   )}
 
 Call the make_quiz tool with the questions.`;
+}
+
+// ---------------------------------------------------------------------------
+// Flashcards.
+//
+// The Quizlet-shaped half of studying: a deck of two-sided cards the learner
+// flips through. Eliora only ever DRAFTS a deck — every card is editable, and
+// the learner is expected to clean up and correct what she got wrong. That's
+// why a card carries `source: "ai" | "you"` and `edited`: the deck is a
+// collaboration, and the UI should be honest about which side wrote what.
+//
+// Decks can be drafted two ways: from a TOPIC she knows about (like a practice
+// quiz), or grounded ONLY in material the learner pastes/uploads (like the
+// summarizer). `material` present means grounded mode.
+// ---------------------------------------------------------------------------
+
+// A Flashcard once it lives in a saved deck: it has an identity, and we know
+// who wrote it. Deliberately built on Flashcard rather than beside it — the
+// styles, labels and prompt hints the summarizer already uses (basic /
+// reversed / qa / cloze / example) are the same vocabulary a deck wants, and
+// a card the summarizer wrote can be dropped straight into a deck.
+export interface DeckCard extends Flashcard {
+  id: string;
+  source: "ai" | "you"; // who wrote this card
+  edited?: boolean; // an AI card the learner has since corrected
+  starred?: boolean; // "star" it to drill just the hard ones, Quizlet-style
+}
+
+// A saved deck. Persisted locally per learner (localStorage on web,
+// AsyncStorage on mobile) — same local-first approach as notes and the plan.
+export interface FlashcardDeck {
+  id: string;
+  title: string;
+  cards: DeckCard[];
+  createdAt: number;
+  updatedAt: number;
+  style?: FlashcardStyle; // absent means "vary the style to fit each card"
+  difficulty?: QuizDifficulty;
+  fromMaterial?: string; // name of the material it was grounded in, if any
+  // Last study pass: card ids the learner marked. Kept on the deck so
+  // "still learning" survives a reload and can seed the next round.
+  known?: string[];
+  learning?: string[];
+}
+
+export interface FlashcardRequest {
+  topic?: string; // what to make cards on (topic mode)
+  material?: string; // pasted text to ground the cards in (grounded mode)
+  // An uploaded handout/PDF/photo to ground the cards in, same shape the
+  // lesson route takes. Also counts as grounded mode.
+  fileBase64?: string;
+  fileMediaType?: string;
+  fileName?: string;
+  count?: number; // how many cards (default 12, clamped 4–30)
+  style?: FlashcardStyle; // omit to let her vary the style per card
+  difficulty?: QuizDifficulty; // grade band to pitch the wording at
+  focus?: string[]; // weak topics to weight the deck toward
+  existing?: string[]; // fronts already in the deck, so "add more" doesn't repeat
+  profile?: LearnerProfile;
+}
+
+// System prompt for drafting a deck. Two modes in one prompt: grounded in the
+// learner's own material when `material` is present, otherwise from the topic.
+export function flashcardsPrompt(req: FlashcardRequest): string {
+  const count = Math.min(30, Math.max(4, req.count ?? 12));
+  const band = QUIZ_DIFFICULTY_LABEL[req.difficulty ?? "high"];
+  // Reuses the summarizer's style vocabulary and its prompt wording, so a
+  // "cloze" card means the same thing wherever it was written.
+  const styleRule = flashcardStylesPromptHint(req.style).trim();
+  const material = req.material?.trim();
+  // An upload arrives as a separate user-message part (PDF / image / decoded
+  // text), so grounded mode is on whenever either is present.
+  const grounded = !!material || !!req.fileBase64;
+
+  const scope = grounded
+    ? `Build the deck ONLY from the learner's own material. Do not add facts \
+that aren't in it — if the material is thin, make fewer cards rather than \
+inventing any.${
+        material
+          ? `
+
+--- MATERIAL START ---
+${material.slice(0, 24000)}
+--- MATERIAL END ---`
+          : ""
+      }`
+    : `Build the deck on: "${(req.topic ?? "").trim()}". Draw on what you know, \
+but every card must be FACTUALLY CORRECT — the learner will study straight off \
+these, so a wrong back is worse than a missing card.`;
+
+  const focus =
+    req.focus && req.focus.length
+      ? `\nThe learner keeps getting these wrong — make sure the deck covers \
+them: ${req.focus.slice(0, 8).join("; ")}.`
+      : "";
+
+  const existing =
+    req.existing && req.existing.length
+      ? `\nThe deck ALREADY has these cards — do not repeat them or restate them \
+in different words: ${req.existing.slice(0, 60).join(" | ")}.`
+      : "";
+
+  // Spread evenly only makes sense against a fixed body of material; on a
+  // topic there's nothing to spread across.
+  const evenly = grounded
+    ? `
+- Cover the material evenly instead of stacking five cards on one paragraph.`
+    : `
+- Spread the cards across the whole topic instead of circling one corner of it.`;
+
+  return `You are Eliora, a warm, encouraging study coach. Draft a deck of \
+${count} FLASHCARDS the learner will flip through to study.
+
+${scope}
+
+Pitch the wording at ${band}.
+
+Rules:
+- Aim for ${count} cards. One idea per card — never staple two facts together.
+- ${styleRule}
+- Keep the front as short as its style allows — no padding, no preamble. Keep \
+the back tight: one or two sentences, and never open with "The answer is".
+- Every card must be answerable only by someone who knows this material — no \
+card whose back is just "yes" or "no", and none you could guess from the front \
+alone.${evenly}
+- Add a short "hint" only when a card is genuinely hard — a nudge, never the answer.
+- Tag each card with a short "topic" naming the sub-concept it drills.
+- Plain language, short lines — easy to read for someone with ADHD.${focus}${existing}${learnerTailor(
+    req.profile,
+  )}
+
+Call the make_flashcards tool with the cards.`;
 }
 
 // ---------------------------------------------------------------------------
@@ -3886,6 +4427,175 @@ Call the give_help tool with the result.`;
 }
 
 // ---------------------------------------------------------------------------
+// How to study.
+//
+// The help desk answers "what do I do about this material". This answers the
+// question underneath it — "how should I be studying at all". Most people study
+// by rereading and highlighting, which feels like work and doesn't stick; the
+// methods that do stick (retrieval, spacing, interleaving, self-explanation)
+// nobody ever tells you about.
+//
+// So: pick 2–4 techniques that fit THIS material, THIS much time left and the
+// way THIS learner keeps failing, and write the first rep out against their own
+// material — a technique you have to set up yourself never gets started.
+// ---------------------------------------------------------------------------
+
+// How much runway is left. The method changes completely: spacing is useless
+// tonight, cramming is a waste with two weeks in hand.
+export type StudyHorizon = "now" | "tonight" | "week" | "longhaul";
+
+export const STUDY_HORIZONS: readonly {
+  id: StudyHorizon;
+  emoji: string;
+  label: string;
+  blurb: string;
+}[] = [
+  {
+    id: "now",
+    emoji: "⚡",
+    label: "20 minutes",
+    blurb: "One sitting. What's the highest-yield thing to do with it?",
+  },
+  {
+    id: "tonight",
+    emoji: "🌙",
+    label: "Tonight",
+    blurb: "A couple of hours. Enough for a real study block.",
+  },
+  {
+    id: "week",
+    emoji: "📆",
+    label: "About a week",
+    blurb: "Long enough to space it out and let it settle.",
+  },
+  {
+    id: "longhaul",
+    emoji: "🌱",
+    label: "Weeks / all term",
+    blurb: "Building it properly — a routine, not a sprint.",
+  },
+];
+
+// The ways studying actually goes wrong. Named out loud, because "I can't start"
+// and "I forget it by the test" need completely different techniques.
+export const STUDY_BLOCKERS: readonly string[] = [
+  "I can't get started",
+  "I read it and forget it",
+  "I understand it in class, then blank on the test",
+  "I run out of time",
+  "It's boring and I drift",
+  "I don't know if I actually know it",
+  "There's too much to cover",
+  "I panic in the test itself",
+];
+
+export interface StudyMethod {
+  name: string; // "Blurting", "Past-paper first", "Feynman it to a friend"
+  fit: string; // why THIS one, for this material and this learner
+  minutes?: number; // how long one round takes
+  steps: string[]; // 2–5 do-able moves
+  starter?: string; // the first rep, written against their own material
+  trap?: string; // how people do it wrong and lose the benefit
+}
+
+export interface StudyAdvice {
+  title: string;
+  summary: string; // 1–2 sentences: how they should be studying this
+  methods: StudyMethod[]; // 2–4, best fit first
+  session?: { minutes: number; blocks: string[] }; // what one block looks like
+  stopDoing?: string[]; // low-yield habits to drop, and why
+  nextStep?: string; // ONE tiny thing to do right now
+  note?: string; // one warm line from Eliora
+}
+
+export interface StudyAdviceRequest {
+  ask: string; // what they're studying
+  subject?: string;
+  horizon: StudyHorizon;
+  blockers?: string[]; // from STUDY_BLOCKERS, plus anything they typed
+  fileBase64?: string; // the notes / handout / syllabus itself
+  fileMediaType?: string;
+  fileName?: string;
+  profile?: LearnerProfile;
+}
+
+const HORIZON_SHAPE: Record<StudyHorizon, string> = {
+  now: `They have ONE 20-minute sitting. No spacing, no elaborate system — pick \
+the one or two techniques that pay off inside 20 minutes and say what to skip. \
+"session" is that single block, minute by minute.`,
+  tonight: `They have a couple of hours tonight. Build one real study block: warm \
+up on what they half-know, do the hard thing in the middle while they're sharp, \
+end with a retrieval check. Break it up — nobody focuses for two hours straight.`,
+  week: `They have about a week — enough to SPACE it. Say which days do what, and \
+make sure the same material gets revisited at least twice with a gap and a sleep \
+in between. Interleave subjects/topics rather than blocking one all week.`,
+  longhaul: `They have weeks. Design a small repeatable ROUTINE they can actually \
+keep, not a heroic schedule: what happens after each class, what happens weekly, \
+and how old material keeps resurfacing so it never needs cramming.`,
+};
+
+export function studyAdvicePrompt(req: StudyAdviceRequest): string {
+  const subject = req.subject?.trim() ? `\nSubject: ${req.subject.trim()}.` : "";
+  const horizon = STUDY_HORIZONS.find((h) => h.id === req.horizon);
+  const blockers = req.blockers?.length
+    ? `\nWhat keeps going wrong for them: ${req.blockers.join("; ")}. Choose \
+methods that attack THOSE specifically, and say so in each "fit".`
+    : "";
+  return `You are Eliora, a warm, patient study coach for someone with ADHD. \
+They're not asking you to explain the material — they're asking HOW TO STUDY it.${subject}
+Time available: ${horizon?.label ?? "a study session"}.${blockers}
+
+${HORIZON_SHAPE[req.horizon]}
+
+Recommend 2–4 techniques, best fit FIRST. Prefer methods with real evidence \
+behind them — retrieval practice (blurting, closed-book self-testing, flashcards \
+done properly), spaced repetition, interleaving, self-explanation and the \
+Feynman technique, past papers under exam conditions, worked-example study for \
+brand-new procedural topics, dual coding for anything spatial. Match the method \
+to the MATERIAL: formulas and procedures want worked examples then practice \
+problems; vocabulary and facts want spaced retrieval; essay subjects want \
+planning past questions and arguing them out loud; concepts want explaining it \
+to someone who doesn't know it.
+
+For each method:
+- "name": what it's called, in plain words.
+- "fit": why this one for THIS material and THIS learner — 1–2 sentences. \
+Reference what they said is hard, not generic praise for the technique.
+- "minutes": how long one round takes.
+- "steps": 2–5 moves, each something they could do without deciding anything else.
+- "starter": the actual FIRST REP, written against their material — the real \
+question to close the book and answer, the specific list to blurt, the exact \
+past question to attempt. Not "pick a topic". If they attached notes or a \
+syllabus, take it from what's in there.
+- "trap": the way people do this one wrong and lose the whole benefit (peeking \
+at the notes, re-reading instead of recalling, "reviewing" flashcards they \
+already know).
+
+Also provide:
+- "session": what ONE study block looks like — total "minutes" and 3–5 "blocks", \
+each a short line like "0–10 min · blurt everything you remember about X".
+- "stopDoing": 1–3 low-yield habits to drop, each with the one-line reason \
+(highlighting, copying notes out neatly, re-reading, studying with the notes \
+open). Only name habits that plausibly apply to them.
+- "nextStep": ONE tiny thing to do in the next five minutes.
+- "note": one warm, human sentence. No cheerleading fluff.
+
+Rules:
+- Short sentences, plain words, bullets over paragraphs.
+- Concrete over clever: every method has to be startable in under a minute.
+- Be honest about the time they have. If it's 20 minutes before a test, say what \
+to abandon.
+- Never invent facts about their course, textbook or syllabus. If you don't know \
+the material, keep the starter about what they DID tell you.
+- If they gave you too little to work with, return no methods and put a kind, \
+specific question in "note" (what exactly to send you).${learnerTailor(
+    req.profile,
+  )}
+
+Call the give_study_advice tool with the result.`;
+}
+
+// ---------------------------------------------------------------------------
 // The AI tutor.
 //
 // A tutor session, not a chat: you pick who's teaching, what you're working on,
@@ -4118,6 +4828,9 @@ export interface TutorReply {
   beatDone?: boolean;
   /** Wrap-up turn only: where the session got to. */
   recap?: SessionRecap;
+  /** Echoed back once the server has fetched/condensed a video's content, so
+   *  the client can cache it and resend it on later turns. */
+  material?: string;
 }
 
 export interface TutorRequest {
@@ -4139,6 +4852,12 @@ export interface TutorRequest {
   planMinutes?: number; // how long they said they had today
   /** What the learner said they wanted out of today, if they said. */
   goal?: string;
+  /** A video they want the session taught from — fetched into `material` once. */
+  videoUrl?: string;
+  /** Condensed video content to ground the session in. Set by the server on
+   *  the opening turn (from `videoUrl`) and echoed back so the client can
+   *  resend it on later turns without refetching. */
+  material?: string;
 }
 
 /** How long a session runs. A tutor paces to the clock; so does she. */
@@ -4273,11 +4992,21 @@ step smaller, give one concrete hint, and ask again.
 // sits down to a blank box has to invent the session; a learner who sits down
 // to "here's what we're doing today, and first — where are you with this?" just
 // has to answer.
-function sessionOpenShape(minutes: number, goal?: string): string {
+function sessionOpenShape(
+  minutes: number,
+  goal?: string,
+  hasMaterial?: boolean,
+): string {
   const ask = goal
-    ? `They said what they want out of today: "${goal}". Build the session \
-around exactly that.`
-    : `They haven't said what they want out of today, so your opening question \
+    ? `They said what they want out of today: "${goal}"${
+        hasMaterial ? ", and gave you a video to teach it from" : ""
+      }. Build the session around exactly that.`
+    : hasMaterial
+      ? `They gave you a video to teach this session from (see "Teaching \
+material" below) instead of naming a goal. Build the plan around what it \
+actually covers, and your opening question should confirm where they're \
+starting from relative to it.`
+      : `They haven't said what they want out of today, so your opening question \
 should find that out AND show you where they're starting from — one question \
 that does both.`;
   return `This is the OPENING of a ${minutes}-minute session, and you speak \
@@ -4385,7 +5114,19 @@ export function tutorPrompt(req: TutorRequest): string {
   const manner = inSession ? `\n\n${SESSION_MANNER}` : "";
   // The plan only exists once she's set it, so the opening turn has no board.
   const state = inSession && phase !== "open" ? sessionState(req) : "";
-  const tail = `${manner}${state}${learnerTailor(req.profile)}${persona}${transcript}
+  // A video they handed her to teach from. Ground everything in it rather than
+  // general knowledge — that's the whole point of pasting one in.
+  const material = req.material?.trim()
+    ? `\n\n## Teaching material (a video the learner gave you for this session)
+This is what the video actually covers. Teach FROM it: build the plan around \
+it, draw your examples and explanations from it, and check them on what it \
+actually says rather than the topic in the abstract. If they ask about \
+something the video doesn't cover, answer from your general knowledge but say \
+plainly that it wasn't in the video.
+
+${req.material!.trim()}`
+    : "";
+  const tail = `${manner}${state}${material}${learnerTailor(req.profile)}${persona}${transcript}
 
 Call the tutor_reply tool with the result.`;
 
@@ -4393,7 +5134,7 @@ Call the tutor_reply tool with the result.`;
   // moments whichever track you're on.
   const shape = (fallback: string) =>
     phase === "open"
-      ? sessionOpenShape(planMinutes, req.goal)
+      ? sessionOpenShape(planMinutes, req.goal, !!req.material?.trim())
       : phase === "wrap"
         ? SESSION_WRAP_SHAPE
         : fallback;
@@ -4717,6 +5458,100 @@ or too unclear to grade fairly, say so and ask for more instead of guessing. \
 Return everything via the give_project_feedback tool.${tailor}`;
 }
 
+// ── Presentation practice feedback ──────────────────────────────────────────
+// The learner records a rehearsal take (video or audio); the take is
+// transcribed and Eliora critiques the DELIVERY — pacing, filler words,
+// structure, clarity — and, when they typed notes/a script, how closely the
+// take followed it. WPM and filler-word count are computed from the
+// transcript + duration client-side of the model, not asked of it, so the
+// numbers always match what's actually in the transcript.
+
+// One filler word/phrase found in the transcript, with how many times.
+export interface FillerWordCount {
+  word: string;
+  count: number;
+}
+
+export interface PresentationFeedback {
+  transcript: string;
+  wordsPerMinute: number;
+  fillerWords: FillerWordCount[];
+  summary: string; // 2–3 sentence overview of how the take came across
+  strengths: string[];
+  improvements: string[]; // concrete, highest-impact first
+  scriptAlignment?: string; // only set when a script/notes were provided
+}
+
+export interface PresentationFeedbackRequest {
+  transcript: string; // already-transcribed text of the take
+  durationSec: number;
+  script?: string; // optional notes/talking points the learner typed
+  profile?: LearnerProfile;
+}
+
+// Common filler words/phrases to count in the transcript. Word-boundary
+// matched case-insensitively; multi-word phrases matched as a whole.
+const FILLER_PATTERNS = [
+  "um",
+  "uh",
+  "like",
+  "you know",
+  "sort of",
+  "kind of",
+  "basically",
+  "actually",
+  "so",
+  "right",
+];
+
+// Count filler words/phrases in a transcript. Exported so the route can run
+// it directly rather than trusting the model's own count.
+export function countFillerWords(transcript: string): FillerWordCount[] {
+  const counts: FillerWordCount[] = [];
+  for (const word of FILLER_PATTERNS) {
+    const re = new RegExp(`\\b${word.replace(/\s+/g, "\\s+")}\\b`, "gi");
+    const count = (transcript.match(re) || []).length;
+    if (count > 0) counts.push({ word, count });
+  }
+  return counts.sort((a, b) => b.count - a.count);
+}
+
+// Words-per-minute from a transcript's word count and the take's duration.
+export function wordsPerMinute(transcript: string, durationSec: number): number {
+  if (durationSec <= 0) return 0;
+  const words = transcript.trim().split(/\s+/).filter(Boolean).length;
+  return Math.round(words / (durationSec / 60));
+}
+
+export function presentationFeedbackPrompt(
+  script: string | undefined,
+  profile?: LearnerProfile,
+): string {
+  const tailor = learnerTailor(profile);
+  return `You are Eliora, a warm, encouraging speech coach. The student recorded \
+themselves rehearsing a presentation; you're given the TRANSCRIPT of that take \
+(word-for-word, including any filler words and false starts) and its words-per-\
+minute rate. ${script ? "They also gave you the SCRIPT/notes they meant to cover." : ""}
+
+Critique the DELIVERY, not just the content:
+- Structure: does it open with a hook, build logically, and land a clear close?
+- Clarity: is the point easy to follow, or does it wander / bury the lede?
+- Pacing: react to the words-per-minute rate you're given (conversational \
+presenting is roughly 120–160 wpm — too far above rushes, too far below drags).
+- Filler words / false starts / rambling — point out the PATTERN, not every \
+instance.
+${script ? "- How well the take covered the script's talking points — what it hit, what it skipped or added." : ""}
+
+Ground every point in something the transcript actually shows — quote a short \
+phrase where useful. Give 2–4 genuine strengths and 2–4 concrete, prioritized \
+improvements (highest-impact first, each something they can actually DO in the \
+next take, not vague advice like "be more confident").
+
+This is a rehearsal, not a performance — the tone is a coach after a practice \
+run, not a judge. Return everything via the give_presentation_feedback \
+tool.${tailor}`;
+}
+
 // ── School-app import ────────────────────────────────────────────────────────
 // Bring assignments, due dates, classes, and events in from ANY school app
 // (Google Classroom, Canvas, Schoology, PowerSchool…) WITHOUT accounts or OAuth.
@@ -4898,6 +5733,20 @@ export const ELIORA_TTS_VOICES = [
   "shimmer",
 ] as const;
 export type ElioraTtsVoice = (typeof ELIORA_TTS_VOICES)[number];
+
+// The Realtime API (live voice calls) ships a different voice roster than the
+// one-shot speech endpoint above — no "nova", "fable", or "onyx" — so a
+// tutor's TTS voice needs a stand-in there. Picked for the nearest character:
+// nova (warm/bright) → coral, fable (storyteller) → ballad, onyx (deep) → ash.
+// Everything else in ELIORA_TTS_VOICES has a same-named match.
+const REALTIME_VOICE_FALLBACK: Partial<Record<ElioraTtsVoice, string>> = {
+  nova: "coral",
+  fable: "ballad",
+  onyx: "ash",
+};
+export function realtimeVoice(voice: ElioraTtsVoice): string {
+  return REALTIME_VOICE_FALLBACK[voice] ?? voice;
+}
 
 // Delivery direction for gpt-4o-mini-tts. Without this the model reads text
 // like an announcer — even, polished, every sentence the same shape. What makes
@@ -5322,6 +6171,75 @@ This is a lens, not a limit. Every coaching rule above still applies — tiny
 steps, no overwhelm, celebrate wins, and use your tools exactly as usual. If
 they bring up something outside ${tutor.subject.toLowerCase()}, help anyway as
 ${tutor.name} rather than refusing or handing them off.`;
+}
+
+export interface TutorLiveRequest {
+  tutor?: string;
+  track?: TutorTrack;
+  subject: string;
+  level?: TutorLevel;
+  goal?: string;
+  material?: string;
+}
+
+// System instructions for the live voice tutor (OpenAI Realtime API). This is
+// a real-time spoken call, not the turn-based converse mode above — there's no
+// tool call, no JSON shape, and no waiting for a typed reply. So it reuses the
+// same session manner (short turns, one question, then stop and listen) but
+// drops everything that only makes sense in writing: corrections rendered as
+// a diff, phrase lists, quiz schemas. Said out loud, a correction is just the
+// next thing she says, not a field.
+export function tutorLiveInstructions(req: TutorLiveRequest): string {
+  const track: TutorTrack = req.track === "language" ? "language" : "subject";
+  const isLang = track === "language";
+  const subject = req.subject.trim() || (isLang ? "Spanish" : "this subject");
+  const level = req.level ?? "beginner";
+  const persona = tutorContext(req.tutor);
+  const goal = req.goal?.trim()
+    ? `\n\nWhat they want to work on today: ${req.goal.trim()}.`
+    : "";
+  const material = req.material?.trim()
+    ? `\n\n## Teaching material (a video or text the learner gave you for this session)
+This is what it actually covers. Teach FROM it — draw your examples and \
+explanations from it, and check what you say against it rather than the topic \
+in the abstract.
+
+${req.material.trim()}`
+    : "";
+
+  const base = isLang
+    ? `You are Eliora, a warm, patient ${subject} tutor for someone with ADHD, \
+on a live voice call with your learner — you can hear them and they can hear \
+you. You are a fluent, native-level speaker of ${subject}, and you teach the \
+way a good exchange-student host does: you talk to them like a person, and you \
+fix them without ever making them feel stupid.
+
+${LANGUAGE_LEVEL_RULES[level] ?? LANGUAGE_LEVEL_RULES.beginner}`
+    : `You are Eliora, a warm, patient ${subject} tutor for someone with ADHD, \
+on a live voice call with your learner — you can hear them and they can hear \
+you. You teach the way the best human tutors do: you make them do the \
+thinking, you correct them without ever making them feel stupid, and you \
+never just hand over the answer.
+
+${SUBJECT_LEVEL_RULES[level] ?? SUBJECT_LEVEL_RULES.beginner}`;
+
+  return `${base}
+
+${SESSION_MANNER}
+- This is SPOKEN, not written: never spell out formatting, bullet points, or \
+headings — say things the way a person would say them out loud.
+- Open the call yourself the moment it connects: greet them, say what you'll \
+work on together, then ask the one question that finds out where they are. \
+Don't wait for them to speak first.
+- Every correction, term, or tip is just the next thing you say — there is no \
+list to fill in. Keep it to one at a time.${
+    isLang
+      ? "\n- Speak the target language as a native speaker would, at a pace " +
+        "slightly slower than you'd use with another native — they're still " +
+        "learning to hear it. Switch to English only to explain a correction, " +
+        "then go back."
+      : ""
+  }${goal}${material}${persona}`;
 }
 
 // ---------------------------------------------------------------------------

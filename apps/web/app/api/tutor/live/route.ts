@@ -13,7 +13,7 @@ import {
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 
-const REALTIME_MODEL = "gpt-realtime-mini";
+const REALTIME_MODEL = "gpt-realtime";
 
 export async function POST(req: Request) {
   let body: TutorLiveRequest;
